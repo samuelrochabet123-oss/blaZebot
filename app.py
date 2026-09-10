@@ -1041,20 +1041,30 @@ def on_data(data):
         )
 
 
-def configurar_socket(transporte):
+# Headers usados somente como compatibilidade com servidores/proxies que
+# esperam uma origem semelhante a um navegador. Eles podem ser alterados
+# por variáveis de ambiente sem editar o código.
+BLAZE_USER_AGENT = os.getenv(
+    "BLAZE_USER_AGENT",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36"
+)
+BLAZE_ORIGIN = os.getenv("BLAZE_ORIGIN", "https://blaze.bet.br")
+BLAZE_REFERER = os.getenv("BLAZE_REFERER", "https://blaze.bet.br/")
+
+
+def configurar_socket(transporte, headers=None):
     global sio
 
+    # Esta configuração segue deliberadamente o Collector V2.1 que
+    # funciona no Colab: reconexão longa e logs internos desligados.
     sio = socketio.Client(
         reconnection=True,
         reconnection_attempts=MAX_RECONEXOES,
         reconnection_delay=2,
         reconnection_delay_max=10,
-
-        # IMPORTANTE:
-        # Nesta versão deixamos os logs internos ligados para
-        # descobrir o erro real do Engine.IO / WebSocket.
-        logger=True,
-        engineio_logger=True,
+        logger=False,
+        engineio_logger=False,
     )
 
     sio.on("connect", on_connect)
@@ -1062,95 +1072,133 @@ def configurar_socket(transporte):
     sio.on("connect_error", on_connect_error)
     sio.on(EVENT_NAME, on_data)
 
-    add_log(
-        f"⚙️ Socket configurado | transporte={transporte}"
-    )
+    add_log(f"⚙️ Socket configurado | transporte={transporte}")
+    if headers:
+        add_log("🧩 Headers de compatibilidade ativados")
+
+
+def _headers_compatibilidade():
+    return {
+        "User-Agent": BLAZE_USER_AGENT,
+        "Accept": "*/*",
+        "Accept-Language": "pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7",
+        "Origin": BLAZE_ORIGIN,
+        "Referer": BLAZE_REFERER,
+        "Cache-Control": "no-cache",
+        "Pragma": "no-cache",
+    }
 
 
 def tentar_socket(transporte):
     global sio
 
+    tipo_diag = "websocket" if transporte == "websocket" else "engineio"
+
     add_log("")
     add_log("================================================")
-    add_log(f"🔌 INICIANDO TESTE SOCKET.IO | transporte={transporte}")
+    add_log(f"🔌 INICIANDO CONEXÃO | transporte={transporte}")
     add_log(f"🌐 URL={BLAZE_URL}")
     add_log(f"🛣️ PATH={SOCKET_PATH}")
     add_log(f"🏠 ROOM={ROOM}")
     add_log("================================================")
 
+    # Mostra as versões reais instaladas. Algumas versões não expõem
+    # __version__ diretamente no módulo, então usamos importlib.metadata.
     try:
-        import socketio
-        import engineio
-        import websocket
-
+        from importlib.metadata import version
         add_log(
-            f"📦 VERSÕES | "
-            f"python-socketio={getattr(socketio, '__version__', 'desconhecida')} | "
-            f"python-engineio={getattr(engineio, '__version__', 'desconhecida')} | "
-            f"websocket-client={getattr(websocket, '__version__', 'desconhecida')}"
+            "📦 VERSÕES | "
+            f"python-socketio={version('python-socketio')} | "
+            f"python-engineio={version('python-engineio')} | "
+            f"websocket-client={version('websocket-client')}"
         )
-    except Exception as e:
-        add_log(f"⚠️ Não foi possível obter versões: {repr(e)}")
+    except Exception as e:        
+        add_log(f"⚠️ Não foi possível obter versões dos pacotes: {repr(e)}")
 
-    configurar_socket(transporte)
+    # ------------------------------------------------------------
+    # PRIMEIRA TENTATIVA: exatamente no padrão do Collector V2.1
+    # ------------------------------------------------------------
+    tentativas = [
+        ("collector", None),
+        ("browser", _headers_compatibilidade()),
+    ]
 
-    try:
-        add_log("⏳ Chamando sio.connect()...")
-        add_log(
-            f"➡️ CONNECT | url={BLAZE_URL} | "
-            f"socketio_path={SOCKET_PATH} | transport={transporte}"
-        )
-
-        inicio = time.time()
-
-        sio.connect(
-            BLAZE_URL,
-            socketio_path=SOCKET_PATH,
-            transports=[transporte],
-            wait_timeout=20,
-        )
-
-        ms = round((time.time() - inicio) * 1000, 1)
-
-        add_log(
-            f"🟢 sio.connect() RETORNOU COM SUCESSO | "
-            f"transporte={transporte} | {ms} ms"
-        )
-        add_log(f"🔎 Socket conectado? {getattr(sio, 'connected', 'desconhecido')}")
-
-        diagnostico["websocket" if transporte == "websocket" else "engineio"] = "OK"
-        add_log(f"🟢 CONEXÃO SOCKET.IO OK | transporte={transporte} | {ms} ms")
-        return True
-
-    except Exception as e:
-        diagnostico["websocket" if transporte == "websocket" else "engineio"] = "FALHA"
-        diagnostico["ultimo_erro"] = repr(e)
-
-        add_log("")
-        add_log("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
-        add_log(f"❌ SOCKET.IO FALHOU | transporte={transporte}")
-        add_log(f"❌ TIPO DO ERRO: {type(e).__name__}")
-        add_log(f"❌ ERRO: {repr(e)}")
-        add_log("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
+    for indice, (modo, headers) in enumerate(tentativas, start=1):
+        configurar_socket(transporte, headers=headers)
 
         try:
-            import traceback
-            traceback_str = traceback.format_exc()
-            add_log("📋 TRACEBACK COMPLETO:")
-            for linha in traceback_str.strip().splitlines():
-                add_log(f"   {linha}")
-        except Exception as traceback_error:
-            add_log(f"⚠️ Erro ao gerar traceback: {repr(traceback_error)}")
+            add_log(
+                f"⏳ Tentativa {indice}/2 | modo={modo} | "
+                f"transport={transporte}"
+            )
 
-        try:
-            if sio:
-                add_log("🔌 Desconectando cliente Socket.IO após falha...")
-                sio.disconnect()
-        except Exception as disconnect_error:
-            add_log(f"⚠️ Erro ao desconectar: {repr(disconnect_error)}")
+            if headers:
+                add_log(f"🌍 Origin={headers['Origin']}")
+                add_log(f"🧭 Referer={headers['Referer']}")
+                add_log(f"🖥️ User-Agent={headers['User-Agent'][:90]}")
 
-        add_log(f"🔴 TESTE FINALIZADO COM FALHA | transporte={transporte}")
-        return False
+            inicio = time.time()
+
+            kwargs = {
+                "socketio_path": SOCKET_PATH,
+                "transports": [transporte],
+                "wait_timeout": 20,
+            }
+
+            if headers:
+                kwargs["headers"] = headers
+
+            add_log("➡️ Chamando sio.connect()...")
+            sio.connect(BLAZE_URL, **kwargs)
+
+            ms = round((time.time() - inicio) * 1000, 1)
+
+            conectado_socket = getattr(sio, "connected", False)
+            add_log(
+                f"🟢 sio.connect() retornou | {ms} ms | "
+                f"connected={conectado_socket}"
+            )
+
+            if conectado_socket:
+                diagnostico[tipo_diag] = "OK"
+                diagnostico["ultimo_erro"] = ""
+                add_log(
+                    f"🟢 CONEXÃO SOCKET.IO OK | transporte={transporte} | "
+                    f"modo={modo}"
+                )
+                return True
+
+            add_log("⚠️ sio.connect() retornou, mas connected=False")
+
+        except Exception as e:
+            diagnostico[tipo_diag] = "FALHA"
+            diagnostico["ultimo_erro"] = repr(e)
+
+            add_log(f"❌ FALHA | modo={modo} | transporte={transporte}")
+            add_log(f"❌ Tipo: {type(e).__name__}")
+            add_log(f"❌ Erro: {repr(e)}")
+
+            # O 403 é especialmente importante: significa que a requisição
+            # chegou ao servidor/Cloudflare, mas foi recusada.
+            if "403" in repr(e):
+                add_log("🚫 HTTP 403 detectado pelo servidor/Cloudflare")
+                add_log("   A conexão foi recusada antes do subscribe da sala.")
+
+        finally:
+            try:
+                if sio and getattr(sio, "connected", False):
+                    sio.disconnect()
+            except Exception:
+                pass
+
+        # Pequena pausa antes do segundo formato, evitando duas requisições
+        # instantâneas ao mesmo endpoint.
+        if indice < len(tentativas):
+            time.sleep(1)
+
+    add_log(f"🔴 TESTE FINALIZADO COM FALHA | transporte={transporte}")
+    return False
+
 
 def iniciar_socket():
     add_log("================================================")
