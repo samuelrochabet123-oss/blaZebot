@@ -190,7 +190,1176 @@ def add_log(msg):
 # ================================================================
 
 def get_db_connection():
+    database_url = # ================================================================
+# BLAZE DOUBLE — COLLECTOR V2.1
+# ================================================================
+# Objetivo:
+#   Capturar os resultados reais do Blaze Double via Socket.IO
+#   e armazenar no PostgreSQL.
+#
+# Fluxo:
+#
+#   BLAZE DOUBLE
+#        ↓
+#   Socket.IO
+#        ↓
+#   double.tick
+#        ↓
+#   resultado FINAL (status = complete)
+#        ↓
+#   PostgreSQL
+#        ↓
+#   tabela: blaze_historico
+#
+# IMPORTANTE:
+#   Este coletor NÃO aplica estratégia de aposta.
+#   Ele apenas coleta os resultados para posterior análise.
+#
+# Cores Blaze Double:
+#   0 = BRANCO
+#   1 = VERMELHO
+#   2 = PRETO
+#
+# ================================================================
+
+
+# ================================================================
+# 1. INSTALAÇÃO DAS DEPENDÊNCIAS
+# ================================================================
+
+!pip -q install "python-socketio[client]" psycopg2-binary
+
+
+# ================================================================
+# 2. IMPORTAÇÕES
+# ================================================================
+
+import os
+import sys
+import time
+import signal
+import threading
+from datetime import datetime, timezone
+
+import socketio
+import psycopg2
+from psycopg2.extras import RealDictCursor
+
+
+# ================================================================
+# 3. CONFIGURAÇÃO DO POSTGRESQL
+# ================================================================
+#
+# OPÇÃO 1 — variável de ambiente
+#
+# Se você já configurou DATABASE_URL no ambiente do Colab,
+# o programa irá utilizá-la automaticamente.
+#
+# OPÇÃO 2 — colocar diretamente abaixo
+#
+# Descomente e coloque sua DATABASE_URL:
+#
+# os.environ["DATABASE_URL"] = "postgresql://usuario:senha@host:5432/banco"
+#
+# NÃO compartilhe sua senha aqui no chat.
+#
+
+# ================================================================
+# COLE SUA DATABASE_URL AQUI, SE QUISER
+# ================================================================
+
+os.environ["DATABASE_URL"] = "postgresql://postgres:aoRHxpedtcdvuhuvvgcSBpYSFwmLCZpf@autorack.proxy.rlwy.net:54731/railway"
+
+
+# ================================================================
+# 4. CONFIGURAÇÕES DO BLAZE
+# ================================================================
+
+BLAZE_URL = "https://api-gaming.blaze.bet.br"
+
+SOCKET_PATH = "/replication/"
+
+ROOM = "double_room_1"
+
+EVENT_NAME = "data"
+
+TICK_NAME = "double.tick"
+
+
+# ================================================================
+# 5. CONFIGURAÇÕES DO COLETOR
+# ================================================================
+
+# Mostra todos os ticks recebidos
+MOSTRAR_TICKS = True
+
+# Intervalo do monitor de conexão
+INTERVALO_STATUS = 30
+
+# Número máximo de tentativas de reconexão
+MAX_RECONEXOES = 999999
+
+
+# ================================================================
+# 6. CONTROLE GLOBAL
+# ================================================================
+
+sio = None
+
+rodando = True
+
+conectado = False
+
+ultima_rodada = None
+
+total_ticks = 0
+
+total_resultados = 0
+
+total_duplicados = 0
+
+total_erros_db = 0
+
+
+# ================================================================
+# 7. MAPA DE CORES
+# ================================================================
+
+CORES = {
+    0: "BRANCO",
+    1: "VERMELHO",
+    2: "PRETO"
+}
+
+
+def nome_cor(cor):
+
+    try:
+        cor_int = int(cor)
+    except:
+        return "DESCONHECIDA"
+
+    return CORES.get(cor_int, f"DESCONHECIDA({cor_int})")
+
+
+# ================================================================
+# 8. CONEXÃO COM POSTGRESQL
+# ================================================================
+
+def get_db_connection():
+
     database_url = os.environ.get("DATABASE_URL")
+
+    if not database_url:
+        print()
+        print("=" * 70)
+        print("❌ DATABASE_URL NÃO CONFIGURADA")
+        print("=" * 70)
+        print()
+        print("Configure a variável DATABASE_URL antes de iniciar.")
+        print()
+        return None
+
+    try:
+
+        conn = psycopg2.connect(
+            database_url,
+            connect_timeout=15
+        )
+
+        conn.autocommit = False
+
+        return conn
+
+    except Exception as e:
+
+        print()
+        print("=" * 70)
+        print("❌ ERRO AO CONECTAR NO POSTGRESQL")
+        print("=" * 70)
+        print(str(e))
+        print()
+
+        return None
+
+
+# ================================================================
+# 9. TESTAR POSTGRESQL
+# ================================================================
+
+def testar_postgresql():
+
+    print()
+    print("=" * 70)
+    print("TESTANDO POSTGRESQL")
+    print("=" * 70)
+
+    conn = get_db_connection()
+
+    if not conn:
+
+        return False
+
+    try:
+
+        with conn.cursor() as cur:
+
+            cur.execute("SELECT version();")
+
+            resultado = cur.fetchone()
+
+            print("✅ PostgreSQL conectado.")
+
+            if resultado:
+
+                print("Versão:")
+
+                print(resultado[0])
+
+        conn.close()
+
+        return True
+
+    except Exception as e:
+
+        print("❌ Erro no teste PostgreSQL:")
+
+        print(e)
+
+        try:
+            conn.close()
+        except:
+            pass
+
+        return False
+
+
+# ================================================================
+# 10. CRIAR TABELA
+# ================================================================
+
+def init_db():
+
+    print()
+    print("=" * 70)
+    print("INICIALIZANDO BANCO")
+    print("=" * 70)
+
+    conn = get_db_connection()
+
+    if not conn:
+
+        return False
+
+    try:
+
+        with conn.cursor() as cur:
+
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS blaze_historico (
+
+                    id SERIAL PRIMARY KEY,
+
+                    rodada_id VARCHAR(100) UNIQUE NOT NULL,
+
+                    color INTEGER,
+
+                    cor VARCHAR(20),
+
+                    roll INTEGER,
+
+                    status VARCHAR(30),
+
+                    room_id INTEGER,
+
+                    created_at TIMESTAMP,
+
+                    updated_at TIMESTAMP,
+
+                    coletado_em TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+
+                );
+            """)
+
+            # Índices para facilitar análises futuras
+
+            cur.execute("""
+                CREATE INDEX IF NOT EXISTS idx_blaze_created_at
+                ON blaze_historico(created_at);
+            """)
+
+            cur.execute("""
+                CREATE INDEX IF NOT EXISTS idx_blaze_cor
+                ON blaze_historico(cor);
+            """)
+
+            cur.execute("""
+                CREATE INDEX IF NOT EXISTS idx_blaze_roll
+                ON blaze_historico(roll);
+            """)
+
+            conn.commit()
+
+        conn.close()
+
+        print("✅ Tabela blaze_historico pronta.")
+
+        return True
+
+    except Exception as e:
+
+        print()
+        print("❌ ERRO AO CRIAR TABELA:")
+        print(e)
+
+        try:
+            conn.rollback()
+            conn.close()
+        except:
+            pass
+
+        return False
+
+
+# ================================================================
+# 11. SALVAR RESULTADO
+# ================================================================
+
+def salvar_resultado(payload):
+
+    global total_resultados
+    global total_duplicados
+    global total_erros_db
+    global ultima_rodada
+
+    rodada_id = payload.get("id")
+
+    color = payload.get("color")
+
+    roll = payload.get("roll")
+
+    status = payload.get("status")
+
+    room_id = payload.get("room_id")
+
+    created_at = payload.get("created_at")
+
+    updated_at = payload.get("updated_at")
+
+
+    # ------------------------------------------------------------
+    # Validação
+    # ------------------------------------------------------------
+
+    if not rodada_id:
+
+        print("⚠️ Resultado ignorado: rodada sem ID.")
+
+        return False
+
+
+    if color is None:
+
+        print(
+            f"⚠️ Resultado ignorado: "
+            f"rodada {rodada_id} sem cor."
+        )
+
+        return False
+
+
+    if roll is None:
+
+        print(
+            f"⚠️ Resultado ignorado: "
+            f"rodada {rodada_id} sem roll."
+        )
+
+        return False
+
+
+    if status != "complete":
+
+        return False
+
+
+    cor_nome = nome_cor(color)
+
+
+    # ------------------------------------------------------------
+    # Conversão dos timestamps
+    # ------------------------------------------------------------
+
+    created_datetime = None
+
+    updated_datetime = None
+
+    try:
+
+        if created_at:
+
+            created_datetime = datetime.fromisoformat(
+                created_at.replace("Z", "+00:00")
+            ).replace(tzinfo=None)
+
+    except Exception:
+
+        created_datetime = None
+
+
+    try:
+
+        if updated_at:
+
+            updated_datetime = datetime.fromisoformat(
+                updated_at.replace("Z", "+00:00")
+            ).replace(tzinfo=None)
+
+    except Exception:
+
+        updated_datetime = None
+
+
+    # ------------------------------------------------------------
+    # Conexão
+    # ------------------------------------------------------------
+
+    conn = get_db_connection()
+
+    if not conn:
+
+        total_erros_db += 1
+
+        return False
+
+
+    try:
+
+        with conn.cursor() as cur:
+
+            cur.execute("""
+                INSERT INTO blaze_historico (
+
+                    rodada_id,
+                    color,
+                    cor,
+                    roll,
+                    status,
+                    room_id,
+                    created_at,
+                    updated_at
+
+                )
+
+                VALUES (
+
+                    %s,
+                    %s,
+                    %s,
+                    %s,
+                    %s,
+                    %s,
+                    %s,
+                    %s
+
+                )
+
+                ON CONFLICT (rodada_id)
+                DO NOTHING
+
+                RETURNING id;
+
+            """, (
+
+                rodada_id,
+                color,
+                cor_nome,
+                roll,
+                status,
+                room_id,
+                created_datetime,
+                updated_datetime
+
+            ))
+
+
+            resultado = cur.fetchone()
+
+
+        conn.commit()
+
+        conn.close()
+
+
+        # --------------------------------------------------------
+        # Resultado novo
+        # --------------------------------------------------------
+
+        if resultado:
+
+            total_resultados += 1
+
+            ultima_rodada = rodada_id
+
+            print()
+            print("=" * 70)
+            print("✅ RESULTADO SALVO NO POSTGRESQL")
+            print("=" * 70)
+
+            print(f"Rodada : {rodada_id}")
+            print(f"Cor    : {cor_nome}")
+            print(f"Color  : {color}")
+            print(f"Roll   : {roll}")
+            print(f"Status : {status}")
+            print(f"Room   : {room_id}")
+            print(f"Data   : {created_at}")
+
+            print("=" * 70)
+            print()
+
+            return True
+
+
+        # --------------------------------------------------------
+        # Rodada já existente
+        # --------------------------------------------------------
+
+        else:
+
+            total_duplicados += 1
+
+            if MOSTRAR_TICKS:
+
+                print(
+                    f"↩️ DUPLICADO | "
+                    f"{rodada_id} | "
+                    f"{cor_nome} | "
+                    f"roll={roll}"
+                )
+
+            return False
+
+
+    except Exception as e:
+
+        total_erros_db += 1
+
+        print()
+        print("=" * 70)
+        print("❌ ERRO AO SALVAR NO POSTGRESQL")
+        print("=" * 70)
+        print(e)
+        print("=" * 70)
+
+        try:
+
+            conn.rollback()
+            conn.close()
+
+        except:
+            pass
+
+        return False
+
+
+# ================================================================
+# 12. PROCESSAR DOUBLE.TICK
+# ================================================================
+
+def processar_tick(data):
+
+    global total_ticks
+
+    total_ticks += 1
+
+
+    # ------------------------------------------------------------
+    # Estrutura esperada:
+    #
+    # {
+    #     "id": "double.tick",
+    #     "payload": {
+    #         ...
+    #     }
+    # }
+    # ------------------------------------------------------------
+
+    if not isinstance(data, dict):
+
+        return
+
+
+    event_id = data.get("id")
+
+    payload = data.get("payload")
+
+
+    if event_id != TICK_NAME:
+
+        return
+
+
+    if not isinstance(payload, dict):
+
+        return
+
+
+    rodada_id = payload.get("id")
+
+    status = payload.get("status")
+
+    color = payload.get("color")
+
+    roll = payload.get("roll")
+
+
+    # ------------------------------------------------------------
+    # Mostrar tick
+    # ------------------------------------------------------------
+
+    if MOSTRAR_TICKS:
+
+        cor = (
+            nome_cor(color)
+            if color is not None
+            else "-"
+        )
+
+        print(
+            f"📡 TICK | "
+            f"ID={rodada_id} | "
+            f"STATUS={status} | "
+            f"COR={cor} | "
+            f"ROLL={roll}"
+        )
+
+
+    # ------------------------------------------------------------
+    # Só salva resultado FINAL
+    # ------------------------------------------------------------
+
+    if status != "complete":
+
+        return
+
+
+    if color is None or roll is None:
+
+        print(
+            f"⚠️ COMPLETE sem resultado completo | "
+            f"ID={rodada_id}"
+        )
+
+        return
+
+
+    salvar_resultado(payload)
+
+
+# ================================================================
+# 13. EVENTO DE CONEXÃO
+# ================================================================
+
+def on_connect():
+
+    global conectado
+
+    conectado = True
+
+    print()
+    print("=" * 70)
+    print("🟢 SOCKET.IO CONECTADO")
+    print("=" * 70)
+    print(f"Servidor : {BLAZE_URL}")
+    print(f"Path     : {SOCKET_PATH}")
+    print(f"Room     : {ROOM}")
+    print("=" * 70)
+    print()
+
+
+    # ------------------------------------------------------------
+    # Inscrição na sala Double
+    # ------------------------------------------------------------
+
+    try:
+
+        sio.emit(
+            "cmd",
+            {
+                "id": "subscribe",
+                "payload": {
+                    "room": ROOM
+                }
+            }
+        )
+
+        print(
+            f"📡 Subscribe enviado para: {ROOM}"
+        )
+
+    except Exception as e:
+
+        print(
+            "❌ Erro ao enviar subscribe:",
+            e
+        )
+
+
+# ================================================================
+# 14. EVENTO DE DESCONEXÃO
+# ================================================================
+
+def on_disconnect():
+
+    global conectado
+
+    conectado = False
+
+    print()
+    print("=" * 70)
+    print("🔴 SOCKET.IO DESCONECTADO")
+    print("=" * 70)
+    print()
+
+
+# ================================================================
+# 15. EVENTO DE ERRO
+# ================================================================
+
+def on_connect_error(data):
+
+    global conectado
+
+    conectado = False
+
+    print()
+    print("=" * 70)
+    print("❌ ERRO DE CONEXÃO SOCKET.IO")
+    print("=" * 70)
+
+    print(data)
+
+    print("=" * 70)
+    print()
+
+
+# ================================================================
+# 16. EVENTO DATA
+# ================================================================
+
+def on_data(data):
+
+    try:
+
+        processar_tick(data)
+
+    except Exception as e:
+
+        print()
+        print("❌ Erro processando evento data:")
+        print(e)
+        print()
+
+
+# ================================================================
+# 17. MONITOR DE STATUS
+# ================================================================
+
+def monitor_status():
+
+    global rodando
+
+    while rodando:
+
+        time.sleep(INTERVALO_STATUS)
+
+        if not rodando:
+
+            break
+
+        print()
+        print(
+            f"📊 STATUS | "
+            f"Socket={'CONECTADO' if conectado else 'DESCONECTADO'} | "
+            f"Ticks={total_ticks} | "
+            f"Resultados={total_resultados} | "
+            f"Duplicados={total_duplicados} | "
+            f"ErrosDB={total_erros_db}"
+        )
+
+
+# ================================================================
+# 18. TRATAMENTO DE CTRL+C
+# ================================================================
+
+def encerrar(sig=None, frame=None):
+
+    global rodando
+
+    print()
+    print()
+    print("=" * 70)
+    print("ENCERRANDO COLLECTOR...")
+    print("=" * 70)
+
+    rodando = False
+
+    try:
+
+        if sio:
+
+            sio.disconnect()
+
+    except:
+
+        pass
+
+    print()
+    print("Collector encerrado.")
+    print()
+
+
+# ================================================================
+# 19. CONFIGURAR SOCKET.IO
+# ================================================================
+
+def configurar_socket():
+
+    global sio
+
+    sio = socketio.Client(
+
+        reconnection=True,
+
+        reconnection_attempts=MAX_RECONEXOES,
+
+        reconnection_delay=2,
+
+        reconnection_delay_max=10,
+
+        logger=False,
+
+        engineio_logger=False
+
+    )
+
+
+    # ------------------------------------------------------------
+    # Eventos Socket.IO
+    # ------------------------------------------------------------
+
+    sio.on(
+        "connect",
+        on_connect
+    )
+
+    sio.on(
+        "disconnect",
+        on_disconnect
+    )
+
+    sio.on(
+        "connect_error",
+        on_connect_error
+    )
+
+    sio.on(
+        EVENT_NAME,
+        on_data
+    )
+
+
+# ================================================================
+# 20. INICIAR SOCKET
+# ================================================================
+
+def iniciar_socket():
+
+    global sio
+
+    configurar_socket()
+
+
+    print()
+    print("=" * 70)
+    print("CONECTANDO AO BLAZE DOUBLE")
+    print("=" * 70)
+
+    print(f"URL       : {BLAZE_URL}")
+    print(f"SOCKET    : {SOCKET_PATH}")
+    print(f"ROOM      : {ROOM}")
+    print()
+
+
+    try:
+
+        sio.connect(
+
+            BLAZE_URL,
+
+            socketio_path=SOCKET_PATH,
+
+            transports=[
+                "websocket"
+            ],
+
+            wait_timeout=20
+
+        )
+
+    except Exception as e:
+
+        print()
+        print("=" * 70)
+        print("❌ FALHA AO CONECTAR")
+        print("=" * 70)
+
+        print(e)
+
+        print("=" * 70)
+        print()
+
+        return False
+
+
+    return True
+
+
+# ================================================================
+# 21. CONSULTAR QUANTIDADE DE RESULTADOS
+# ================================================================
+
+def mostrar_estatisticas_db():
+
+    conn = get_db_connection()
+
+    if not conn:
+
+        return
+
+
+    try:
+
+        with conn.cursor() as cur:
+
+            cur.execute("""
+                SELECT
+                    COUNT(*),
+                    MIN(created_at),
+                    MAX(created_at)
+                FROM blaze_historico;
+            """)
+
+            total, primeira, ultima = cur.fetchone()
+
+
+            print()
+            print("=" * 70)
+            print("BANCO DE DADOS")
+            print("=" * 70)
+
+            print(f"Total de resultados : {total}")
+            print(f"Primeiro resultado  : {primeira}")
+            print(f"Último resultado    : {ultima}")
+
+            print("=" * 70)
+            print()
+
+
+        conn.close()
+
+    except Exception as e:
+
+        print(
+            "Erro consultando estatísticas:",
+            e
+        )
+
+        try:
+            conn.close()
+        except:
+            pass
+
+
+# ================================================================
+# 22. MAIN
+# ================================================================
+
+def main():
+
+    global rodando
+
+
+    print()
+    print("=" * 70)
+    print("BLAZE DOUBLE — COLLECTOR V2.1")
+    print("=" * 70)
+
+    print()
+    print("Objetivo:")
+    print("Capturar resultados do Blaze Double")
+    print("e armazená-los no PostgreSQL.")
+    print()
+
+    print("Tabela:")
+    print("blaze_historico")
+
+    print()
+    print("Cores:")
+    print("0 = BRANCO")
+    print("1 = VERMELHO")
+    print("2 = PRETO")
+
+    print()
+    print("=" * 70)
+
+
+    # ============================================================
+    # DATABASE_URL
+    # ============================================================
+
+    database_url = os.environ.get(
+        "DATABASE_URL"
+    )
+
+
+    if not database_url:
+
+        print()
+        print("❌ DATABASE_URL NÃO CONFIGURADA.")
+        print()
+        print(
+            "Defina a variável DATABASE_URL "
+            "antes de executar o Collector."
+        )
+        print()
+
+        return
+
+
+    print()
+    print("✅ DATABASE_URL encontrada.")
+
+
+    # ============================================================
+    # TESTAR POSTGRESQL
+    # ============================================================
+
+    if not testar_postgresql():
+
+        print()
+        print("❌ PostgreSQL não respondeu.")
+        print("Collector não iniciado.")
+        print()
+
+        return
+
+
+    # ============================================================
+    # CRIAR TABELA
+    # ============================================================
+
+    if not init_db():
+
+        print()
+        print("❌ Não foi possível inicializar o banco.")
+        print("Collector não iniciado.")
+        print()
+
+        return
+
+
+    # ============================================================
+    # ESTATÍSTICAS ANTES DE INICIAR
+    # ============================================================
+
+    mostrar_estatisticas_db()
+
+
+    # ============================================================
+    # MONITOR
+    # ============================================================
+
+    thread_status = threading.Thread(
+
+        target=monitor_status,
+
+        daemon=True
+
+    )
+
+    thread_status.start()
+
+
+    # ============================================================
+    # CTRL+C
+    # ============================================================
+
+    signal.signal(
+        signal.SIGINT,
+        encerrar
+    )
+
+
+    # ============================================================
+    # SOCKET
+    # ============================================================
+
+    sucesso = iniciar_socket()
+
+
+    if not sucesso:
+
+        encerrar()
+
+        return
+
+
+    # ============================================================
+    # LOOP PRINCIPAL
+    # ============================================================
+
+    print()
+    print("=" * 70)
+    print("🟢 COLLECTOR V2.1 OPERANDO")
+    print("=" * 70)
+    print()
+    print("Aguardando resultados...")
+    print()
+    print("Não feche esta célula enquanto quiser coletar.")
+    print("Para parar: interrompa a execução da célula.")
+    print()
+    print("=" * 70)
+    print()
+
+
+    try:
+
+        while rodando:
+
+            time.sleep(1)
+
+
+    except KeyboardInterrupt:
+
+        encerrar()
+
+
+    except Exception as e:
+
+        print()
+        print("❌ Erro no loop principal:")
+        print(e)
+        print()
+
+        encerrar()
+
+
+# ================================================================
+# 23. EXECUTAR
+# ================================================================
+
+main()
 
     if not database_url:
         add_log("⚠️ DATABASE_URL não configurada.")
