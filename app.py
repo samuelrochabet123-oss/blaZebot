@@ -7,6 +7,7 @@ from datetime import datetime
 
 import socketio
 import psycopg2
+import requests
 from flask import Flask, redirect, render_template_string
 
 # ================================================================
@@ -1053,30 +1054,6 @@ BLAZE_ORIGIN = os.getenv("BLAZE_ORIGIN", "https://blaze.bet.br")
 BLAZE_REFERER = os.getenv("BLAZE_REFERER", "https://blaze.bet.br/")
 
 
-def configurar_socket(transporte, headers=None):
-    global sio
-
-    # Esta configuração segue deliberadamente o Collector V2.1 que
-    # funciona no Colab: reconexão longa e logs internos desligados.
-    sio = socketio.Client(
-        reconnection=True,
-        reconnection_attempts=MAX_RECONEXOES,
-        reconnection_delay=2,
-        reconnection_delay_max=10,
-        logger=False,
-        engineio_logger=False,
-    )
-
-    sio.on("connect", on_connect)
-    sio.on("disconnect", on_disconnect)
-    sio.on("connect_error", on_connect_error)
-    sio.on(EVENT_NAME, on_data)
-
-    add_log(f"⚙️ Socket configurado | transporte={transporte}")
-    if headers:
-        add_log("🧩 Headers de compatibilidade ativados")
-
-
 def _headers_compatibilidade():
     return {
         "User-Agent": BLAZE_USER_AGENT,
@@ -1087,6 +1064,75 @@ def _headers_compatibilidade():
         "Cache-Control": "no-cache",
         "Pragma": "no-cache",
     }
+
+
+def _criar_sessao_browser():
+    """Cria uma sessão HTTP persistente e tenta obter cookies iniciais do site."""
+    headers = _headers_compatibilidade()
+    sessao = requests.Session()
+    sessao.headers.update(headers)
+
+    add_log("🌐 Aquecendo sessão HTTP do site Blaze...")
+
+    try:
+        inicio = time.time()
+        resposta = sessao.get(
+            BLAZE_ORIGIN.rstrip("/") + "/",
+            timeout=15,
+            allow_redirects=True,
+        )
+        ms = round((time.time() - inicio) * 1000, 1)
+
+        add_log(
+            f"🌐 SITE BLAZE | HTTP {resposta.status_code} | {ms} ms | "
+            f"url_final={resposta.url}"
+        )
+        add_log(
+            f"🍪 Cookies obtidos: {len(sessao.cookies)}"
+        )
+
+        if resposta.status_code == 403:
+            add_log(
+                "🚫 O próprio site Blaze respondeu 403 para o Railway. "
+                "Isso aponta para bloqueio de origem/IP ou desafio do Cloudflare."
+            )
+        elif resposta.status_code < 400:
+            add_log("🟢 Sessão HTTP inicial aceita pelo site Blaze.")
+        else:
+            add_log(
+                f"⚠️ Site Blaze respondeu HTTP {resposta.status_code}; "
+                "a sessão ainda será usada no teste Socket.IO."
+            )
+
+    except Exception as e:
+        add_log(f"⚠️ Falha ao aquecer sessão HTTP: {type(e).__name__}: {repr(e)}")
+
+    return sessao
+
+
+def configurar_socket(transporte, headers=None, http_session=None):
+    global sio
+
+    sio = socketio.Client(
+        reconnection=True,
+        reconnection_attempts=MAX_RECONEXOES,
+        reconnection_delay=2,
+        reconnection_delay_max=10,
+        logger=False,
+        engineio_logger=False,
+        http_session=http_session,
+    )
+
+    sio.on("connect", on_connect)
+    sio.on("disconnect", on_disconnect)
+    sio.on("connect_error", on_connect_error)
+    sio.on(EVENT_NAME, on_data)
+
+    add_log(f"⚙️ Socket configurado | transporte={transporte}")
+    if headers:
+        add_log("🧩 Headers de compatibilidade ativados")
+    if http_session is not None:
+        add_log("🍪 Sessão HTTP persistente vinculada ao Socket.IO")
 
 
 def tentar_socket(transporte):
@@ -1102,29 +1148,30 @@ def tentar_socket(transporte):
     add_log(f"🏠 ROOM={ROOM}")
     add_log("================================================")
 
-    # Mostra as versões reais instaladas. Algumas versões não expõem
-    # __version__ diretamente no módulo, então usamos importlib.metadata.
     try:
         from importlib.metadata import version
         add_log(
             "📦 VERSÕES | "
             f"python-socketio={version('python-socketio')} | "
             f"python-engineio={version('python-engineio')} | "
-            f"websocket-client={version('websocket-client')}"
+            f"websocket-client={version('websocket-client')} | "
+            f"requests={version('requests')}"
         )
-    except Exception as e:        
+    except Exception as e:
         add_log(f"⚠️ Não foi possível obter versões dos pacotes: {repr(e)}")
 
-    # ------------------------------------------------------------
-    # PRIMEIRA TENTATIVA: exatamente no padrão do Collector V2.1
-    # ------------------------------------------------------------
+    # Primeira tentativa: padrão do Collector.
     tentativas = [
-        ("collector", None),
-        ("browser", _headers_compatibilidade()),
+        ("collector", None, None),
+        ("browser", _headers_compatibilidade(), _criar_sessao_browser()),
     ]
 
-    for indice, (modo, headers) in enumerate(tentativas, start=1):
-        configurar_socket(transporte, headers=headers)
+    for indice, (modo, headers, http_session) in enumerate(tentativas, start=1):
+        configurar_socket(
+            transporte,
+            headers=headers,
+            http_session=http_session,
+        )
 
         try:
             add_log(
@@ -1135,7 +1182,13 @@ def tentar_socket(transporte):
             if headers:
                 add_log(f"🌍 Origin={headers['Origin']}")
                 add_log(f"🧭 Referer={headers['Referer']}")
-                add_log(f"🖥️ User-Agent={headers['User-Agent'][:90]}")
+                add_log(f"🖥️ User-Agent={headers['User-Agent'][:120]}")
+
+            if http_session is not None:
+                add_log(
+                    f"🍪 Cookies antes do Socket.IO: "
+                    f"{len(http_session.cookies)}"
+                )
 
             inicio = time.time()
 
@@ -1152,8 +1205,8 @@ def tentar_socket(transporte):
             sio.connect(BLAZE_URL, **kwargs)
 
             ms = round((time.time() - inicio) * 1000, 1)
-
             conectado_socket = getattr(sio, "connected", False)
+
             add_log(
                 f"🟢 sio.connect() retornou | {ms} ms | "
                 f"connected={conectado_socket}"
@@ -1178,8 +1231,6 @@ def tentar_socket(transporte):
             add_log(f"❌ Tipo: {type(e).__name__}")
             add_log(f"❌ Erro: {repr(e)}")
 
-            # O 403 é especialmente importante: significa que a requisição
-            # chegou ao servidor/Cloudflare, mas foi recusada.
             if "403" in repr(e):
                 add_log("🚫 HTTP 403 detectado pelo servidor/Cloudflare")
                 add_log("   A conexão foi recusada antes do subscribe da sala.")
@@ -1191,8 +1242,6 @@ def tentar_socket(transporte):
             except Exception:
                 pass
 
-        # Pequena pausa antes do segundo formato, evitando duas requisições
-        # instantâneas ao mesmo endpoint.
         if indice < len(tentativas):
             time.sleep(1)
 
