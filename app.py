@@ -164,7 +164,7 @@ def add_log(msg):
 # ================================================================
 
 def get_db_connection():
-    database_url = os.environ.get("DATABASE_URL")
+    database_url = "postgresql://postgres:aoRHxpedtcdvuhuvvgcSBpYSFwmLCZpf@autorack.proxy.rlwy.net:54731/railway"
 
     if not database_url:
         add_log("⚠️ DATABASE_URL não configurada.")
