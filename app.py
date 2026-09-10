@@ -11,9 +11,9 @@ import requests
 from flask import Flask, redirect, render_template_string
 
 # ================================================================
-# BLAZE DOUBLE — BOT V3
+# BLAZE DOUBLE — BOT ESTUDO 2
 # ================================================================
-# Coleta contínua + PostgreSQL + motor V3 + painel web
+# Coleta contínua + PostgreSQL + motor ESTUDO 2 + painel web
 #
 # O bot NÃO executa apostas na Blaze.
 # Ele apenas coleta resultados, gera sinais e contabiliza
@@ -25,10 +25,13 @@ from flask import Flask, redirect, render_template_string
 #   - não é LOSS
 #   - não encerra sinal aberto
 #
-# V3:
-#   - 10 regras
-#   - mínimo operacional padrão = 2 votos
-#   - empate = sem sinal
+# ESTUDO 2:
+#   - MOV_SEQ_3
+#   - janela = 300 resultados
+#   - mínimo = 10 ocorrências
+#   - confiança mínima = 60%
+#   - modo INVERTIDO
+#   - WHITE não participa do treino nem encerra sinal
 # ================================================================
 
 # ================================================================
@@ -43,13 +46,22 @@ TICK_NAME = "double.tick"
 
 MIN_CONFLUENCIA = int(os.getenv("MIN_CONFLUENCIA", "2"))
 APOSTA_BASE = float(os.getenv("APOSTA_BASE", "1.00"))
-HISTORICO_MEMORIA = int(os.getenv("HISTORICO_MEMORIA", "50"))
+HISTORICO_MEMORIA = int(os.getenv("HISTORICO_MEMORIA", "500"))
 MAX_LOGS = 80
 INTERVALO_STATUS = 30
 MAX_RECONEXOES = 999999
 MOSTRAR_TICKS = os.getenv("MOSTRAR_TICKS", "false").lower() == "true"
 COLETA_MODO = os.getenv("COLETA_MODO", "postgres_bridge").lower().strip()
 COLETA_DB_INTERVALO = float(os.getenv("COLETA_DB_INTERVALO", "1.0"))
+
+# ================================================================
+# ESTUDO 2 — MOV_SEQ_3 / INVERTIDO
+# ================================================================
+ESTUDO2_JANELA = int(os.getenv("ESTUDO2_JANELA", "300"))
+ESTUDO2_MIN_OCORRENCIAS = int(os.getenv("ESTUDO2_MIN_OCORRENCIAS", "10"))
+ESTUDO2_CONFIANCA = float(os.getenv("ESTUDO2_CONFIANCA", "0.60"))
+ESTUDO2_MIN_HISTORICO = int(os.getenv("ESTUDO2_MIN_HISTORICO", "20"))
+ESTUDO2_ATIVO = os.getenv("ESTUDO2_ATIVO", "true").lower() == "true"
 
 
 # ================================================================
@@ -409,89 +421,148 @@ def salvar_operacao_db(
 
 
 # ================================================================
-# REGRAS V3
+# ESTUDO 2 — MOTOR WALK-FORWARD
 # ================================================================
 
-def calcular_regras():
+def movimento(a, b):
+    """Movimento do número b em relação ao número a."""
+    if b > a:
+        return "S"  # SUBIU
+    if b < a:
+        return "D"  # DESCEU
+    return "I"      # IGUAL
+
+
+def calcular_mov_seq_3(numeros):
+    """Retorna a sequência dos 3 últimos movimentos."""
+    if len(numeros) < 4:
+        return None
+    return "".join(
+        movimento(numeros[-4], numeros[-3]),
+        movimento(numeros[-3], numeros[-2]),
+        movimento(numeros[-2], numeros[-1]),
+    )
+
+
+def _mov_seq_3_no_indice(numeros, i):
+    """MOV_SEQ_3 terminando no índice i."""
+    if i < 3:
+        return None
+    return "".join([
+        movimento(numeros[i - 3], numeros[i - 2]),
+        movimento(numeros[i - 2], numeros[i - 1]),
+        movimento(numeros[i - 1], numeros[i]),
+    ])
+
+
+def calcular_estudo2():
     """
-    Calcula as 10 regras usando SOMENTE o histórico anterior.
-    Retorna apenas as regras que geraram sinal.
+    Estudo 2 em modo INVERTIDO.
+
+    A regra é recalculada usando apenas o histórico ANTERIOR ao próximo
+    resultado. Dentro da janela de 300 resultados, procura o contexto
+    MOV_SEQ_3 atual, exige pelo menos 10 ocorrências e confiança mínima
+    de 60%. A cor dominante observada no histórico é INVERTIDA para
+    gerar o sinal. WHITE é excluído da contagem de alvo.
     """
     n = list(history_numbers)
-    sinais = {}
+    c = list(history_colors)
 
-    # R1 — SOMA2 <= 8 -> BLACK
-    if len(n) >= 2 and n[-1] + n[-2] <= 8:
-        sinais["R1"] = "B"
+    if len(n) < ESTUDO2_MIN_HISTORICO or len(c) != len(n):
+        return {
+            "sinal": None, "votos": 0, "regra": "MOV_SEQ_3",
+            "contexto": None, "ocorrencias": 0, "confianca": 0.0,
+            "historico": len(n), "motivo": "histórico insuficiente",
+            "dominante": None, "invertido": None,
+        }
 
-    # R2 — SOMA3 <= 14 -> RED
-    if len(n) >= 3 and sum(n[-3:]) <= 14:
-        sinais["R2"] = "R"
+    contexto_atual = calcular_mov_seq_3(n)
+    if contexto_atual is None:
+        return {
+            "sinal": None, "votos": 0, "regra": "MOV_SEQ_3",
+            "contexto": None, "ocorrencias": 0, "confianca": 0.0,
+            "historico": len(n), "motivo": "contexto indisponível",
+            "dominante": None, "invertido": None,
+        }
 
-    # R3 — SOMA3 >= 30 -> BLACK
-    if len(n) >= 3 and sum(n[-3:]) >= 30:
-        sinais["R3"] = "B"
+    # Treino somente no passado: cada contexto em i prevê a cor de i+1.
+    inicio = max(0, len(n) - ESTUDO2_JANELA)
+    vermelhos = 0
+    pretos = 0
 
-    # R4 — DISTÂNCIA >= 9 -> RED
-    if len(n) >= 2 and abs(n[-1] - n[-2]) >= 9:
-        sinais["R4"] = "R"
+    # i é o último ponto do contexto; i+1 é o alvo histórico.
+    for i in range(max(3, inicio), len(n) - 1):
+        contexto = _mov_seq_3_no_indice(n, i)
+        if contexto != contexto_atual:
+            continue
 
-    # R5 — DISTÂNCIA >= 11 -> RED
-    if len(n) >= 2 and abs(n[-1] - n[-2]) >= 11:
-        sinais["R5"] = "R"
+        alvo = c[i + 1]
+        if alvo == "R":
+            vermelhos += 1
+        elif alvo == "B":
+            pretos += 1
 
-    # R6 — NÚMERO 3 -> RED
-    if len(n) >= 1 and n[-1] == 3:
-        sinais["R6"] = "R"
+    ocorrencias = vermelhos + pretos
 
-    # R7 — NÚMERO 4 -> BLACK
-    if len(n) >= 1 and n[-1] == 4:
-        sinais["R7"] = "B"
+    if ocorrencias < ESTUDO2_MIN_OCORRENCIAS:
+        return {
+            "sinal": None, "votos": ocorrencias, "regra": "MOV_SEQ_3",
+            "contexto": contexto_atual, "ocorrencias": ocorrencias,
+            "confianca": 0.0, "historico": len(n),
+            "motivo": "ocorrências insuficientes",
+            "dominante": None, "invertido": None,
+        }
 
-    # R8 — NÚMERO 6 -> BLACK
-    if len(n) >= 1 and n[-1] == 6:
-        sinais["R8"] = "B"
+    if vermelhos == pretos:
+        return {
+            "sinal": None, "votos": ocorrencias, "regra": "MOV_SEQ_3",
+            "contexto": contexto_atual, "ocorrencias": ocorrencias,
+            "confianca": 0.50, "historico": len(n),
+            "motivo": "empate no histórico",
+            "dominante": None, "invertido": None,
+        }
 
-    # R9 — H10-H10-L7 -> BLACK
-    if len(n) >= 3 and n[-3] >= 8 and n[-2] >= 8 and n[-1] == 7:
-        sinais["R9"] = "B"
+    dominante = "R" if vermelhos > pretos else "B"
+    maior = max(vermelhos, pretos)
+    confianca = maior / ocorrencias
+    invertido = "B" if dominante == "R" else "R"
 
-    # R10 — H7-H7-L1 -> BLACK
-    if len(n) >= 3 and n[-3] >= 7 and n[-2] >= 7 and n[-1] <= 1:
-        sinais["R10"] = "B"
+    if confianca < ESTUDO2_CONFIANCA:
+        return {
+            "sinal": None, "votos": ocorrencias, "regra": "MOV_SEQ_3",
+            "contexto": contexto_atual, "ocorrencias": ocorrencias,
+            "confianca": confianca, "historico": len(n),
+            "motivo": "confiança abaixo do mínimo",
+            "dominante": dominante, "invertido": invertido,
+        }
 
-    return sinais
+    return {
+        "sinal": invertido,
+        "votos": ocorrencias,
+        "regra": "MOV_SEQ_3",
+        "contexto": contexto_atual,
+        "ocorrencias": ocorrencias,
+        "confianca": confianca,
+        "historico": len(n),
+        "motivo": "sinal válido",
+        "dominante": dominante,
+        "invertido": invertido,
+        "vermelhos": vermelhos,
+        "pretos": pretos,
+    }
 
 
 def calcular_confluencia():
-    sinais = calcular_regras()
-
-    votos_r = [regra for regra, sinal in sinais.items() if sinal == "R"]
-    votos_b = [regra for regra, sinal in sinais.items() if sinal == "B"]
-
-    qtd_r = len(votos_r)
-    qtd_b = len(votos_b)
-
-    if qtd_r > qtd_b and qtd_r >= MIN_CONFLUENCIA:
-        sinal = "R"
-        votos = qtd_r
-        regras = votos_r
-    elif qtd_b > qtd_r and qtd_b >= MIN_CONFLUENCIA:
-        sinal = "B"
-        votos = qtd_b
-        regras = votos_b
-    else:
-        sinal = None
-        votos = max(qtd_r, qtd_b)
-        regras = []
-
+    """Compatibilidade com o motor anterior; agora retorna o Estudo 2."""
+    r = calcular_estudo2()
     return {
-        "sinal": sinal,
-        "votos": votos,
-        "votos_r": votos_r,
-        "votos_b": votos_b,
-        "regras": regras,
-        "sinais": sinais,
+        "sinal": r["sinal"],
+        "votos": r["votos"],
+        "votos_r": ["MOV_SEQ_3"] if r["sinal"] == "R" else [],
+        "votos_b": ["MOV_SEQ_3"] if r["sinal"] == "B" else [],
+        "regras": ["MOV_SEQ_3"] if r["sinal"] else [],
+        "sinais": {"MOV_SEQ_3": r["sinal"]} if r["sinal"] else {},
+        "estudo2": r,
     }
 
 
@@ -519,10 +590,10 @@ def start_bot():
         history_results.clear()
 
         add_log("==========================================")
-        add_log("🟢 V3 INICIADO")
-        add_log(f"🎯 Confluência mínima: {MIN_CONFLUENCIA} votos")
+        add_log("🟢 ESTUDO 2 INICIADO")
+        add_log(f"🧠 Estratégia: MOV_SEQ_3 | janela={ESTUDO2_JANELA} | mínimo={ESTUDO2_MIN_OCORRENCIAS} | confiança={ESTUDO2_CONFIANCA:.0%} | INVERTIDO")
         add_log(f"💰 Aposta simulada: R$ {APOSTA_BASE:.2f}")
-        add_log("⚪ WHITE será ignorado na avaliação.")
+        add_log("⚪ WHITE será ignorado na avaliação e no treino do Estudo 2.")
         add_log("==========================================")
 
 
@@ -539,7 +610,7 @@ def stop_bot():
         signal_rules = []
 
         add_log("==========================================")
-        add_log("🔴 V3 PARADO")
+        add_log("🔴 ESTUDO 2 PARADO")
         add_log(f"💰 Saldo da sessão: R$ {current_profit:.2f}")
         add_log("📡 COLETA CONTINUA.")
         add_log("==========================================")
@@ -676,36 +747,41 @@ def processar_resultado_novo(payload):
             return
 
         if bot_state == "CACANDO":
-            if len(history_numbers) < 2:
+            if not ESTUDO2_ATIVO:
                 return
 
-            resultado = calcular_confluencia()
-            sinais = resultado["sinais"]
+            resultado = calcular_estudo2()
+            estudo = resultado
 
-            if sinais:
-                partes = [f"{regra}={sinal}" for regra, sinal in sinais.items()]
-                add_log("🧠 " + " | ".join(partes))
+            if estudo.get("contexto"):
+                add_log(
+                    f"🧠 MOV_SEQ_3={estudo['contexto']} | "
+                    f"ocorrências={estudo['ocorrencias']} | "
+                    f"confiança={estudo['confianca']:.1%} | "
+                    f"histórico={estudo['historico']}"
+                )
 
             if resultado["sinal"]:
                 signal_color = resultado["sinal"]
                 signal_issue = rodada_id
                 signal_votes = resultado["votos"]
-                signal_rules = resultado["regras"]
+                signal_rules = ["MOV_SEQ_3 / INVERTIDO"]
                 bot_state = "ACOMPANHANDO"
 
                 alvo = "🔴 RED" if signal_color == "R" else "⚫ BLACK"
-                add_log(f"🚨 SINAL {alvo} | {signal_votes} VOTOS")
+                dominante = estudo.get("dominante") or "-"
+                add_log(f"🚨 SINAL {alvo} | INVERTIDO de {dominante}")
                 add_log(
-                    f"📊 R={len(resultado['votos_r'])} | "
-                    f"B={len(resultado['votos_b'])}"
+                    f"📊 contexto={estudo['contexto']} | "
+                    f"n={estudo['ocorrencias']} | "
+                    f"confiança={estudo['confianca']:.1%}"
                 )
-                add_log(f"🧩 Regras: {', '.join(signal_rules)}")
+                add_log("🧩 Regra: MOV_SEQ_3 | modo=INVERTIDO")
                 add_log(f"💰 Entrada simulada: R$ {APOSTA_BASE:.2f}")
-            elif resultado["votos"]:
-                add_log(
-                    f"⚪ SEM ENTRADA | R={len(resultado['votos_r'])} | "
-                    f"B={len(resultado['votos_b'])}"
-                )
+            else:
+                motivo = estudo.get("motivo", "sem sinal")
+                if estudo.get("contexto"):
+                    add_log(f"⚪ SEM ENTRADA | {motivo}")
 
 
 # ================================================================
@@ -1534,7 +1610,7 @@ HTML_TEMPLATE = r"""
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <meta http-equiv="refresh" content="10">
-<title>Blaze Double V3</title>
+<title>Blaze Double — Estudo 2</title>
 <style>
 :root {
     --bg: #07090d;
@@ -1662,12 +1738,12 @@ body {
 <div class="container">
 
 <div class="header">
-    <div class="logo">🤖 Blaze <span>Double V3</span></div>
+    <div class="logo">🤖 Blaze <span>Double Estudo 2</span></div>
     <div class="controls">
         {% if running %}
-        <form method="POST" action="/stop"><button class="btn btn-stop">⏹ PARAR V3</button></form>
+        <form method="POST" action="/stop"><button class="btn btn-stop">⏹ PARAR ESTUDO 2</button></form>
         {% else %}
-        <form method="POST" action="/start"><button class="btn btn-start">▶ INICIAR V3</button></form>
+        <form method="POST" action="/start"><button class="btn btn-start">▶ INICIAR ESTUDO 2</button></form>
         {% endif %}
         <form method="POST" action="/reset"><button class="btn btn-reset">↻ ZERAR</button></form>
     </div>
@@ -1689,13 +1765,13 @@ body {
         <div class="status-value">{{ last_round or '—' }}</div>
     </div>
     <div class="status-card">
-        <div class="status-title">Motor V3</div>
+        <div class="status-title">Motor Estudo 2</div>
         <div class="status-value">
             {% if running %}
                 {% if state == 'ACOMPANHANDO' %}
                     <span class="red">🚨 ACOMPANHANDO</span>
                 {% else %}
-                    <span class="yellow">🎯 CAÇANDO</span>
+                    <span class="yellow">🎯 CAÇANDO ESTUDO 2</span>
                 {% endif %}
             {% else %}
                 <span class="offline">⏹ PARADO</span>
@@ -1717,13 +1793,13 @@ body {
         Aposta simulada: R$ {{ '%.2f'|format(bet_amount) }}
     </div>
 {% elif running %}
-    <div class="signal-none">🎯 CAÇANDO SINAL V3</div>
+    <div class="signal-none">🎯 CAÇANDO ESTUDO 2 SINAL V3</div>
     <div class="signal-detail">
-        Mínimo de {{ min_confluencia }} votos. Empates não geram sinal.
+        MOV_SEQ_3 • Janela {{ estudo2_janela }} • Mínimo {{ estudo2_min }} • Confiança {{ estudo2_conf }}% • INVERTIDO
     </div>
 {% else %}
     <div class="signal-none">⏹ V3 PARADO</div>
-    <div class="signal-detail">A coleta continua mesmo com o motor V3 parado.</div>
+    <div class="signal-detail">A coleta continua mesmo com o motor Estudo 2 parado.</div>
 {% endif %}
 </div>
 
@@ -1749,7 +1825,7 @@ body {
 
 <div class="main-grid">
     <div class="console">
-        <div class="section-title">Console V3 / Coletor</div>
+        <div class="section-title">Console Estudo 2 / Coletor</div>
         {% for line in logs %}
             <div class="log
                 {% if 'WIN' in line %}log-win
@@ -1785,7 +1861,7 @@ body {
 </div>
 
 <div class="footer">
-    Coleta contínua • PostgreSQL • Socket.IO • V3
+    Coleta contínua • PostgreSQL • Estudo 2 • MOV_SEQ_3 INVERTIDO
     {% if db_errors > 0 %} • Erros DB: {{ db_errors }}{% endif %}
 </div>
 
@@ -1831,6 +1907,9 @@ def home():
             "operations": list(history_results),
             "min_confluencia": MIN_CONFLUENCIA,
             "bet_amount": APOSTA_BASE,
+            "estudo2_janela": ESTUDO2_JANELA,
+            "estudo2_min": ESTUDO2_MIN_OCORRENCIAS,
+            "estudo2_conf": round(ESTUDO2_CONFIANCA * 100, 1),
         }
 
     return render_template_string(HTML_TEMPLATE, **snapshot)
@@ -1871,8 +1950,8 @@ def health():
 # ================================================================
 
 def bot_loop():
-    add_log("🤖 Aplicação Blaze V3 iniciada.")
-    add_log("📡 Coleta será mantida mesmo com V3 parado.")
+    add_log("🤖 Aplicação Blaze — Estudo 2 iniciada.")
+    add_log("📡 Coleta será mantida mesmo com Estudo 2 parado.")
 
     while rodando:
         time.sleep(1)
@@ -1880,7 +1959,7 @@ def bot_loop():
 
 def main():
     add_log("==========================================")
-    add_log("BLAZE DOUBLE — BOT V3 / DIAGNÓSTICO")
+    add_log("BLAZE DOUBLE — BOT ESTUDO 2 / DIAGNÓSTICO")
     add_log("==========================================")
 
     if not os.environ.get("DATABASE_URL"):
