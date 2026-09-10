@@ -30,7 +30,7 @@ from flask import Flask, redirect, render_template_string
 #   - janela = 300 resultados
 #   - mínimo = 10 ocorrências
 #   - confiança mínima = 60%
-#   - modo INVERTIDO
+#   - modo NORMAL (sem inversão)
 #   - WHITE não participa do treino nem encerra sinal
 # ================================================================
 
@@ -55,7 +55,7 @@ COLETA_MODO = os.getenv("COLETA_MODO", "postgres_bridge").lower().strip()
 COLETA_DB_INTERVALO = float(os.getenv("COLETA_DB_INTERVALO", "1.0"))
 
 # ================================================================
-# ESTUDO 2 — MOV_SEQ_3 / INVERTIDO
+# ESTUDO 2 — MOV_SEQ_3 / NORMAL
 # ================================================================
 ESTUDO2_JANELA = int(os.getenv("ESTUDO2_JANELA", "300"))
 ESTUDO2_MIN_OCORRENCIAS = int(os.getenv("ESTUDO2_MIN_OCORRENCIAS", "10"))
@@ -457,13 +457,13 @@ def _mov_seq_3_no_indice(numeros, i):
 
 def calcular_estudo2():
     """
-    Estudo 2 em modo INVERTIDO.
+    Estudo 2 em modo NORMAL, sem inversão.
 
     A regra é recalculada usando apenas o histórico ANTERIOR ao próximo
     resultado. Dentro da janela de 300 resultados, procura o contexto
     MOV_SEQ_3 atual, exige pelo menos 10 ocorrências e confiança mínima
-    de 60%. A cor dominante observada no histórico é INVERTIDA para
-    gerar o sinal. WHITE é excluído da contagem de alvo.
+    de 60%. A cor dominante observada no histórico é usada diretamente
+    como sinal. WHITE é excluído da contagem de alvo.
     """
     n = list(history_numbers)
     c = list(history_colors)
@@ -473,7 +473,7 @@ def calcular_estudo2():
             "sinal": None, "votos": 0, "regra": "MOV_SEQ_3",
             "contexto": None, "ocorrencias": 0, "confianca": 0.0,
             "historico": len(n), "motivo": "histórico insuficiente",
-            "dominante": None, "invertido": None,
+            "dominante": None,
         }
 
     contexto_atual = calcular_mov_seq_3(n)
@@ -482,7 +482,7 @@ def calcular_estudo2():
             "sinal": None, "votos": 0, "regra": "MOV_SEQ_3",
             "contexto": None, "ocorrencias": 0, "confianca": 0.0,
             "historico": len(n), "motivo": "contexto indisponível",
-            "dominante": None, "invertido": None,
+            "dominante": None,
         }
 
     # Treino somente no passado: cada contexto em i prevê a cor de i+1.
@@ -510,7 +510,7 @@ def calcular_estudo2():
             "contexto": contexto_atual, "ocorrencias": ocorrencias,
             "confianca": 0.0, "historico": len(n),
             "motivo": "ocorrências insuficientes",
-            "dominante": None, "invertido": None,
+            "dominante": None,
         }
 
     if vermelhos == pretos:
@@ -519,25 +519,23 @@ def calcular_estudo2():
             "contexto": contexto_atual, "ocorrencias": ocorrencias,
             "confianca": 0.50, "historico": len(n),
             "motivo": "empate no histórico",
-            "dominante": None, "invertido": None,
+            "dominante": None,
         }
 
     dominante = "R" if vermelhos > pretos else "B"
     maior = max(vermelhos, pretos)
     confianca = maior / ocorrencias
-    invertido = "B" if dominante == "R" else "R"
-
     if confianca < ESTUDO2_CONFIANCA:
         return {
             "sinal": None, "votos": ocorrencias, "regra": "MOV_SEQ_3",
             "contexto": contexto_atual, "ocorrencias": ocorrencias,
             "confianca": confianca, "historico": len(n),
             "motivo": "confiança abaixo do mínimo",
-            "dominante": dominante, "invertido": invertido,
+            "dominante": dominante,
         }
 
     return {
-        "sinal": invertido,
+        "sinal": dominante,
         "votos": ocorrencias,
         "regra": "MOV_SEQ_3",
         "contexto": contexto_atual,
@@ -546,14 +544,13 @@ def calcular_estudo2():
         "historico": len(n),
         "motivo": "sinal válido",
         "dominante": dominante,
-        "invertido": invertido,
         "vermelhos": vermelhos,
         "pretos": pretos,
     }
 
 
 def calcular_confluencia():
-    """Compatibilidade com o motor anterior; agora retorna o Estudo 2."""
+    """Compatibilidade com o motor anterior; agora retorna o Estudo 2 sem inversão."""
     r = calcular_estudo2()
     return {
         "sinal": r["sinal"],
@@ -591,7 +588,7 @@ def start_bot():
 
         add_log("==========================================")
         add_log("🟢 ESTUDO 2 INICIADO")
-        add_log(f"🧠 Estratégia: MOV_SEQ_3 | janela={ESTUDO2_JANELA} | mínimo={ESTUDO2_MIN_OCORRENCIAS} | confiança={ESTUDO2_CONFIANCA:.0%} | INVERTIDO")
+        add_log(f"🧠 Estratégia: MOV_SEQ_3 | janela={ESTUDO2_JANELA} | mínimo={ESTUDO2_MIN_OCORRENCIAS} | confiança={ESTUDO2_CONFIANCA:.0%} | NORMAL")
         add_log(f"💰 Aposta simulada: R$ {APOSTA_BASE:.2f}")
         add_log("⚪ WHITE será ignorado na avaliação e no treino do Estudo 2.")
         add_log("==========================================")
@@ -765,18 +762,18 @@ def processar_resultado_novo(payload):
                 signal_color = resultado["sinal"]
                 signal_issue = rodada_id
                 signal_votes = resultado["votos"]
-                signal_rules = ["MOV_SEQ_3 / INVERTIDO"]
+                signal_rules = ["MOV_SEQ_3 / NORMAL"]
                 bot_state = "ACOMPANHANDO"
 
                 alvo = "🔴 RED" if signal_color == "R" else "⚫ BLACK"
                 dominante = estudo.get("dominante") or "-"
-                add_log(f"🚨 SINAL {alvo} | INVERTIDO de {dominante}")
+                add_log(f"🚨 SINAL {alvo} | previsão original")
                 add_log(
                     f"📊 contexto={estudo['contexto']} | "
                     f"n={estudo['ocorrencias']} | "
                     f"confiança={estudo['confianca']:.1%}"
                 )
-                add_log("🧩 Regra: MOV_SEQ_3 | modo=INVERTIDO")
+                add_log("🧩 Regra: MOV_SEQ_3 | modo=NORMAL (sem inversão)")
                 add_log(f"💰 Entrada simulada: R$ {APOSTA_BASE:.2f}")
             else:
                 motivo = estudo.get("motivo", "sem sinal")
