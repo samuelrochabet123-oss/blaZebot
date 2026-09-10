@@ -1070,11 +1070,35 @@ def configurar_socket(transporte):
 def tentar_socket(transporte):
     global sio
 
+    add_log("")
+    add_log("================================================")
+    add_log(f"🔌 INICIANDO TESTE SOCKET.IO | transporte={transporte}")
+    add_log(f"🌐 URL={BLAZE_URL}")
+    add_log(f"🛣️ PATH={SOCKET_PATH}")
+    add_log(f"🏠 ROOM={ROOM}")
+    add_log("================================================")
+
+    try:
+        import socketio
+        import engineio
+        import websocket
+
+        add_log(
+            f"📦 VERSÕES | "
+            f"python-socketio={getattr(socketio, '__version__', 'desconhecida')} | "
+            f"python-engineio={getattr(engineio, '__version__', 'desconhecida')} | "
+            f"websocket-client={getattr(websocket, '__version__', 'desconhecida')}"
+        )
+    except Exception as e:
+        add_log(f"⚠️ Não foi possível obter versões: {repr(e)}")
+
     configurar_socket(transporte)
 
     try:
+        add_log("⏳ Chamando sio.connect()...")
         add_log(
-            f"🔌 TESTE SOCKET.IO | transporte={transporte}"
+            f"➡️ CONNECT | url={BLAZE_URL} | "
+            f"socketio_path={SOCKET_PATH} | transport={transporte}"
         )
 
         inicio = time.time()
@@ -1088,38 +1112,45 @@ def tentar_socket(transporte):
 
         ms = round((time.time() - inicio) * 1000, 1)
 
-        diagnostico["websocket" if transporte == "websocket" else "engineio"] = "OK"
-
         add_log(
-            f"🟢 CONEXÃO SOCKET.IO OK | "
+            f"🟢 sio.connect() RETORNOU COM SUCESSO | "
             f"transporte={transporte} | {ms} ms"
         )
+        add_log(f"🔎 Socket conectado? {getattr(sio, 'connected', 'desconhecido')}")
 
+        diagnostico["websocket" if transporte == "websocket" else "engineio"] = "OK"
+        add_log(f"🟢 CONEXÃO SOCKET.IO OK | transporte={transporte} | {ms} ms")
         return True
 
     except Exception as e:
         diagnostico["websocket" if transporte == "websocket" else "engineio"] = "FALHA"
-
         diagnostico["ultimo_erro"] = repr(e)
 
-        add_log(
-            f"❌ SOCKET.IO FALHOU | transporte={transporte}"
-        )
-        add_log(
-            f"   Tipo: {type(e).__name__}"
-        )
-        add_log(
-            f"   Erro: {repr(e)}"
-        )
+        add_log("")
+        add_log("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
+        add_log(f"❌ SOCKET.IO FALHOU | transporte={transporte}")
+        add_log(f"❌ TIPO DO ERRO: {type(e).__name__}")
+        add_log(f"❌ ERRO: {repr(e)}")
+        add_log("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
+
+        try:
+            import traceback
+            traceback_str = traceback.format_exc()
+            add_log("📋 TRACEBACK COMPLETO:")
+            for linha in traceback_str.strip().splitlines():
+                add_log(f"   {linha}")
+        except Exception as traceback_error:
+            add_log(f"⚠️ Erro ao gerar traceback: {repr(traceback_error)}")
 
         try:
             if sio:
+                add_log("🔌 Desconectando cliente Socket.IO após falha...")
                 sio.disconnect()
-        except Exception:
-            pass
+        except Exception as disconnect_error:
+            add_log(f"⚠️ Erro ao desconectar: {repr(disconnect_error)}")
 
+        add_log(f"🔴 TESTE FINALIZADO COM FALHA | transporte={transporte}")
         return False
-
 
 def iniciar_socket():
     add_log("================================================")
