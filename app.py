@@ -270,7 +270,6 @@ from psycopg2.extras import RealDictCursor
 
 os.environ["DATABASE_URL"] = "postgresql://postgres:aoRHxpedtcdvuhuvvgcSBpYSFwmLCZpf@autorack.proxy.rlwy.net:54731/railway"
 
-
 # ================================================================
 # 4. CONFIGURAÇÕES DO BLAZE
 # ================================================================
