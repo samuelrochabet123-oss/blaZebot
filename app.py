@@ -48,6 +48,9 @@ MAX_LOGS = 80
 INTERVALO_STATUS = 30
 MAX_RECONEXOES = 999999
 MOSTRAR_TICKS = os.getenv("MOSTRAR_TICKS", "false").lower() == "true"
+COLETA_MODO = os.getenv("COLETA_MODO", "postgres_bridge").lower().strip()
+COLETA_DB_INTERVALO = float(os.getenv("COLETA_DB_INTERVALO", "1.0"))
+
 
 # ================================================================
 # CORES
@@ -104,6 +107,7 @@ total_erros_db = 0
 history_numbers = deque(maxlen=HISTORICO_MEMORIA)
 history_colors = deque(maxlen=HISTORICO_MEMORIA)
 processed_issues = set()
+ultimo_id_banco_processado = 0
 
 # ================================================================
 # ESTADO DO BOT
@@ -302,6 +306,7 @@ def salvar_resultado_db(payload):
 
 
 def carregar_historico():
+    global ultimo_id_banco_processado
     """
     Carrega o histórico em ordem cronológica por created_at.
     Em caso de empate/nulo, usa coletado_em e id.
@@ -313,7 +318,7 @@ def carregar_historico():
     try:
         with conn.cursor() as cur:
             cur.execute("""
-                SELECT rodada_id, roll, cor
+                SELECT id, rodada_id, roll, cor
                 FROM blaze_historico
                 WHERE status = 'complete'
                 ORDER BY
@@ -322,6 +327,9 @@ def carregar_historico():
             """)
             rows = cur.fetchall()
 
+            cur.execute("SELECT COALESCE(MAX(id), 0) FROM blaze_historico;")
+            ultimo_id_banco_processado = int(cur.fetchone()[0] or 0)
+
         conn.close()
 
         with state_lock:
@@ -329,7 +337,7 @@ def carregar_historico():
             history_colors.clear()
             processed_issues.clear()
 
-            for rodada_id, roll, cor in rows:
+            for row_id, rodada_id, roll, cor in rows:
                 if roll is None:
                     continue
 
@@ -698,6 +706,137 @@ def processar_resultado_novo(payload):
                     f"⚪ SEM ENTRADA | R={len(resultado['votos_r'])} | "
                     f"B={len(resultado['votos_b'])}"
                 )
+
+
+# ================================================================
+# PONTE POSTGRESQL — CONSUMIR RESULTADOS DO COLAB
+# ================================================================
+#
+# Quando a conexão direta Blaze -> Railway é bloqueada pelo ambiente
+# do Railway, o Colab continua fazendo a coleta via Socket.IO e grava
+# os resultados na MESMA tabela blaze_historico.
+#
+# O Railway passa então a fazer:
+#
+#   Colab -> Blaze/Socket.IO -> PostgreSQL
+#                              ^
+#                              |
+#                    Railway lê daqui
+#
+# Isso elimina a necessidade de o Railway acessar a Blaze diretamente.
+# ================================================================
+
+def processar_resultado_banco(row):
+    """Transforma uma linha já salva pelo coletor em um resultado do V3."""
+    global ultimo_id_banco_processado, ultimo_resultado_em
+
+    row_id, rodada_id, color, roll, status, room_id, created_at, updated_at = row
+
+    if status != "complete" or rodada_id is None or color is None or roll is None:
+        return False
+
+    rodada_id = str(rodada_id)
+
+    with state_lock:
+        if rodada_id in processed_issues:
+            return False
+
+    payload = {
+        "id": rodada_id,
+        "color": int(color),
+        "roll": int(roll),
+        "status": status,
+        "room_id": room_id,
+        "created_at": created_at.isoformat() if hasattr(created_at, "isoformat") else created_at,
+        "updated_at": updated_at.isoformat() if hasattr(updated_at, "isoformat") else updated_at,
+    }
+
+    # Aqui NÃO salvamos novamente no banco: o Colab já salvou.
+    # Apenas alimentamos o mesmo motor V3 usado pelo Socket.IO.
+    with state_lock:
+        processed_issues.add(rodada_id)
+        history_before = len(history_numbers)
+
+    processar_resultado_novo(payload)
+
+    with state_lock:
+        history_numbers.append(int(roll))
+        sigla = {0: "W", 1: "R", 2: "B"}.get(int(color))
+        if sigla:
+            history_colors.append(sigla)
+        ultimo_resultado_em = datetime.now()
+        ultima = rodada_id
+
+    add_log(
+        f"📥 DB BRIDGE | rodada={rodada_id} | {nome_cor(color)} | "
+        f"roll={roll} | histórico_antes={history_before}"
+    )
+    return True
+
+
+def monitorar_postgres():
+    """Monitora a tabela e consome apenas linhas novas inseridas pelo Colab."""
+    global ultimo_id_banco_processado, total_ticks, ultima_rodada
+    global total_erros_db, conectado
+
+    add_log("🟢 PONTE POSTGRESQL ATIVA")
+    add_log(
+        f"📡 Fonte: blaze_historico | intervalo={COLETA_DB_INTERVALO:.1f}s"
+    )
+
+    while rodando:
+        conn = None
+        try:
+            conn = get_db_connection()
+            if not conn:
+                time.sleep(max(COLETA_DB_INTERVALO, 2.0))
+                continue
+
+            with conn.cursor() as cur:
+                cur.execute("""
+                    SELECT id, rodada_id, color, roll, status,
+                           room_id, created_at, updated_at
+                    FROM blaze_historico
+                    WHERE id > %s
+                      AND status = 'complete'
+                      AND rodada_id IS NOT NULL
+                      AND color IS NOT NULL
+                      AND roll IS NOT NULL
+                    ORDER BY id ASC;
+                """, (ultimo_id_banco_processado,))
+                rows = cur.fetchall()
+
+            conn.close()
+            conn = None
+
+            with state_lock:
+                conectado = True
+                diagnostico["transporte_ativo"] = "POSTGRES_BRIDGE"
+
+            for row in rows:
+                row_id = int(row[0])
+                total_ticks += 1
+                processar_resultado_banco(row)
+                ultimo_id_banco_processado = max(
+                    ultimo_id_banco_processado,
+                    row_id,
+                )
+                ultima_rodada = str(row[1])
+
+        except Exception as e:
+            total_erros_db += 1
+            with state_lock:
+                conectado = False
+                diagnostico["transporte_ativo"] = "POSTGRES_BRIDGE_FALHA"
+                diagnostico["ultimo_erro"] = repr(e)
+            add_log(f"⚠️ DB BRIDGE | erro: {type(e).__name__}: {str(e)[:180]}")
+            try:
+                if conn:
+                    conn.close()
+            except Exception:
+                pass
+
+        time.sleep(max(COLETA_DB_INTERVALO, 0.2))
 
 
 # ================================================================
@@ -1757,12 +1896,24 @@ def main():
     global bot_running
     bot_running = False
 
-    sucesso = iniciar_socket()
-    if not sucesso:
-        add_log(
-            "⚠️ Conexão inicial falhou. "
-            "O processo continuará tentando reconectar."
+    add_log(f"🧭 MODO DE COLETA: {COLETA_MODO}")
+
+    if COLETA_MODO in ("postgres", "postgres_bridge", "bridge"):
+        add_log("🔗 Railway não acessará a Blaze diretamente.")
+        add_log("📥 O Railway consumirá os resultados gravados pelo Colab.")
+        thread_coleta = threading.Thread(
+            target=monitorar_postgres,
+            daemon=True,
+            name="postgres-bridge",
         )
+        thread_coleta.start()
+    else:
+        sucesso = iniciar_socket()
+        if not sucesso:
+            add_log(
+                "⚠️ Conexão inicial falhou. "
+                "O processo continuará tentando reconectar."
+            )
 
     thread_status = threading.Thread(target=monitor_status, daemon=True)
     thread_status.start()
