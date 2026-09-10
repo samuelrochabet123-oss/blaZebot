@@ -437,11 +437,11 @@ def calcular_mov_seq_3(numeros):
     """Retorna a sequência dos 3 últimos movimentos."""
     if len(numeros) < 4:
         return None
-    return "".join(
+    return "".join([
         movimento(numeros[-4], numeros[-3]),
         movimento(numeros[-3], numeros[-2]),
         movimento(numeros[-2], numeros[-1]),
-    )
+    ])
 
 
 def _mov_seq_3_no_indice(numeros, i):
