@@ -763,12 +763,224 @@ def processar_tick(data):
 
 
 # ================================================================
-# SOCKET.IO
+# SOCKET.IO — DIAGNÓSTICO
 # ================================================================
+#
+# Esta versão NÃO altera as regras V3.
+# Ela foi feita para descobrir exatamente em qual etapa a conexão
+# com a Blaze está falhando no Railway.
+#
+# ETAPAS:
+# 1) DNS
+# 2) TCP 443
+# 3) HTTPS básico
+# 4) Engine.IO polling
+# 5) Socket.IO WebSocket
+#
+# Se uma etapa funcionar e a seguinte falhar, o log mostrará onde.
+# ================================================================
+
+import socket as py_socket
+import urllib.request
+import urllib.error
+
+
+diagnostico = {
+    "dns": "NÃO TESTADO",
+    "tcp": "NÃO TESTADO",
+    "https": "NÃO TESTADO",
+    "engineio": "NÃO TESTADO",
+    "websocket": "NÃO TESTADO",
+    "transporte_ativo": None,
+    "ultimo_erro": None,
+}
+
+
+def diagnostico_dns():
+    host = BLAZE_URL.replace("https://", "").replace("http://", "").split("/")[0]
+
+    try:
+        infos = py_socket.getaddrinfo(host, 443, type=py_socket.SOCK_STREAM)
+        ips = sorted(set(info[4][0] for info in infos))
+
+        diagnostico["dns"] = "OK"
+        add_log(f"🔎 DNS OK | {host} -> {', '.join(ips[:5])}")
+        return True
+
+    except Exception as e:
+        diagnostico["dns"] = "FALHA"
+        diagnostico["ultimo_erro"] = repr(e)
+        add_log(f"❌ DNS FALHOU | {host} | {repr(e)}")
+        return False
+
+
+def diagnostico_tcp():
+    host = BLAZE_URL.replace("https://", "").replace("http://", "").split("/")[0]
+
+    try:
+        inicio = time.time()
+
+        sock = py_socket.create_connection(
+            (host, 443),
+            timeout=10
+        )
+        sock.close()
+
+        ms = round((time.time() - inicio) * 1000, 1)
+
+        diagnostico["tcp"] = "OK"
+        add_log(f"🔎 TCP 443 OK | {host}:443 | {ms} ms")
+        return True
+
+    except Exception as e:
+        diagnostico["tcp"] = "FALHA"
+        diagnostico["ultimo_erro"] = repr(e)
+        add_log(f"❌ TCP 443 FALHOU | {host}:443 | {repr(e)}")
+        return False
+
+
+def diagnostico_https():
+    url = BLAZE_URL.rstrip("/") + SOCKET_PATH
+
+    # O objetivo aqui NÃO é esperar um resultado de jogo.
+    # É apenas confirmar que o Railway consegue fazer HTTPS
+    # até o endpoint informado.
+    try:
+        req = urllib.request.Request(
+            url,
+            headers={
+                "User-Agent": "BlazeDoubleV3-Diagnostic/1.0",
+                "Accept": "*/*",
+            },
+            method="GET",
+        )
+
+        inicio = time.time()
+
+        with urllib.request.urlopen(req, timeout=15) as response:
+            status = response.status
+            body = response.read(500).decode(
+                "utf-8",
+                errors="replace"
+            )
+
+        ms = round((time.time() - inicio) * 1000, 1)
+
+        diagnostico["https"] = f"HTTP {status}"
+
+        add_log(
+            f"🔎 HTTPS OK | HTTP {status} | {ms} ms | "
+            f"body={body[:180]!r}"
+        )
+
+        return True
+
+    except urllib.error.HTTPError as e:
+        body = ""
+
+        try:
+            body = e.read(500).decode(
+                "utf-8",
+                errors="replace"
+            )
+        except Exception:
+            pass
+
+        diagnostico["https"] = f"HTTP {e.code}"
+        diagnostico["ultimo_erro"] = repr(e)
+
+        add_log(
+            f"⚠️ HTTPS respondeu | HTTP {e.code} | "
+            f"body={body[:180]!r}"
+        )
+
+        # HTTP 4xx/5xx prova que houve comunicação HTTPS.
+        return True
+
+    except Exception as e:
+        diagnostico["https"] = "FALHA"
+        diagnostico["ultimo_erro"] = repr(e)
+        add_log(f"❌ HTTPS FALHOU | {repr(e)}")
+        return False
+
+
+def diagnostico_engineio_polling():
+    """
+    Teste direto do handshake Engine.IO.
+
+    Isso é diferente do Socket.IO completo.
+    Se funcionar, sabemos que o endpoint /replication/ está
+    respondendo ao protocolo Engine.IO no Railway.
+    """
+    url = (
+        BLAZE_URL.rstrip("/")
+        + SOCKET_PATH
+        + "?EIO=4&transport=polling"
+    )
+
+    try:
+        req = urllib.request.Request(
+            url,
+            headers={
+                "User-Agent": "BlazeDoubleV3-Diagnostic/1.0",
+                "Accept": "*/*",
+            },
+            method="GET",
+        )
+
+        inicio = time.time()
+
+        with urllib.request.urlopen(req, timeout=15) as response:
+            status = response.status
+            body = response.read(1000).decode(
+                "utf-8",
+                errors="replace"
+            )
+
+        ms = round((time.time() - inicio) * 1000, 1)
+
+        diagnostico["engineio"] = f"HTTP {status}"
+
+        add_log(
+            f"🔎 ENGINE.IO POLLING | HTTP {status} | "
+            f"{ms} ms | resposta={body[:300]!r}"
+        )
+
+        return True
+
+    except urllib.error.HTTPError as e:
+        body = ""
+
+        try:
+            body = e.read(1000).decode(
+                "utf-8",
+                errors="replace"
+            )
+        except Exception:
+            pass
+
+        diagnostico["engineio"] = f"HTTP {e.code}"
+        diagnostico["ultimo_erro"] = repr(e)
+
+        add_log(
+            f"❌ ENGINE.IO POLLING | HTTP {e.code} | "
+            f"resposta={body[:300]!r}"
+        )
+
+        return False
+
+    except Exception as e:
+        diagnostico["engineio"] = "FALHA"
+        diagnostico["ultimo_erro"] = repr(e)
+        add_log(f"❌ ENGINE.IO POLLING FALHOU | {repr(e)}")
+        return False
+
 
 def on_connect():
     global conectado
+
     conectado = True
+    diagnostico["transporte_ativo"] = "CONECTADO"
 
     add_log("🟢 SOCKET.IO CONECTADO")
     add_log(f"📡 Room: {ROOM}")
@@ -778,34 +990,58 @@ def on_connect():
             "cmd",
             {
                 "id": "subscribe",
-                "payload": {"room": ROOM},
-            },
+                "payload": {
+                    "room": ROOM
+                }
+            }
         )
-        add_log(f"📡 Subscribe enviado: {ROOM}")
+
+        add_log(
+            f"📡 Subscribe enviado: {ROOM}"
+        )
+
     except Exception as e:
-        add_log(f"❌ Erro no subscribe: {str(e)[:180]}")
+        add_log(
+            f"❌ ERRO NO SUBSCRIBE | {repr(e)}"
+        )
 
 
 def on_disconnect():
     global conectado
+
     conectado = False
     add_log("🔴 SOCKET.IO DESCONECTADO")
 
 
 def on_connect_error(data):
     global conectado
+
     conectado = False
-    add_log(f"⚠️ Socket.IO Connection error: {str(data)[:180]}")
+
+    diagnostico["ultimo_erro"] = repr(data)
+
+    add_log(
+        "❌ SOCKET.IO CONNECTION ERROR"
+    )
+    add_log(
+        f"   Tipo: {type(data).__name__}"
+    )
+    add_log(
+        f"   Detalhe: {repr(data)}"
+    )
 
 
 def on_data(data):
     try:
         processar_tick(data)
+
     except Exception as e:
-        add_log(f"❌ Erro processando data: {str(e)[:200]}")
+        add_log(
+            f"❌ Erro processando data: {repr(e)}"
+        )
 
 
-def configurar_socket():
+def configurar_socket(transporte):
     global sio
 
     sio = socketio.Client(
@@ -813,8 +1049,12 @@ def configurar_socket():
         reconnection_attempts=MAX_RECONEXOES,
         reconnection_delay=2,
         reconnection_delay_max=10,
-        logger=False,
-        engineio_logger=False,
+
+        # IMPORTANTE:
+        # Nesta versão deixamos os logs internos ligados para
+        # descobrir o erro real do Engine.IO / WebSocket.
+        logger=True,
+        engineio_logger=True,
     )
 
     sio.on("connect", on_connect)
@@ -822,25 +1062,151 @@ def configurar_socket():
     sio.on("connect_error", on_connect_error)
     sio.on(EVENT_NAME, on_data)
 
+    add_log(
+        f"⚙️ Socket configurado | transporte={transporte}"
+    )
 
-def iniciar_socket():
-    configurar_socket()
 
-    add_log("🔌 Conectando ao Blaze...")
-    add_log(f"🌐 {BLAZE_URL}{SOCKET_PATH}")
+def tentar_socket(transporte):
+    global sio
+
+    configurar_socket(transporte)
 
     try:
-        # Conexão idêntica ao Collector V2.1 funcional.
+        add_log(
+            f"🔌 TESTE SOCKET.IO | transporte={transporte}"
+        )
+
+        inicio = time.time()
+
         sio.connect(
             BLAZE_URL,
             socketio_path=SOCKET_PATH,
-            transports=["websocket"],
+            transports=[transporte],
             wait_timeout=20,
         )
+
+        ms = round((time.time() - inicio) * 1000, 1)
+
+        diagnostico["websocket" if transporte == "websocket" else "engineio"] = "OK"
+
+        add_log(
+            f"🟢 CONEXÃO SOCKET.IO OK | "
+            f"transporte={transporte} | {ms} ms"
+        )
+
         return True
+
     except Exception as e:
-        add_log(f"❌ Falha inicial Socket.IO: {str(e)[:200]}")
+        diagnostico["websocket" if transporte == "websocket" else "engineio"] = "FALHA"
+
+        diagnostico["ultimo_erro"] = repr(e)
+
+        add_log(
+            f"❌ SOCKET.IO FALHOU | transporte={transporte}"
+        )
+        add_log(
+            f"   Tipo: {type(e).__name__}"
+        )
+        add_log(
+            f"   Erro: {repr(e)}"
+        )
+
+        try:
+            if sio:
+                sio.disconnect()
+        except Exception:
+            pass
+
         return False
+
+
+def iniciar_socket():
+    add_log("================================================")
+    add_log("🔬 DIAGNÓSTICO DE CONEXÃO BLAZE")
+    add_log("================================================")
+    add_log(f"🌐 URL: {BLAZE_URL}")
+    add_log(f"🛣️ SOCKET PATH: {SOCKET_PATH}")
+    add_log(f"🏠 ROOM: {ROOM}")
+    add_log("")
+
+    # ------------------------------------------------------------
+    # 1. DNS
+    # ------------------------------------------------------------
+    add_log("1️⃣ TESTE DNS")
+    if not diagnostico_dns():
+        add_log("⛔ Diagnóstico interrompido: DNS não resolveu.")
+        return False
+
+    # ------------------------------------------------------------
+    # 2. TCP 443
+    # ------------------------------------------------------------
+    add_log("2️⃣ TESTE TCP 443")
+    if not diagnostico_tcp():
+        add_log("⛔ Diagnóstico interrompido: TCP 443 inacessível.")
+        return False
+
+    # ------------------------------------------------------------
+    # 3. HTTPS
+    # ------------------------------------------------------------
+    add_log("3️⃣ TESTE HTTPS")
+    diagnostico_https()
+
+    # ------------------------------------------------------------
+    # 4. Engine.IO polling
+    # ------------------------------------------------------------
+    add_log("4️⃣ TESTE ENGINE.IO POLLING")
+    polling_http_ok = diagnostico_engineio_polling()
+
+    # ------------------------------------------------------------
+    # 5. Socket.IO WebSocket
+    # ------------------------------------------------------------
+    add_log("5️⃣ TESTE SOCKET.IO WEBSOCKET")
+
+    if tentar_socket("websocket"):
+        add_log("================================================")
+        add_log("✅ DIAGNÓSTICO: WEBSOCKET FUNCIONOU")
+        add_log("================================================")
+        return True
+
+    # ------------------------------------------------------------
+    # 6. Fallback diagnóstico: polling
+    # ------------------------------------------------------------
+    add_log("================================================")
+    add_log("⚠️ WEBSOCKET FALHOU")
+    add_log("🔄 Testando Socket.IO via POLLING...")
+    add_log("================================================")
+
+    if tentar_socket("polling"):
+        add_log("================================================")
+        add_log("✅ SOCKET.IO POLLING FUNCIONOU")
+        add_log("⚠️ O problema está especificamente no WEBSOCKET.")
+        add_log("================================================")
+        return True
+
+    add_log("================================================")
+    add_log("❌ DIAGNÓSTICO: SOCKET.IO NÃO CONECTOU")
+    add_log("================================================")
+
+    add_log(
+        f"DNS={diagnostico['dns']} | "
+        f"TCP={diagnostico['tcp']} | "
+        f"HTTPS={diagnostico['https']} | "
+        f"EngineIO={diagnostico['engineio']} | "
+        f"WebSocket={diagnostico['websocket']}"
+    )
+
+    add_log(
+        f"Último erro: {diagnostico['ultimo_erro']}"
+    )
+
+    if polling_http_ok:
+        add_log(
+            "ℹ️ O endpoint Engine.IO respondeu via HTTP, "
+            "mas o cliente Socket.IO não conseguiu completar a conexão."
+        )
+
+    return False
 
 
 # ================================================================
@@ -1229,6 +1595,7 @@ def health():
             "socket_connected": conectado,
             "collector_results": total_resultados,
             "bot_running": bot_running,
+            "diagnostic": dict(diagnostico),
         }, 200
 
 
@@ -1246,7 +1613,7 @@ def bot_loop():
 
 def main():
     add_log("==========================================")
-    add_log("BLAZE DOUBLE — BOT V3")
+    add_log("BLAZE DOUBLE — BOT V3 / DIAGNÓSTICO")
     add_log("==========================================")
 
     if not os.environ.get("DATABASE_URL"):
