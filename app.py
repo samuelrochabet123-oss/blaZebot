@@ -7,78 +7,46 @@ from datetime import datetime
 
 import socketio
 import psycopg2
-from flask import Flask, redirect, render_template_string, request
+from flask import Flask, redirect, render_template_string
 
 # ================================================================
 # BLAZE DOUBLE — BOT V3
 # ================================================================
 # Coleta contínua + PostgreSQL + motor V3 + painel web
 #
-# COLETA:
-#   Blaze Socket.IO
-#       -> double.tick
-#       -> status=complete
-#       -> blaze_historico
+# O bot NÃO executa apostas na Blaze.
+# Ele apenas coleta resultados, gera sinais e contabiliza
+# uma simulação de aposta fixa no painel.
 #
-# OPERAÇÃO:
-#   RED / BLACK são os únicos resultados avaliados.
-#   WHITE permanece no histórico, mas NÃO é WIN nem LOSS.
+# WHITE:
+#   - permanece no histórico
+#   - não é WIN
+#   - não é LOSS
+#   - não encerra sinal aberto
 #
 # V3:
-#   10 regras
-#   mínimo operacional padrão = 2 votos
-#   empate = sem sinal
-#
-# IMPORTANTE:
-#   O bot NÃO executa apostas na Blaze. Ele apenas gera sinais
-#   e contabiliza uma simulação de aposta fixa no painel.
+#   - 10 regras
+#   - mínimo operacional padrão = 2 votos
+#   - empate = sem sinal
 # ================================================================
-
 
 # ================================================================
 # CONFIGURAÇÃO
 # ================================================================
 
-BLAZE_URL = os.getenv(
-    "BLAZE_URL",
-    "https://api-gaming.blaze.bet.br"
-)
-
-SOCKET_PATH = os.getenv(
-    "SOCKET_PATH",
-    "/replication/"
-)
-
-ROOM = os.getenv(
-    "BLAZE_ROOM",
-    "double_room_1"
-)
-
+BLAZE_URL = os.getenv("BLAZE_URL", "https://api-gaming.blaze.bet.br")
+SOCKET_PATH = os.getenv("SOCKET_PATH", "/replication/")
+ROOM = os.getenv("BLAZE_ROOM", "double_room_1")
 EVENT_NAME = "data"
 TICK_NAME = "double.tick"
 
-# Operação
 MIN_CONFLUENCIA = int(os.getenv("MIN_CONFLUENCIA", "2"))
 APOSTA_BASE = float(os.getenv("APOSTA_BASE", "1.00"))
-
-# Memória utilizada pelas regras
 HISTORICO_MEMORIA = int(os.getenv("HISTORICO_MEMORIA", "50"))
-
-# Quantidade de linhas do console no painel
 MAX_LOGS = 80
-
-# Monitor
 INTERVALO_STATUS = 30
-
-# Reconexão praticamente contínua
 MAX_RECONEXOES = 999999
-
-# Se False, não mostra cada tick intermediário.
-MOSTRAR_TICKS = os.getenv(
-    "MOSTRAR_TICKS",
-    "false"
-).lower() == "true"
-
+MOSTRAR_TICKS = os.getenv("MOSTRAR_TICKS", "false").lower() == "true"
 
 # ================================================================
 # CORES
@@ -87,13 +55,13 @@ MOSTRAR_TICKS = os.getenv(
 CORES = {
     0: "BRANCO",
     1: "VERMELHO",
-    2: "PRETO"
+    2: "PRETO",
 }
 
 COR_SIGLA = {
     "BRANCO": "W",
     "VERMELHO": "R",
-    "PRETO": "B"
+    "PRETO": "B",
 }
 
 
@@ -105,8 +73,16 @@ def nome_cor(cor):
 
 
 def sigla_cor(cor):
-    nome = nome_cor(cor)
-    return COR_SIGLA.get(nome)
+    return COR_SIGLA.get(nome_cor(cor))
+
+
+def parse_timestamp(value):
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(str(value).replace("Z", "+00:00")).replace(tzinfo=None)
+    except Exception:
+        return None
 
 
 # ================================================================
@@ -114,7 +90,6 @@ def sigla_cor(cor):
 # ================================================================
 
 sio = None
-
 rodando = True
 conectado = False
 ultima_rodada = None
@@ -125,11 +100,8 @@ total_resultados = 0
 total_duplicados = 0
 total_erros_db = 0
 
-# Histórico usado pelo motor V3.
 history_numbers = deque(maxlen=HISTORICO_MEMORIA)
 history_colors = deque(maxlen=HISTORICO_MEMORIA)
-
-# IDs já processados nesta execução.
 processed_issues = set()
 
 # ================================================================
@@ -137,33 +109,21 @@ processed_issues = set()
 # ================================================================
 
 bot_running = False
-
-# CAÇANDO = aguardando sinal
-# ACOMPANHANDO = existe um sinal aberto
-bot_state = "PARADO"
+bot_state = "PARADO"  # PARADO / CACANDO / ACOMPANHANDO
 
 signal_color = None
 signal_issue = None
 signal_votes = 0
 signal_rules = []
 
-# ================================================================
-# PLACAR DA SESSÃO
-# ================================================================
-
 wins = 0
 losses = 0
 white_ignored = 0
 current_profit = 0.0
-
 history_results = deque(maxlen=30)
 
-# Lock único para estado compartilhado entre Flask e Socket.IO.
 state_lock = threading.RLock()
-
-# Logs
 log_lines = deque(maxlen=MAX_LOGS)
-
 
 # ================================================================
 # FLASK
@@ -178,11 +138,8 @@ app = Flask(__name__)
 
 def add_log(msg):
     timestamp = datetime.now().strftime("%H:%M:%S")
-
     with state_lock:
-        log_lines.append(
-            f"[{timestamp}] {msg}"
-        )
+        log_lines.append(f"[{timestamp}] {msg}")
 
 
 # ================================================================
@@ -190,1202 +147,26 @@ def add_log(msg):
 # ================================================================
 
 def get_db_connection():
-    database_url = # ================================================================
-# BLAZE DOUBLE — COLLECTOR V2.1
-# ================================================================
-# Objetivo:
-#   Capturar os resultados reais do Blaze Double via Socket.IO
-#   e armazenar no PostgreSQL.
-#
-# Fluxo:
-#
-#   BLAZE DOUBLE
-#        ↓
-#   Socket.IO
-#        ↓
-#   double.tick
-#        ↓
-#   resultado FINAL (status = complete)
-#        ↓
-#   PostgreSQL
-#        ↓
-#   tabela: blaze_historico
-#
-# IMPORTANTE:
-#   Este coletor NÃO aplica estratégia de aposta.
-#   Ele apenas coleta os resultados para posterior análise.
-#
-# Cores Blaze Double:
-#   0 = BRANCO
-#   1 = VERMELHO
-#   2 = PRETO
-#
-# ================================================================
-
-
-# ================================================================
-# 1. INSTALAÇÃO DAS DEPENDÊNCIAS
-# ================================================================
-
-!pip -q install "python-socketio[client]" psycopg2-binary
-
-
-# ================================================================
-# 2. IMPORTAÇÕES
-# ================================================================
-
-import os
-import sys
-import time
-import signal
-import threading
-from datetime import datetime, timezone
-
-import socketio
-import psycopg2
-from psycopg2.extras import RealDictCursor
-
-
-# ================================================================
-# 3. CONFIGURAÇÃO DO POSTGRESQL
-# ================================================================
-#
-# OPÇÃO 1 — variável de ambiente
-#
-# Se você já configurou DATABASE_URL no ambiente do Colab,
-# o programa irá utilizá-la automaticamente.
-#
-# OPÇÃO 2 — colocar diretamente abaixo
-#
-# Descomente e coloque sua DATABASE_URL:
-#
-# os.environ["DATABASE_URL"] = "postgresql://usuario:senha@host:5432/banco"
-#
-# NÃO compartilhe sua senha aqui no chat.
-#
-
-# ================================================================
-# COLE SUA DATABASE_URL AQUI, SE QUISER
-# ================================================================
-
-os.environ["DATABASE_URL"] = "postgresql://postgres:aoRHxpedtcdvuhuvvgcSBpYSFwmLCZpf@autorack.proxy.rlwy.net:54731/railway"
-
-# ================================================================
-# 4. CONFIGURAÇÕES DO BLAZE
-# ================================================================
-
-BLAZE_URL = "https://api-gaming.blaze.bet.br"
-
-SOCKET_PATH = "/replication/"
-
-ROOM = "double_room_1"
-
-EVENT_NAME = "data"
-
-TICK_NAME = "double.tick"
-
-
-# ================================================================
-# 5. CONFIGURAÇÕES DO COLETOR
-# ================================================================
-
-# Mostra todos os ticks recebidos
-MOSTRAR_TICKS = True
-
-# Intervalo do monitor de conexão
-INTERVALO_STATUS = 30
-
-# Número máximo de tentativas de reconexão
-MAX_RECONEXOES = 999999
-
-
-# ================================================================
-# 6. CONTROLE GLOBAL
-# ================================================================
-
-sio = None
-
-rodando = True
-
-conectado = False
-
-ultima_rodada = None
-
-total_ticks = 0
-
-total_resultados = 0
-
-total_duplicados = 0
-
-total_erros_db = 0
-
-
-# ================================================================
-# 7. MAPA DE CORES
-# ================================================================
-
-CORES = {
-    0: "BRANCO",
-    1: "VERMELHO",
-    2: "PRETO"
-}
-
-
-def nome_cor(cor):
-
-    try:
-        cor_int = int(cor)
-    except:
-        return "DESCONHECIDA"
-
-    return CORES.get(cor_int, f"DESCONHECIDA({cor_int})")
-
-
-# ================================================================
-# 8. CONEXÃO COM POSTGRESQL
-# ================================================================
-
-def get_db_connection():
-
     database_url = os.environ.get("DATABASE_URL")
-
-    if not database_url:
-        print()
-        print("=" * 70)
-        print("❌ DATABASE_URL NÃO CONFIGURADA")
-        print("=" * 70)
-        print()
-        print("Configure a variável DATABASE_URL antes de iniciar.")
-        print()
-        return None
-
-    try:
-
-        conn = psycopg2.connect(
-            database_url,
-            connect_timeout=15
-        )
-
-        conn.autocommit = False
-
-        return conn
-
-    except Exception as e:
-
-        print()
-        print("=" * 70)
-        print("❌ ERRO AO CONECTAR NO POSTGRESQL")
-        print("=" * 70)
-        print(str(e))
-        print()
-
-        return None
-
-
-# ================================================================
-# 9. TESTAR POSTGRESQL
-# ================================================================
-
-def testar_postgresql():
-
-    print()
-    print("=" * 70)
-    print("TESTANDO POSTGRESQL")
-    print("=" * 70)
-
-    conn = get_db_connection()
-
-    if not conn:
-
-        return False
-
-    try:
-
-        with conn.cursor() as cur:
-
-            cur.execute("SELECT version();")
-
-            resultado = cur.fetchone()
-
-            print("✅ PostgreSQL conectado.")
-
-            if resultado:
-
-                print("Versão:")
-
-                print(resultado[0])
-
-        conn.close()
-
-        return True
-
-    except Exception as e:
-
-        print("❌ Erro no teste PostgreSQL:")
-
-        print(e)
-
-        try:
-            conn.close()
-        except:
-            pass
-
-        return False
-
-
-# ================================================================
-# 10. CRIAR TABELA
-# ================================================================
-
-def init_db():
-
-    print()
-    print("=" * 70)
-    print("INICIALIZANDO BANCO")
-    print("=" * 70)
-
-    conn = get_db_connection()
-
-    if not conn:
-
-        return False
-
-    try:
-
-        with conn.cursor() as cur:
-
-            cur.execute("""
-                CREATE TABLE IF NOT EXISTS blaze_historico (
-
-                    id SERIAL PRIMARY KEY,
-
-                    rodada_id VARCHAR(100) UNIQUE NOT NULL,
-
-                    color INTEGER,
-
-                    cor VARCHAR(20),
-
-                    roll INTEGER,
-
-                    status VARCHAR(30),
-
-                    room_id INTEGER,
-
-                    created_at TIMESTAMP,
-
-                    updated_at TIMESTAMP,
-
-                    coletado_em TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-
-                );
-            """)
-
-            # Índices para facilitar análises futuras
-
-            cur.execute("""
-                CREATE INDEX IF NOT EXISTS idx_blaze_created_at
-                ON blaze_historico(created_at);
-            """)
-
-            cur.execute("""
-                CREATE INDEX IF NOT EXISTS idx_blaze_cor
-                ON blaze_historico(cor);
-            """)
-
-            cur.execute("""
-                CREATE INDEX IF NOT EXISTS idx_blaze_roll
-                ON blaze_historico(roll);
-            """)
-
-            conn.commit()
-
-        conn.close()
-
-        print("✅ Tabela blaze_historico pronta.")
-
-        return True
-
-    except Exception as e:
-
-        print()
-        print("❌ ERRO AO CRIAR TABELA:")
-        print(e)
-
-        try:
-            conn.rollback()
-            conn.close()
-        except:
-            pass
-
-        return False
-
-
-# ================================================================
-# 11. SALVAR RESULTADO
-# ================================================================
-
-def salvar_resultado(payload):
-
-    global total_resultados
-    global total_duplicados
-    global total_erros_db
-    global ultima_rodada
-
-    rodada_id = payload.get("id")
-
-    color = payload.get("color")
-
-    roll = payload.get("roll")
-
-    status = payload.get("status")
-
-    room_id = payload.get("room_id")
-
-    created_at = payload.get("created_at")
-
-    updated_at = payload.get("updated_at")
-
-
-    # ------------------------------------------------------------
-    # Validação
-    # ------------------------------------------------------------
-
-    if not rodada_id:
-
-        print("⚠️ Resultado ignorado: rodada sem ID.")
-
-        return False
-
-
-    if color is None:
-
-        print(
-            f"⚠️ Resultado ignorado: "
-            f"rodada {rodada_id} sem cor."
-        )
-
-        return False
-
-
-    if roll is None:
-
-        print(
-            f"⚠️ Resultado ignorado: "
-            f"rodada {rodada_id} sem roll."
-        )
-
-        return False
-
-
-    if status != "complete":
-
-        return False
-
-
-    cor_nome = nome_cor(color)
-
-
-    # ------------------------------------------------------------
-    # Conversão dos timestamps
-    # ------------------------------------------------------------
-
-    created_datetime = None
-
-    updated_datetime = None
-
-    try:
-
-        if created_at:
-
-            created_datetime = datetime.fromisoformat(
-                created_at.replace("Z", "+00:00")
-            ).replace(tzinfo=None)
-
-    except Exception:
-
-        created_datetime = None
-
-
-    try:
-
-        if updated_at:
-
-            updated_datetime = datetime.fromisoformat(
-                updated_at.replace("Z", "+00:00")
-            ).replace(tzinfo=None)
-
-    except Exception:
-
-        updated_datetime = None
-
-
-    # ------------------------------------------------------------
-    # Conexão
-    # ------------------------------------------------------------
-
-    conn = get_db_connection()
-
-    if not conn:
-
-        total_erros_db += 1
-
-        return False
-
-
-    try:
-
-        with conn.cursor() as cur:
-
-            cur.execute("""
-                INSERT INTO blaze_historico (
-
-                    rodada_id,
-                    color,
-                    cor,
-                    roll,
-                    status,
-                    room_id,
-                    created_at,
-                    updated_at
-
-                )
-
-                VALUES (
-
-                    %s,
-                    %s,
-                    %s,
-                    %s,
-                    %s,
-                    %s,
-                    %s,
-                    %s
-
-                )
-
-                ON CONFLICT (rodada_id)
-                DO NOTHING
-
-                RETURNING id;
-
-            """, (
-
-                rodada_id,
-                color,
-                cor_nome,
-                roll,
-                status,
-                room_id,
-                created_datetime,
-                updated_datetime
-
-            ))
-
-
-            resultado = cur.fetchone()
-
-
-        conn.commit()
-
-        conn.close()
-
-
-        # --------------------------------------------------------
-        # Resultado novo
-        # --------------------------------------------------------
-
-        if resultado:
-
-            total_resultados += 1
-
-            ultima_rodada = rodada_id
-
-            print()
-            print("=" * 70)
-            print("✅ RESULTADO SALVO NO POSTGRESQL")
-            print("=" * 70)
-
-            print(f"Rodada : {rodada_id}")
-            print(f"Cor    : {cor_nome}")
-            print(f"Color  : {color}")
-            print(f"Roll   : {roll}")
-            print(f"Status : {status}")
-            print(f"Room   : {room_id}")
-            print(f"Data   : {created_at}")
-
-            print("=" * 70)
-            print()
-
-            return True
-
-
-        # --------------------------------------------------------
-        # Rodada já existente
-        # --------------------------------------------------------
-
-        else:
-
-            total_duplicados += 1
-
-            if MOSTRAR_TICKS:
-
-                print(
-                    f"↩️ DUPLICADO | "
-                    f"{rodada_id} | "
-                    f"{cor_nome} | "
-                    f"roll={roll}"
-                )
-
-            return False
-
-
-    except Exception as e:
-
-        total_erros_db += 1
-
-        print()
-        print("=" * 70)
-        print("❌ ERRO AO SALVAR NO POSTGRESQL")
-        print("=" * 70)
-        print(e)
-        print("=" * 70)
-
-        try:
-
-            conn.rollback()
-            conn.close()
-
-        except:
-            pass
-
-        return False
-
-
-# ================================================================
-# 12. PROCESSAR DOUBLE.TICK
-# ================================================================
-
-def processar_tick(data):
-
-    global total_ticks
-
-    total_ticks += 1
-
-
-    # ------------------------------------------------------------
-    # Estrutura esperada:
-    #
-    # {
-    #     "id": "double.tick",
-    #     "payload": {
-    #         ...
-    #     }
-    # }
-    # ------------------------------------------------------------
-
-    if not isinstance(data, dict):
-
-        return
-
-
-    event_id = data.get("id")
-
-    payload = data.get("payload")
-
-
-    if event_id != TICK_NAME:
-
-        return
-
-
-    if not isinstance(payload, dict):
-
-        return
-
-
-    rodada_id = payload.get("id")
-
-    status = payload.get("status")
-
-    color = payload.get("color")
-
-    roll = payload.get("roll")
-
-
-    # ------------------------------------------------------------
-    # Mostrar tick
-    # ------------------------------------------------------------
-
-    if MOSTRAR_TICKS:
-
-        cor = (
-            nome_cor(color)
-            if color is not None
-            else "-"
-        )
-
-        print(
-            f"📡 TICK | "
-            f"ID={rodada_id} | "
-            f"STATUS={status} | "
-            f"COR={cor} | "
-            f"ROLL={roll}"
-        )
-
-
-    # ------------------------------------------------------------
-    # Só salva resultado FINAL
-    # ------------------------------------------------------------
-
-    if status != "complete":
-
-        return
-
-
-    if color is None or roll is None:
-
-        print(
-            f"⚠️ COMPLETE sem resultado completo | "
-            f"ID={rodada_id}"
-        )
-
-        return
-
-
-    salvar_resultado(payload)
-
-
-# ================================================================
-# 13. EVENTO DE CONEXÃO
-# ================================================================
-
-def on_connect():
-
-    global conectado
-
-    conectado = True
-
-    print()
-    print("=" * 70)
-    print("🟢 SOCKET.IO CONECTADO")
-    print("=" * 70)
-    print(f"Servidor : {BLAZE_URL}")
-    print(f"Path     : {SOCKET_PATH}")
-    print(f"Room     : {ROOM}")
-    print("=" * 70)
-    print()
-
-
-    # ------------------------------------------------------------
-    # Inscrição na sala Double
-    # ------------------------------------------------------------
-
-    try:
-
-        sio.emit(
-            "cmd",
-            {
-                "id": "subscribe",
-                "payload": {
-                    "room": ROOM
-                }
-            }
-        )
-
-        print(
-            f"📡 Subscribe enviado para: {ROOM}"
-        )
-
-    except Exception as e:
-
-        print(
-            "❌ Erro ao enviar subscribe:",
-            e
-        )
-
-
-# ================================================================
-# 14. EVENTO DE DESCONEXÃO
-# ================================================================
-
-def on_disconnect():
-
-    global conectado
-
-    conectado = False
-
-    print()
-    print("=" * 70)
-    print("🔴 SOCKET.IO DESCONECTADO")
-    print("=" * 70)
-    print()
-
-
-# ================================================================
-# 15. EVENTO DE ERRO
-# ================================================================
-
-def on_connect_error(data):
-
-    global conectado
-
-    conectado = False
-
-    print()
-    print("=" * 70)
-    print("❌ ERRO DE CONEXÃO SOCKET.IO")
-    print("=" * 70)
-
-    print(data)
-
-    print("=" * 70)
-    print()
-
-
-# ================================================================
-# 16. EVENTO DATA
-# ================================================================
-
-def on_data(data):
-
-    try:
-
-        processar_tick(data)
-
-    except Exception as e:
-
-        print()
-        print("❌ Erro processando evento data:")
-        print(e)
-        print()
-
-
-# ================================================================
-# 17. MONITOR DE STATUS
-# ================================================================
-
-def monitor_status():
-
-    global rodando
-
-    while rodando:
-
-        time.sleep(INTERVALO_STATUS)
-
-        if not rodando:
-
-            break
-
-        print()
-        print(
-            f"📊 STATUS | "
-            f"Socket={'CONECTADO' if conectado else 'DESCONECTADO'} | "
-            f"Ticks={total_ticks} | "
-            f"Resultados={total_resultados} | "
-            f"Duplicados={total_duplicados} | "
-            f"ErrosDB={total_erros_db}"
-        )
-
-
-# ================================================================
-# 18. TRATAMENTO DE CTRL+C
-# ================================================================
-
-def encerrar(sig=None, frame=None):
-
-    global rodando
-
-    print()
-    print()
-    print("=" * 70)
-    print("ENCERRANDO COLLECTOR...")
-    print("=" * 70)
-
-    rodando = False
-
-    try:
-
-        if sio:
-
-            sio.disconnect()
-
-    except:
-
-        pass
-
-    print()
-    print("Collector encerrado.")
-    print()
-
-
-# ================================================================
-# 19. CONFIGURAR SOCKET.IO
-# ================================================================
-
-def configurar_socket():
-
-    global sio
-
-    sio = socketio.Client(
-
-        reconnection=True,
-
-        reconnection_attempts=MAX_RECONEXOES,
-
-        reconnection_delay=2,
-
-        reconnection_delay_max=10,
-
-        logger=False,
-
-        engineio_logger=False
-
-    )
-
-
-    # ------------------------------------------------------------
-    # Eventos Socket.IO
-    # ------------------------------------------------------------
-
-    sio.on(
-        "connect",
-        on_connect
-    )
-
-    sio.on(
-        "disconnect",
-        on_disconnect
-    )
-
-    sio.on(
-        "connect_error",
-        on_connect_error
-    )
-
-    sio.on(
-        EVENT_NAME,
-        on_data
-    )
-
-
-# ================================================================
-# 20. INICIAR SOCKET
-# ================================================================
-
-def iniciar_socket():
-
-    global sio
-
-    configurar_socket()
-
-
-    print()
-    print("=" * 70)
-    print("CONECTANDO AO BLAZE DOUBLE")
-    print("=" * 70)
-
-    print(f"URL       : {BLAZE_URL}")
-    print(f"SOCKET    : {SOCKET_PATH}")
-    print(f"ROOM      : {ROOM}")
-    print()
-
-
-    try:
-
-        sio.connect(
-
-            BLAZE_URL,
-
-            socketio_path=SOCKET_PATH,
-
-            transports=[
-                "websocket"
-            ],
-
-            wait_timeout=20
-
-        )
-
-    except Exception as e:
-
-        print()
-        print("=" * 70)
-        print("❌ FALHA AO CONECTAR")
-        print("=" * 70)
-
-        print(e)
-
-        print("=" * 70)
-        print()
-
-        return False
-
-
-    return True
-
-
-# ================================================================
-# 21. CONSULTAR QUANTIDADE DE RESULTADOS
-# ================================================================
-
-def mostrar_estatisticas_db():
-
-    conn = get_db_connection()
-
-    if not conn:
-
-        return
-
-
-    try:
-
-        with conn.cursor() as cur:
-
-            cur.execute("""
-                SELECT
-                    COUNT(*),
-                    MIN(created_at),
-                    MAX(created_at)
-                FROM blaze_historico;
-            """)
-
-            total, primeira, ultima = cur.fetchone()
-
-
-            print()
-            print("=" * 70)
-            print("BANCO DE DADOS")
-            print("=" * 70)
-
-            print(f"Total de resultados : {total}")
-            print(f"Primeiro resultado  : {primeira}")
-            print(f"Último resultado    : {ultima}")
-
-            print("=" * 70)
-            print()
-
-
-        conn.close()
-
-    except Exception as e:
-
-        print(
-            "Erro consultando estatísticas:",
-            e
-        )
-
-        try:
-            conn.close()
-        except:
-            pass
-
-
-# ================================================================
-# 22. MAIN
-# ================================================================
-
-def main():
-
-    global rodando
-
-
-    print()
-    print("=" * 70)
-    print("BLAZE DOUBLE — COLLECTOR V2.1")
-    print("=" * 70)
-
-    print()
-    print("Objetivo:")
-    print("Capturar resultados do Blaze Double")
-    print("e armazená-los no PostgreSQL.")
-    print()
-
-    print("Tabela:")
-    print("blaze_historico")
-
-    print()
-    print("Cores:")
-    print("0 = BRANCO")
-    print("1 = VERMELHO")
-    print("2 = PRETO")
-
-    print()
-    print("=" * 70)
-
-
-    # ============================================================
-    # DATABASE_URL
-    # ============================================================
-
-    database_url = os.environ.get(
-        "DATABASE_URL"
-    )
-
-
-    if not database_url:
-
-        print()
-        print("❌ DATABASE_URL NÃO CONFIGURADA.")
-        print()
-        print(
-            "Defina a variável DATABASE_URL "
-            "antes de executar o Collector."
-        )
-        print()
-
-        return
-
-
-    print()
-    print("✅ DATABASE_URL encontrada.")
-
-
-    # ============================================================
-    # TESTAR POSTGRESQL
-    # ============================================================
-
-    if not testar_postgresql():
-
-        print()
-        print("❌ PostgreSQL não respondeu.")
-        print("Collector não iniciado.")
-        print()
-
-        return
-
-
-    # ============================================================
-    # CRIAR TABELA
-    # ============================================================
-
-    if not init_db():
-
-        print()
-        print("❌ Não foi possível inicializar o banco.")
-        print("Collector não iniciado.")
-        print()
-
-        return
-
-
-    # ============================================================
-    # ESTATÍSTICAS ANTES DE INICIAR
-    # ============================================================
-
-    mostrar_estatisticas_db()
-
-
-    # ============================================================
-    # MONITOR
-    # ============================================================
-
-    thread_status = threading.Thread(
-
-        target=monitor_status,
-
-        daemon=True
-
-    )
-
-    thread_status.start()
-
-
-    # ============================================================
-    # CTRL+C
-    # ============================================================
-
-    signal.signal(
-        signal.SIGINT,
-        encerrar
-    )
-
-
-    # ============================================================
-    # SOCKET
-    # ============================================================
-
-    sucesso = iniciar_socket()
-
-
-    if not sucesso:
-
-        encerrar()
-
-        return
-
-
-    # ============================================================
-    # LOOP PRINCIPAL
-    # ============================================================
-
-    print()
-    print("=" * 70)
-    print("🟢 COLLECTOR V2.1 OPERANDO")
-    print("=" * 70)
-    print()
-    print("Aguardando resultados...")
-    print()
-    print("Não feche esta célula enquanto quiser coletar.")
-    print("Para parar: interrompa a execução da célula.")
-    print()
-    print("=" * 70)
-    print()
-
-
-    try:
-
-        while rodando:
-
-            time.sleep(1)
-
-
-    except KeyboardInterrupt:
-
-        encerrar()
-
-
-    except Exception as e:
-
-        print()
-        print("❌ Erro no loop principal:")
-        print(e)
-        print()
-
-        encerrar()
-
-
-# ================================================================
-# 23. EXECUTAR
-# ================================================================
-
-main()
 
     if not database_url:
         add_log("⚠️ DATABASE_URL não configurada.")
         return None
 
     try:
-        return psycopg2.connect(
-            database_url,
-            connect_timeout=15
-        )
-
+        return psycopg2.connect(database_url, connect_timeout=15)
     except Exception as e:
-        add_log(
-            f"⚠️ Erro PostgreSQL: {str(e)[:180]}"
-        )
+        add_log(f"⚠️ Erro PostgreSQL: {str(e)[:180]}")
         return None
 
 
 def init_db():
     conn = get_db_connection()
-
     if not conn:
         return False
 
     try:
         with conn.cursor() as cur:
-
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS blaze_historico (
                     id SERIAL PRIMARY KEY,
@@ -1432,33 +213,24 @@ def init_db():
                 );
             """)
 
-            conn.commit()
-
+        conn.commit()
         conn.close()
-
         add_log("🗄️ PostgreSQL pronto.")
         return True
 
     except Exception as e:
-        add_log(
-            f"❌ Erro inicializando banco: {e}"
-        )
-
+        add_log(f"❌ Erro inicializando banco: {e}")
         try:
             conn.rollback()
             conn.close()
         except Exception:
             pass
-
         return False
 
 
 def salvar_resultado_db(payload):
-    global total_resultados
-    global total_duplicados
-    global total_erros_db
-    global ultima_rodada
-    global ultimo_resultado_em
+    global total_resultados, total_duplicados, total_erros_db
+    global ultima_rodada, ultimo_resultado_em
 
     rodada_id = payload.get("id")
     color = payload.get("color")
@@ -1468,22 +240,14 @@ def salvar_resultado_db(payload):
     created_at = payload.get("created_at")
     updated_at = payload.get("updated_at")
 
-    if not rodada_id:
-        return False
-
-    if color is None or roll is None:
-        return False
-
-    if status != "complete":
+    if not rodada_id or color is None or roll is None or status != "complete":
         return False
 
     cor_nome = nome_cor(color)
-
     created_datetime = parse_timestamp(created_at)
     updated_datetime = parse_timestamp(updated_at)
 
     conn = get_db_connection()
-
     if not conn:
         total_erros_db += 1
         return False
@@ -1492,18 +256,11 @@ def salvar_resultado_db(payload):
         with conn.cursor() as cur:
             cur.execute("""
                 INSERT INTO blaze_historico (
-                    rodada_id,
-                    color,
-                    cor,
-                    roll,
-                    status,
-                    room_id,
-                    created_at,
-                    updated_at
+                    rodada_id, color, cor, roll, status, room_id,
+                    created_at, updated_at
                 )
                 VALUES (%s,%s,%s,%s,%s,%s,%s,%s)
-                ON CONFLICT (rodada_id)
-                DO NOTHING
+                ON CONFLICT (rodada_id) DO NOTHING
                 RETURNING id;
             """, (
                 str(rodada_id),
@@ -1513,9 +270,8 @@ def salvar_resultado_db(payload):
                 status,
                 room_id,
                 created_datetime,
-                updated_datetime
+                updated_datetime,
             ))
-
             inserted = cur.fetchone()
 
         conn.commit()
@@ -1525,12 +281,9 @@ def salvar_resultado_db(payload):
             total_resultados += 1
             ultima_rodada = str(rodada_id)
             ultimo_resultado_em = datetime.now()
-
             add_log(
-                f"💾 SALVO | {str(rodada_id)} | "
-                f"{cor_nome} | roll={roll}"
+                f"💾 SALVO | {rodada_id} | {cor_nome} | roll={roll}"
             )
-
             return True
 
         total_duplicados += 1
@@ -1538,58 +291,34 @@ def salvar_resultado_db(payload):
 
     except Exception as e:
         total_erros_db += 1
-
-        add_log(
-            f"❌ Erro salvando resultado: {str(e)[:180]}"
-        )
-
+        add_log(f"❌ Erro salvando resultado: {str(e)[:180]}")
         try:
             conn.rollback()
             conn.close()
         except Exception:
             pass
-
         return False
-
-
-def parse_timestamp(value):
-    if not value:
-        return None
-
-    try:
-        return datetime.fromisoformat(
-            str(value).replace("Z", "+00:00")
-        ).replace(tzinfo=None)
-
-    except Exception:
-        return None
 
 
 def carregar_historico():
     """
-    Carrega os últimos resultados do PostgreSQL para que o V3
-    não precise esperar 3, 5 ou 10 novas rodadas após reiniciar.
+    Carrega o histórico em ordem cronológica por created_at.
+    Em caso de empate/nulo, usa coletado_em e id.
     """
-
     conn = get_db_connection()
-
     if not conn:
         return False
 
     try:
         with conn.cursor() as cur:
             cur.execute("""
-                SELECT
-                    rodada_id,
-                    roll,
-                    cor
+                SELECT rodada_id, roll, cor
                 FROM blaze_historico
                 WHERE status = 'complete'
                 ORDER BY
                     COALESCE(created_at, coletado_em) ASC,
                     id ASC;
             """)
-
             rows = cur.fetchall()
 
         conn.close()
@@ -1597,44 +326,29 @@ def carregar_historico():
         with state_lock:
             history_numbers.clear()
             history_colors.clear()
-
             processed_issues.clear()
 
             for rodada_id, roll, cor in rows:
                 if roll is None:
                     continue
 
-                sigla = {
-                    "BRANCO": "W",
-                    "VERMELHO": "R",
-                    "PRETO": "B"
-                }.get(str(cor).upper())
-
+                sigla = COR_SIGLA.get(str(cor).upper())
                 if sigla is None:
                     continue
 
                 history_numbers.append(int(roll))
                 history_colors.append(sigla)
-
                 processed_issues.add(str(rodada_id))
 
-        add_log(
-            f"📚 Histórico carregado: "
-            f"{len(history_numbers)} resultados em memória."
-        )
-
+        add_log(f"📚 Histórico carregado: {len(history_numbers)} resultados em memória.")
         return True
 
     except Exception as e:
-        add_log(
-            f"⚠️ Erro carregando histórico: {e}"
-        )
-
+        add_log(f"⚠️ Erro carregando histórico: {e}")
         try:
             conn.close()
         except Exception:
             pass
-
         return False
 
 
@@ -1647,10 +361,9 @@ def salvar_operacao_db(
     votos,
     regras,
     valor,
-    lucro
+    lucro,
 ):
     conn = get_db_connection()
-
     if not conn:
         return
 
@@ -1658,15 +371,8 @@ def salvar_operacao_db(
         with conn.cursor() as cur:
             cur.execute("""
                 INSERT INTO blaze_operacoes (
-                    rodada_sinal,
-                    rodada_resultado,
-                    sinal,
-                    resultado,
-                    roll,
-                    votos,
-                    regras,
-                    valor,
-                    lucro
+                    rodada_sinal, rodada_resultado, sinal, resultado,
+                    roll, votos, regras, valor, lucro
                 )
                 VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s);
             """, (
@@ -1678,17 +384,14 @@ def salvar_operacao_db(
                 votos,
                 regras,
                 valor,
-                lucro
+                lucro,
             ))
 
         conn.commit()
         conn.close()
 
     except Exception as e:
-        add_log(
-            f"⚠️ Erro salvando operação: {str(e)[:160]}"
-        )
-
+        add_log(f"⚠️ Erro salvando operação: {str(e)[:160]}")
         try:
             conn.rollback()
             conn.close()
@@ -1702,117 +405,51 @@ def salvar_operacao_db(
 
 def calcular_regras():
     """
-    Retorna um dicionário:
-        {
-            "R1": "B",
-            "R2": "R",
-            ...
-        }
-
-    None significa que a regra não gerou sinal.
-
-    IMPORTANTE:
-    O resultado atual NÃO está no histórico neste momento.
-    Portanto as regras usam apenas resultados anteriores.
+    Calcula as 10 regras usando SOMENTE o histórico anterior.
+    Retorna apenas as regras que geraram sinal.
     """
-
     n = list(history_numbers)
-    c = list(history_colors)
-
     sinais = {}
 
-    # Precisamos de pelo menos 2 resultados para algumas regras,
-    # mas mantemos todas as regras disponíveis desde o início.
-
-    # ------------------------------------------------------------
     # R1 — SOMA2 <= 8 -> BLACK
-    # ------------------------------------------------------------
-    if len(n) >= 2:
-        soma2 = n[-1] + n[-2]
+    if len(n) >= 2 and n[-1] + n[-2] <= 8:
+        sinais["R1"] = "B"
 
-        if soma2 <= 8:
-            sinais["R1"] = "B"
-
-    # ------------------------------------------------------------
     # R2 — SOMA3 <= 14 -> RED
-    # ------------------------------------------------------------
-    if len(n) >= 3:
-        soma3 = sum(n[-3:])
+    if len(n) >= 3 and sum(n[-3:]) <= 14:
+        sinais["R2"] = "R"
 
-        if soma3 <= 14:
-            sinais["R2"] = "R"
-
-    # ------------------------------------------------------------
     # R3 — SOMA3 >= 30 -> BLACK
-    # ------------------------------------------------------------
-    if len(n) >= 3:
-        soma3 = sum(n[-3:])
+    if len(n) >= 3 and sum(n[-3:]) >= 30:
+        sinais["R3"] = "B"
 
-        if soma3 >= 30:
-            sinais["R3"] = "B"
-
-    # ------------------------------------------------------------
     # R4 — DISTÂNCIA >= 9 -> RED
-    # ------------------------------------------------------------
-    if len(n) >= 2:
-        distancia = abs(n[-1] - n[-2])
+    if len(n) >= 2 and abs(n[-1] - n[-2]) >= 9:
+        sinais["R4"] = "R"
 
-        if distancia >= 9:
-            sinais["R4"] = "R"
-
-    # ------------------------------------------------------------
     # R5 — DISTÂNCIA >= 11 -> RED
-    # ------------------------------------------------------------
-    if len(n) >= 2:
-        distancia = abs(n[-1] - n[-2])
+    if len(n) >= 2 and abs(n[-1] - n[-2]) >= 11:
+        sinais["R5"] = "R"
 
-        if distancia >= 11:
-            sinais["R5"] = "R"
-
-    # ------------------------------------------------------------
     # R6 — NÚMERO 3 -> RED
-    # ------------------------------------------------------------
-    if len(n) >= 1:
-        if n[-1] == 3:
-            sinais["R6"] = "R"
+    if len(n) >= 1 and n[-1] == 3:
+        sinais["R6"] = "R"
 
-    # ------------------------------------------------------------
     # R7 — NÚMERO 4 -> BLACK
-    # ------------------------------------------------------------
-    if len(n) >= 1:
-        if n[-1] == 4:
-            sinais["R7"] = "B"
+    if len(n) >= 1 and n[-1] == 4:
+        sinais["R7"] = "B"
 
-    # ------------------------------------------------------------
     # R8 — NÚMERO 6 -> BLACK
-    # ------------------------------------------------------------
-    if len(n) >= 1:
-        if n[-1] == 6:
-            sinais["R8"] = "B"
+    if len(n) >= 1 and n[-1] == 6:
+        sinais["R8"] = "B"
 
-    # ------------------------------------------------------------
     # R9 — H10-H10-L7 -> BLACK
-    # n3 >= 8, n2 >= 8, n1 == 7
-    # ------------------------------------------------------------
-    if len(n) >= 3:
-        if (
-            n[-3] >= 8
-            and n[-2] >= 8
-            and n[-1] == 7
-        ):
-            sinais["R9"] = "B"
+    if len(n) >= 3 and n[-3] >= 8 and n[-2] >= 8 and n[-1] == 7:
+        sinais["R9"] = "B"
 
-    # ------------------------------------------------------------
     # R10 — H7-H7-L1 -> BLACK
-    # n3 >= 7, n2 >= 7, n1 <= 1
-    # ------------------------------------------------------------
-    if len(n) >= 3:
-        if (
-            n[-3] >= 7
-            and n[-2] >= 7
-            and n[-1] <= 1
-        ):
-            sinais["R10"] = "B"
+    if len(n) >= 3 and n[-3] >= 7 and n[-2] >= 7 and n[-1] <= 1:
+        sinais["R10"] = "B"
 
     return sinais
 
@@ -1820,33 +457,20 @@ def calcular_regras():
 def calcular_confluencia():
     sinais = calcular_regras()
 
-    votos_r = [
-        regra
-        for regra, sinal in sinais.items()
-        if sinal == "R"
-    ]
-
-    votos_b = [
-        regra
-        for regra, sinal in sinais.items()
-        if sinal == "B"
-    ]
+    votos_r = [regra for regra, sinal in sinais.items() if sinal == "R"]
+    votos_b = [regra for regra, sinal in sinais.items() if sinal == "B"]
 
     qtd_r = len(votos_r)
     qtd_b = len(votos_b)
 
-    # Strict majority:
-    # empate nunca gera entrada.
     if qtd_r > qtd_b and qtd_r >= MIN_CONFLUENCIA:
         sinal = "R"
         votos = qtd_r
         regras = votos_r
-
     elif qtd_b > qtd_r and qtd_b >= MIN_CONFLUENCIA:
         sinal = "B"
         votos = qtd_b
         regras = votos_b
-
     else:
         sinal = None
         votos = max(qtd_r, qtd_b)
@@ -1858,7 +482,7 @@ def calcular_confluencia():
         "votos_r": votos_r,
         "votos_b": votos_b,
         "regras": regras,
-        "sinais": sinais
+        "sinais": sinais,
     }
 
 
@@ -1867,81 +491,53 @@ def calcular_confluencia():
 # ================================================================
 
 def start_bot():
-    global bot_running
-    global bot_state
-    global signal_color
-    global signal_issue
-    global signal_votes
-    global signal_rules
-    global wins
-    global losses
-    global white_ignored
-    global current_profit
+    global bot_running, bot_state
+    global signal_color, signal_issue, signal_votes, signal_rules
+    global wins, losses, white_ignored, current_profit
     global history_results
 
     with state_lock:
         bot_running = True
-
         bot_state = "CACANDO"
-
         signal_color = None
         signal_issue = None
         signal_votes = 0
         signal_rules = []
-
         wins = 0
         losses = 0
         white_ignored = 0
         current_profit = 0.0
-
         history_results.clear()
 
-        add_log("")
         add_log("==========================================")
         add_log("🟢 V3 INICIADO")
-        add_log(
-            f"🎯 Confluência mínima: {MIN_CONFLUENCIA} votos"
-        )
-        add_log(
-            f"💰 Aposta simulada: R$ {APOSTA_BASE:.2f}"
-        )
+        add_log(f"🎯 Confluência mínima: {MIN_CONFLUENCIA} votos")
+        add_log(f"💰 Aposta simulada: R$ {APOSTA_BASE:.2f}")
         add_log("⚪ WHITE será ignorado na avaliação.")
         add_log("==========================================")
 
 
 def stop_bot():
-    global bot_running
-    global bot_state
-    global signal_color
-    global signal_issue
-    global signal_votes
-    global signal_rules
+    global bot_running, bot_state
+    global signal_color, signal_issue, signal_votes, signal_rules
 
     with state_lock:
         bot_running = False
-
         bot_state = "PARADO"
-
         signal_color = None
         signal_issue = None
         signal_votes = 0
         signal_rules = []
 
-        add_log("")
         add_log("==========================================")
         add_log("🔴 V3 PARADO")
-        add_log(
-            f"💰 Saldo da sessão: R$ {current_profit:.2f}"
-        )
+        add_log(f"💰 Saldo da sessão: R$ {current_profit:.2f}")
         add_log("📡 COLETA CONTINUA.")
         add_log("==========================================")
 
 
 def zerar_sessao():
-    global wins
-    global losses
-    global white_ignored
-    global current_profit
+    global wins, losses, white_ignored, current_profit
     global history_results
 
     with state_lock:
@@ -1950,7 +546,6 @@ def zerar_sessao():
         white_ignored = 0
         current_profit = 0.0
         history_results.clear()
-
         add_log("♻️ Placar da sessão zerado.")
 
 
@@ -1959,61 +554,37 @@ def zerar_sessao():
 # ================================================================
 
 def processar_resultado_novo(payload):
-    global signal_color
-    global signal_issue
-    global signal_votes
-    global signal_rules
-
-    global wins
-    global losses
-    global white_ignored
-    global current_profit
+    global signal_color, signal_issue, signal_votes, signal_rules
+    global wins, losses, white_ignored, current_profit
+    global bot_state
 
     rodada_id = str(payload.get("id"))
     roll = int(payload.get("roll"))
     color = int(payload.get("color"))
 
-    sigla = {
-        0: "W",
-        1: "R",
-        2: "B"
-    }.get(color)
-
+    sigla = {0: "W", 1: "R", 2: "B"}.get(color)
     if sigla is None:
-        add_log(
-            f"⚠️ Cor desconhecida | rodada={rodada_id}"
-        )
+        add_log(f"⚠️ Cor desconhecida | rodada={rodada_id}")
         return
 
-    # ============================================================
-    # PRIMEIRO:
-    # Se já existe sinal aberto, este resultado serve para
-    # avaliá-lo.
-    #
-    # WHITE não encerra o sinal.
-    # ============================================================
-
     with state_lock:
-
+        # ============================================================
+        # SINAL ABERTO: o resultado atual é o avaliador.
+        # WHITE não encerra o sinal.
+        # ============================================================
         if bot_running and bot_state == "ACOMPANHANDO":
-
-            # ----------------------------------------------------
-            # WHITE
-            # ----------------------------------------------------
             if sigla == "W":
-
                 white_ignored += 1
-
                 history_results.append({
                     "issue": rodada_id,
                     "result": "WHITE",
                     "type": "WHITE IGNORADO",
-                    "value": 0.0
+                    "value": 0.0,
                 })
 
                 add_log(
-                    f"⚪ WHITE | {rodada_id} | "
-                    f"roll={roll} | sinal {signal_color} continua."
+                    f"⚪ WHITE | {rodada_id} | roll={roll} | "
+                    f"sinal {signal_color} continua."
                 )
 
                 salvar_operacao_db(
@@ -2025,31 +596,22 @@ def processar_resultado_novo(payload):
                     signal_votes,
                     ",".join(signal_rules),
                     APOSTA_BASE,
-                    0.0
+                    0.0,
                 )
-
-                # NÃO limpa o sinal.
-                # O próximo RED/BLACK ainda será avaliado.
                 return
 
-            # ----------------------------------------------------
-            # RED / BLACK
-            # ----------------------------------------------------
             if sigla == signal_color:
-
                 wins += 1
                 current_profit += APOSTA_BASE
-
                 history_results.append({
                     "issue": rodada_id,
                     "result": "WIN",
                     "type": "VITÓRIA",
-                    "value": APOSTA_BASE
+                    "value": APOSTA_BASE,
                 })
 
                 add_log(
-                    f"✅ WIN | sinal {signal_color} | "
-                    f"saiu {sigla} ({roll}) | "
+                    f"✅ WIN | sinal {signal_color} | saiu {sigla} ({roll}) | "
                     f"+R$ {APOSTA_BASE:.2f}"
                 )
 
@@ -2062,24 +624,20 @@ def processar_resultado_novo(payload):
                     signal_votes,
                     ",".join(signal_rules),
                     APOSTA_BASE,
-                    APOSTA_BASE
+                    APOSTA_BASE,
                 )
-
             else:
-
                 losses += 1
                 current_profit -= APOSTA_BASE
-
                 history_results.append({
                     "issue": rodada_id,
                     "result": "LOSS",
                     "type": "DERROTA",
-                    "value": -APOSTA_BASE
+                    "value": -APOSTA_BASE,
                 })
 
                 add_log(
-                    f"❌ LOSS | sinal {signal_color} | "
-                    f"saiu {sigla} ({roll}) | "
+                    f"❌ LOSS | sinal {signal_color} | saiu {sigla} ({roll}) | "
                     f"-R$ {APOSTA_BASE:.2f}"
                 )
 
@@ -2092,100 +650,53 @@ def processar_resultado_novo(payload):
                     signal_votes,
                     ",".join(signal_rules),
                     APOSTA_BASE,
-                    -APOSTA_BASE
+                    -APOSTA_BASE,
                 )
 
-            # ----------------------------------------------------
-            # Depois de RED/BLACK, o sinal é encerrado.
-            # ----------------------------------------------------
             signal_color = None
             signal_issue = None
             signal_votes = 0
             signal_rules = []
-
             bot_state = "CACANDO"
-
             return
 
-        # ========================================================
+        # ============================================================
         # SEM SINAL ABERTO
-        # ========================================================
-
+        # ============================================================
         if not bot_running:
             return
 
-        # ========================================================
-        # CAÇANDO:
-        # calcula V3 usando SOMENTE o histórico anterior.
-        # O resultado atual ainda não foi adicionado.
-        # ========================================================
-
         if bot_state == "CACANDO":
-
             if len(history_numbers) < 2:
                 return
 
             resultado = calcular_confluencia()
-
             sinais = resultado["sinais"]
 
             if sinais:
-                partes = [
-                    f"{regra}={sinal}"
-                    for regra, sinal in sinais.items()
-                ]
-
-                add_log(
-                    "🧠 " + " | ".join(partes)
-                )
+                partes = [f"{regra}={sinal}" for regra, sinal in sinais.items()]
+                add_log("🧠 " + " | ".join(partes))
 
             if resultado["sinal"]:
-
                 signal_color = resultado["sinal"]
                 signal_issue = rodada_id
                 signal_votes = resultado["votos"]
                 signal_rules = resultado["regras"]
-
                 bot_state = "ACOMPANHANDO"
 
-                alvo = (
-                    "🔴 RED"
-                    if signal_color == "R"
-                    else "⚫ BLACK"
-                )
-
-                add_log(
-                    f"🚨 SINAL {alvo} | "
-                    f"{signal_votes} VOTOS"
-                )
-
+                alvo = "🔴 RED" if signal_color == "R" else "⚫ BLACK"
+                add_log(f"🚨 SINAL {alvo} | {signal_votes} VOTOS")
                 add_log(
                     f"📊 R={len(resultado['votos_r'])} | "
                     f"B={len(resultado['votos_b'])}"
                 )
-
+                add_log(f"🧩 Regras: {', '.join(signal_rules)}")
+                add_log(f"💰 Entrada simulada: R$ {APOSTA_BASE:.2f}")
+            elif resultado["votos"]:
                 add_log(
-                    f"🧩 Regras: "
-                    f"{', '.join(signal_rules)}"
+                    f"⚪ SEM ENTRADA | R={len(resultado['votos_r'])} | "
+                    f"B={len(resultado['votos_b'])}"
                 )
-
-                add_log(
-                    f"💰 Entrada simulada: "
-                    f"R$ {APOSTA_BASE:.2f}"
-                )
-
-                # Não registra WIN/LOSS aqui.
-                # O resultado seguinte será o avaliador.
-                return
-
-            else:
-
-                if resultado["votos"]:
-                    add_log(
-                        f"⚪ SEM ENTRADA | "
-                        f"R={len(resultado['votos_r'])} | "
-                        f"B={len(resultado['votos_b'])}"
-                    )
 
 
 # ================================================================
@@ -2200,12 +711,10 @@ def processar_tick(data):
     if not isinstance(data, dict):
         return
 
-    event_id = data.get("id")
-    payload = data.get("payload")
-
-    if event_id != TICK_NAME:
+    if data.get("id") != TICK_NAME:
         return
 
+    payload = data.get("payload")
     if not isinstance(payload, dict):
         return
 
@@ -2215,18 +724,11 @@ def processar_tick(data):
     roll = payload.get("roll")
 
     if MOSTRAR_TICKS:
-        cor = (
-            nome_cor(color)
-            if color is not None
-            else "-"
-        )
-
+        cor = nome_cor(color) if color is not None else "-"
         add_log(
-            f"📡 TICK | {rodada_id} | "
-            f"{status} | {cor} | roll={roll}"
+            f"📡 TICK | {rodada_id} | {status} | {cor} | roll={roll}"
         )
 
-    # Só interessa resultado final.
     if status != "complete":
         return
 
@@ -2235,15 +737,12 @@ def processar_tick(data):
 
     rodada_id = str(rodada_id)
 
-    # Evita processar duas vezes na memória.
     with state_lock:
         if rodada_id in processed_issues:
             return
 
-    # Primeiro grava no banco.
+    # Grava primeiro. Só processa como novo se realmente foi inserido.
     inserido = salvar_resultado_db(payload)
-
-    # Se já existia, não processa novamente.
     if not inserido:
         with state_lock:
             processed_issues.add(rodada_id)
@@ -2252,23 +751,13 @@ def processar_tick(data):
     with state_lock:
         processed_issues.add(rodada_id)
 
-    # ============================================================
-    # IMPORTANTE:
-    # processar_resultado_novo usa o histórico ANTERIOR.
-    # Só depois o resultado atual entra na memória.
-    # ============================================================
-
+    # O motor usa o histórico ANTERIOR ao resultado atual.
     processar_resultado_novo(payload)
 
+    # Só depois o resultado atual entra na memória do V3.
     with state_lock:
         history_numbers.append(int(roll))
-
-        sigla = {
-            0: "W",
-            1: "R",
-            2: "B"
-        }.get(int(color))
-
+        sigla = {0: "W", 1: "R", 2: "B"}.get(int(color))
         if sigla:
             history_colors.append(sigla)
 
@@ -2279,63 +768,41 @@ def processar_tick(data):
 
 def on_connect():
     global conectado
-
     conectado = True
 
     add_log("🟢 SOCKET.IO CONECTADO")
-    add_log(
-        f"📡 Room: {ROOM}"
-    )
+    add_log(f"📡 Room: {ROOM}")
 
     try:
         sio.emit(
             "cmd",
             {
                 "id": "subscribe",
-                "payload": {
-                    "room": ROOM
-                }
-            }
+                "payload": {"room": ROOM},
+            },
         )
-
-        add_log(
-            f"📡 Subscribe enviado: {ROOM}"
-        )
-
+        add_log(f"📡 Subscribe enviado: {ROOM}")
     except Exception as e:
-        add_log(
-            f"❌ Erro no subscribe: {str(e)[:180]}"
-        )
+        add_log(f"❌ Erro no subscribe: {str(e)[:180]}")
 
 
 def on_disconnect():
     global conectado
-
     conectado = False
-
-    add_log(
-        "🔴 SOCKET.IO DESCONECTADO"
-    )
+    add_log("🔴 SOCKET.IO DESCONECTADO")
 
 
 def on_connect_error(data):
     global conectado
-
     conectado = False
-
-    add_log(
-        f"⚠️ Socket.IO Connection error: {str(data)[:180]}"
-    )
+    add_log(f"⚠️ Socket.IO Connection error: {str(data)[:180]}")
 
 
 def on_data(data):
     try:
         processar_tick(data)
-
     except Exception as e:
-        add_log(
-            f"❌ Erro processando data: {str(e)[:200]}"
-        )
+        add_log(f"❌ Erro processando data: {str(e)[:200]}")
 
 
 def configurar_socket():
@@ -2347,7 +814,7 @@ def configurar_socket():
         reconnection_delay=2,
         reconnection_delay_max=10,
         logger=False,
-        engineio_logger=False
+        engineio_logger=False,
     )
 
     sio.on("connect", on_connect)
@@ -2360,79 +827,55 @@ def iniciar_socket():
     configurar_socket()
 
     add_log("🔌 Conectando ao Blaze...")
-    add_log(
-        f"🌐 {BLAZE_URL}{SOCKET_PATH}"
-    )
+    add_log(f"🌐 {BLAZE_URL}{SOCKET_PATH}")
 
     try:
+        # Conexão idêntica ao Collector V2.1 funcional.
         sio.connect(
             BLAZE_URL,
             socketio_path=SOCKET_PATH,
             transports=["websocket"],
-            wait_timeout=20
+            wait_timeout=20,
         )
-
         return True
-
     except Exception as e:
-        add_log(
-            f"❌ Falha inicial Socket.IO: {str(e)[:200]}"
-        )
+        add_log(f"❌ Falha inicial Socket.IO: {str(e)[:200]}")
         return False
 
 
 # ================================================================
-# MONITOR
+# MONITOR / SHUTDOWN
 # ================================================================
 
 def monitor_status():
     global rodando
 
     while rodando:
-
         time.sleep(INTERVALO_STATUS)
-
         if not rodando:
             break
 
         with state_lock:
-            estado_socket = (
-                "CONECTADO"
-                if conectado
-                else "DESCONECTADO"
-            )
-
+            estado_socket = "CONECTADO" if conectado else "DESCONECTADO"
             estado_bot = bot_state
-
             saldo = current_profit
-
             resultados = total_resultados
-
             ultima = ultima_rodada
 
         add_log(
-            f"📊 STATUS | "
-            f"Socket={estado_socket} | "
-            f"Coletados={resultados} | "
-            f"Última={ultima or '-'} | "
-            f"V3={estado_bot} | "
-            f"Saldo=R$ {saldo:.2f}"
+            f"📊 STATUS | Socket={estado_socket} | "
+            f"Coletados={resultados} | Última={ultima or '-'} | "
+            f"V3={estado_bot} | Saldo=R$ {saldo:.2f}"
         )
 
 
-# ================================================================
-# SHUTDOWN
-# ================================================================
-
 def encerrar(sig=None, frame=None):
-    global rodando
-    global conectado
+    global rodando, conectado
 
     if not rodando:
         return
 
     add_log("🛑 Encerrando aplicação...")
-
     rodando = False
     conectado = False
 
@@ -2448,23 +891,290 @@ signal.signal(signal.SIGINT, encerrar)
 
 
 # ================================================================
+# HTML
+# ================================================================
+
+HTML_TEMPLATE = r"""
+<!DOCTYPE html>
+<html lang="pt-br">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta http-equiv="refresh" content="10">
+<title>Blaze Double V3</title>
+<style>
+:root {
+    --bg: #07090d;
+    --card: #11151c;
+    --card2: #0d1117;
+    --border: rgba(255,255,255,.08);
+    --text: #e8edf3;
+    --muted: #7d8794;
+    --red: #ff4d57;
+    --green: #19df78;
+    --white: #f1f3f5;
+    --yellow: #ffc247;
+}
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body {
+    background: radial-gradient(circle at top, #171d28 0%, var(--bg) 52%);
+    color: var(--text);
+    font-family: Arial, sans-serif;
+    min-height: 100vh;
+    padding: 18px;
+}
+.container { max-width: 1180px; margin: auto; }
+.header {
+    display: flex; justify-content: space-between; align-items: center;
+    gap: 15px; margin-bottom: 15px; flex-wrap: wrap;
+}
+.logo { font-size: 25px; font-weight: 900; }
+.logo span { color: var(--red); }
+.controls { display: flex; gap: 8px; flex-wrap: wrap; }
+.btn {
+    border: 0; border-radius: 9px; padding: 10px 15px;
+    font-weight: 800; cursor: pointer;
+}
+.btn-start { background: var(--green); color: #00150a; }
+.btn-stop { background: var(--red); color: white; }
+.btn-reset { background: #252b35; color: var(--text); }
+.status-grid {
+    display: grid; grid-template-columns: repeat(4, 1fr);
+    gap: 10px; margin-bottom: 12px;
+}
+.status-card, .card {
+    background: rgba(17,21,28,.86); border: 1px solid var(--border);
+    border-radius: 14px; padding: 15px;
+}
+.status-title, .card-title {
+    color: var(--muted); text-transform: uppercase;
+    font-size: 10px; font-weight: 800; margin-bottom: 8px;
+}
+.status-value { font-size: 15px; font-weight: 900; }
+.online { color: var(--green); }
+.offline { color: var(--red); }
+.signal-box {
+    margin-bottom: 12px; border-radius: 16px; padding: 20px;
+    text-align: center; background: var(--card); border: 1px solid var(--border);
+}
+.signal-red { color: var(--red); font-size: 31px; font-weight: 1000; }
+.signal-black { color: #dce1e7; font-size: 31px; font-weight: 1000; }
+.signal-none { color: var(--yellow); font-size: 20px; font-weight: 900; }
+.signal-detail { margin-top: 7px; color: var(--muted); font-size: 13px; }
+.stats {
+    display: grid; grid-template-columns: repeat(6, 1fr);
+    gap: 10px; margin-bottom: 12px;
+}
+.value { font-size: 26px; font-weight: 950; }
+.green { color: var(--green); }
+.red { color: var(--red); }
+.yellow { color: var(--yellow); }
+.white { color: var(--white); }
+.profit-positive { color: var(--green); }
+.profit-negative { color: var(--red); }
+.trend {
+    display: flex; gap: 6px; overflow-x: auto; padding: 10px;
+    margin-bottom: 12px; background: var(--card);
+    border: 1px solid var(--border); border-radius: 14px;
+}
+.pill {
+    min-width: 38px; height: 38px; border-radius: 9px;
+    display: flex; align-items: center; justify-content: center;
+    font-weight: 900; flex-shrink: 0;
+}
+.pill-r { background: var(--red); color: white; }
+.pill-b { background: #252a31; color: white; border: 1px solid #454c55; }
+.pill-w { background: white; color: #111; }
+.main-grid { display: grid; grid-template-columns: 1.7fr 1fr; gap: 12px; }
+.console, .operations {
+    height: 400px; overflow-y: auto; background: var(--card2);
+    border: 1px solid var(--border); border-radius: 14px; padding: 15px;
+}
+.console { font-family: Consolas, monospace; }
+.section-title {
+    color: var(--muted); font-size: 11px; font-weight: 900;
+    text-transform: uppercase; margin-bottom: 10px;
+}
+.log { padding: 7px 0; border-bottom: 1px solid rgba(255,255,255,.035); font-size: 13px; line-height: 1.35; }
+.log-win { color: var(--green); font-weight: 800; }
+.log-loss { color: var(--red); font-weight: 800; }
+.log-signal { color: #d7dde5; font-weight: 800; }
+.operation {
+    display: grid; grid-template-columns: 1fr auto auto; gap: 8px;
+    align-items: center; padding: 9px 0;
+    border-bottom: 1px solid rgba(255,255,255,.04); font-size: 12px;
+}
+.issue { color: var(--muted); overflow: hidden; text-overflow: ellipsis; }
+.badge { padding: 4px 7px; border-radius: 6px; font-weight: 900; }
+.badge-win { background: rgba(25,223,120,.1); color: var(--green); }
+.badge-loss { background: rgba(255,77,87,.1); color: var(--red); }
+.badge-white { background: rgba(255,255,255,.08); color: white; }
+.footer { margin-top: 12px; color: var(--muted); font-size: 11px; text-align: center; }
+@media(max-width: 900px) {
+    .status-grid { grid-template-columns: repeat(2, 1fr); }
+    .stats { grid-template-columns: repeat(3, 1fr); }
+    .main-grid { grid-template-columns: 1fr; }
+}
+@media(max-width: 600px) {
+    body { padding: 10px; }
+    .header { align-items: stretch; }
+    .controls { width: 100%; }
+    .btn { flex: 1; }
+    .stats { grid-template-columns: repeat(2, 1fr); }
+    .console, .operations { height: 300px; }
+}
+</style>
+</head>
+<body>
+<div class="container">
+
+<div class="header">
+    <div class="logo">🤖 Blaze <span>Double V3</span></div>
+    <div class="controls">
+        {% if running %}
+        <form method="POST" action="/stop"><button class="btn btn-stop">⏹ PARAR V3</button></form>
+        {% else %}
+        <form method="POST" action="/start"><button class="btn btn-start">▶ INICIAR V3</button></form>
+        {% endif %}
+        <form method="POST" action="/reset"><button class="btn btn-reset">↻ ZERAR</button></form>
+    </div>
+</div>
+
+<div class="status-grid">
+    <div class="status-card">
+        <div class="status-title">Socket Blaze</div>
+        <div class="status-value {{ 'online' if connected else 'offline' }}">
+            {{ '● CONECTADO' if connected else '● DESCONECTADO' }}
+        </div>
+    </div>
+    <div class="status-card">
+        <div class="status-title">Coletor</div>
+        <div class="status-value online">{{ total_results }} resultados</div>
+    </div>
+    <div class="status-card">
+        <div class="status-title">Última rodada</div>
+        <div class="status-value">{{ last_round or '—' }}</div>
+    </div>
+    <div class="status-card">
+        <div class="status-title">Motor V3</div>
+        <div class="status-value">
+            {% if running %}
+                {% if state == 'ACOMPANHANDO' %}
+                    <span class="red">🚨 ACOMPANHANDO</span>
+                {% else %}
+                    <span class="yellow">🎯 CAÇANDO</span>
+                {% endif %}
+            {% else %}
+                <span class="offline">⏹ PARADO</span>
+            {% endif %}
+        </div>
+    </div>
+</div>
+
+<div class="signal-box">
+{% if running and state == 'ACOMPANHANDO' %}
+    {% if signal == 'R' %}
+        <div class="signal-red">🔴 ENTRAR RED</div>
+    {% else %}
+        <div class="signal-black">⚫ ENTRAR BLACK</div>
+    {% endif %}
+    <div class="signal-detail">
+        {{ signal_votes }} votos |
+        Regras: {{ signal_rules|join(', ') }} |
+        Aposta simulada: R$ {{ '%.2f'|format(bet_amount) }}
+    </div>
+{% elif running %}
+    <div class="signal-none">🎯 CAÇANDO SINAL V3</div>
+    <div class="signal-detail">
+        Mínimo de {{ min_confluencia }} votos. Empates não geram sinal.
+    </div>
+{% else %}
+    <div class="signal-none">⏹ V3 PARADO</div>
+    <div class="signal-detail">A coleta continua mesmo com o motor V3 parado.</div>
+{% endif %}
+</div>
+
+<div class="stats">
+    <div class="card">
+        <div class="card-title">Saldo</div>
+        <div class="value {{ 'profit-positive' if profit >= 0 else 'profit-negative' }}">
+            R$ {{ '%.2f'|format(profit) }}
+        </div>
+    </div>
+    <div class="card"><div class="card-title">Wins</div><div class="value green">{{ wins }}</div></div>
+    <div class="card"><div class="card-title">Losses</div><div class="value red">{{ losses }}</div></div>
+    <div class="card"><div class="card-title">White</div><div class="value white">{{ white }}</div></div>
+    <div class="card"><div class="card-title">Win rate</div><div class="value yellow">{{ win_rate }}%</div></div>
+    <div class="card"><div class="card-title">Ticks</div><div class="value">{{ total_ticks }}</div></div>
+</div>
+
+<div class="trend">
+    {% for i in range(numbers|length) %}
+        <div class="pill pill-{{ colors[i].lower() }}">{{ numbers[i] }}</div>
+    {% endfor %}
+</div>
+
+<div class="main-grid">
+    <div class="console">
+        <div class="section-title">Console V3 / Coletor</div>
+        {% for line in logs %}
+            <div class="log
+                {% if 'WIN' in line %}log-win
+                {% elif 'LOSS' in line %}log-loss
+                {% elif 'SINAL' in line or '🚨' in line %}log-signal
+                {% endif %}">
+                {{ line }}
+            </div>
+        {% endfor %}
+    </div>
+
+    <div class="operations">
+        <div class="section-title">Histórico da sessão</div>
+        {% if not operations %}
+            <div style="color:#7d8794;text-align:center;padding:30px 5px;">Nenhuma operação nesta sessão.</div>
+        {% endif %}
+        {% for item in operations|reverse %}
+            <div class="operation">
+                <div class="issue">{{ item.issue }}</div>
+                {% if item.result == 'WIN' %}
+                    <div class="badge badge-win">WIN</div>
+                    <div class="green">+R$ {{ '%.2f'|format(item.value) }}</div>
+                {% elif item.result == 'LOSS' %}
+                    <div class="badge badge-loss">LOSS</div>
+                    <div class="red">-R$ {{ '%.2f'|format(-item.value) }}</div>
+                {% else %}
+                    <div class="badge badge-white">WHITE</div>
+                    <div>R$ 0,00</div>
+                {% endif %}
+            </div>
+        {% endfor %}
+    </div>
+</div>
+
+<div class="footer">
+    Coleta contínua • PostgreSQL • Socket.IO • V3
+    {% if db_errors > 0 %} • Erros DB: {{ db_errors }}{% endif %}
+</div>
+
+</div>
+<script>
+const consoleBox = document.querySelector('.console');
+if (consoleBox) consoleBox.scrollTop = consoleBox.scrollHeight;
+</script>
+</body>
+</html>
+"""
+
+
+# ================================================================
 # ROTAS WEB
 # ================================================================
 
 @app.route("/")
 def home():
-
     with state_lock:
-
         total_operacoes = wins + losses
-
-        if total_operacoes:
-            win_rate = round(
-                wins / total_operacoes * 100,
-                1
-            )
-        else:
-            win_rate = 0.0
+        win_rate = round(wins / total_operacoes * 100, 1) if total_operacoes else 0.0
 
         snapshot = {
             "running": bot_running,
@@ -2485,13 +1195,12 @@ def home():
             "numbers": list(history_numbers),
             "colors": list(history_colors),
             "logs": list(log_lines),
-            "operations": list(history_results)
+            "operations": list(history_results),
+            "min_confluencia": MIN_CONFLUENCIA,
+            "bet_amount": APOSTA_BASE,
         }
 
-    return render_template_string(
-        HTML_TEMPLATE,
-        **snapshot
-    )
+    return render_template_string(HTML_TEMPLATE, **snapshot)
 
 
 @app.route("/start", methods=["POST"])
@@ -2519,608 +1228,8 @@ def health():
             "status": "ok",
             "socket_connected": conectado,
             "collector_results": total_resultados,
-            "bot_running": bot_running
+            "bot_running": bot_running,
         }, 200
-
-
-# ================================================================
-# HTML
-# ================================================================
-
-HTML_TEMPLATE = r"""
-<!DOCTYPE html>
-<html lang="pt-br">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<meta http-equiv="refresh" content="10">
-<title>Blaze Double V3</title>
-
-<style>
-:root {
-    --bg: #07090d;
-    --card: #11151c;
-    --card2: #0d1117;
-    --border: rgba(255,255,255,.08);
-    --text: #e8edf3;
-    --muted: #7d8794;
-    --red: #ff4d57;
-    --green: #19df78;
-    --white: #f1f3f5;
-    --yellow: #ffc247;
-    --blue: #4da3ff;
-}
-
-* {
-    box-sizing: border-box;
-    margin: 0;
-    padding: 0;
-}
-
-body {
-    background:
-        radial-gradient(circle at top, #171d28 0%, var(--bg) 52%);
-    color: var(--text);
-    font-family: Arial, sans-serif;
-    min-height: 100vh;
-    padding: 18px;
-}
-
-.container {
-    max-width: 1180px;
-    margin: auto;
-}
-
-.header {
-    display: flex;
-    justify-content: space-between;
-    align-items: center;
-    gap: 15px;
-    margin-bottom: 15px;
-    flex-wrap: wrap;
-}
-
-.logo {
-    font-size: 25px;
-    font-weight: 900;
-}
-
-.logo span {
-    color: var(--red);
-}
-
-.controls {
-    display: flex;
-    gap: 8px;
-    flex-wrap: wrap;
-}
-
-.btn {
-    border: 0;
-    border-radius: 9px;
-    padding: 10px 15px;
-    font-weight: 800;
-    cursor: pointer;
-}
-
-.btn-start {
-    background: var(--green);
-    color: #00150a;
-}
-
-.btn-stop {
-    background: var(--red);
-    color: white;
-}
-
-.btn-reset {
-    background: #252b35;
-    color: var(--text);
-}
-
-.status-grid {
-    display: grid;
-    grid-template-columns: repeat(4, 1fr);
-    gap: 10px;
-    margin-bottom: 12px;
-}
-
-.status-card,
-.card {
-    background: rgba(17,21,28,.86);
-    border: 1px solid var(--border);
-    border-radius: 14px;
-    padding: 15px;
-}
-
-.status-title,
-.card-title {
-    color: var(--muted);
-    text-transform: uppercase;
-    font-size: 10px;
-    font-weight: 800;
-    margin-bottom: 8px;
-}
-
-.status-value {
-    font-size: 15px;
-    font-weight: 900;
-}
-
-.online {
-    color: var(--green);
-}
-
-.offline {
-    color: var(--red);
-}
-
-.signal-box {
-    margin-bottom: 12px;
-    border-radius: 16px;
-    padding: 20px;
-    text-align: center;
-    background: var(--card);
-    border: 1px solid var(--border);
-}
-
-.signal-red {
-    color: var(--red);
-    font-size: 31px;
-    font-weight: 1000;
-}
-
-.signal-black {
-    color: #dce1e7;
-    font-size: 31px;
-    font-weight: 1000;
-}
-
-.signal-none {
-    color: var(--yellow);
-    font-size: 20px;
-    font-weight: 900;
-}
-
-.signal-detail {
-    margin-top: 7px;
-    color: var(--muted);
-    font-size: 13px;
-}
-
-.stats {
-    display: grid;
-    grid-template-columns: repeat(6, 1fr);
-    gap: 10px;
-    margin-bottom: 12px;
-}
-
-.value {
-    font-size: 26px;
-    font-weight: 950;
-}
-
-.green {
-    color: var(--green);
-}
-
-.red {
-    color: var(--red);
-}
-
-.yellow {
-    color: var(--yellow);
-}
-
-.white {
-    color: var(--white);
-}
-
-.profit-positive {
-    color: var(--green);
-}
-
-.profit-negative {
-    color: var(--red);
-}
-
-.trend {
-    display: flex;
-    gap: 6px;
-    overflow-x: auto;
-    padding: 10px;
-    margin-bottom: 12px;
-    background: var(--card);
-    border: 1px solid var(--border);
-    border-radius: 14px;
-}
-
-.pill {
-    min-width: 38px;
-    height: 38px;
-    border-radius: 9px;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    font-weight: 900;
-    flex-shrink: 0;
-}
-
-.pill-r {
-    background: var(--red);
-    color: white;
-}
-
-.pill-b {
-    background: #252a31;
-    color: white;
-    border: 1px solid #454c55;
-}
-
-.pill-w {
-    background: white;
-    color: #111;
-}
-
-.main-grid {
-    display: grid;
-    grid-template-columns: 1.7fr 1fr;
-    gap: 12px;
-}
-
-.console,
-.operations {
-    height: 400px;
-    overflow-y: auto;
-    background: var(--card2);
-    border: 1px solid var(--border);
-    border-radius: 14px;
-    padding: 15px;
-}
-
-.console {
-    font-family: Consolas, monospace;
-}
-
-.section-title {
-    color: var(--muted);
-    font-size: 11px;
-    font-weight: 900;
-    text-transform: uppercase;
-    margin-bottom: 10px;
-}
-
-.log {
-    padding: 7px 0;
-    border-bottom: 1px solid rgba(255,255,255,.035);
-    font-size: 13px;
-    line-height: 1.35;
-}
-
-.log-win {
-    color: var(--green);
-    font-weight: 800;
-}
-
-.log-loss {
-    color: var(--red);
-    font-weight: 800;
-}
-
-.log-signal {
-    color: #d7dde5;
-    font-weight: 800;
-}
-
-.operation {
-    display: grid;
-    grid-template-columns: 1fr auto auto;
-    gap: 8px;
-    align-items: center;
-    padding: 9px 0;
-    border-bottom: 1px solid rgba(255,255,255,.04);
-    font-size: 12px;
-}
-
-.issue {
-    color: var(--muted);
-    overflow: hidden;
-    text-overflow: ellipsis;
-}
-
-.badge {
-    padding: 4px 7px;
-    border-radius: 6px;
-    font-weight: 900;
-}
-
-.badge-win {
-    background: rgba(25,223,120,.1);
-    color: var(--green);
-}
-
-.badge-loss {
-    background: rgba(255,77,87,.1);
-    color: var(--red);
-}
-
-.badge-white {
-    background: rgba(255,255,255,.08);
-    color: white;
-}
-
-.footer {
-    margin-top: 12px;
-    color: var(--muted);
-    font-size: 11px;
-    text-align: center;
-}
-
-@media(max-width: 900px) {
-    .status-grid {
-        grid-template-columns: repeat(2, 1fr);
-    }
-
-    .stats {
-        grid-template-columns: repeat(3, 1fr);
-    }
-
-    .main-grid {
-        grid-template-columns: 1fr;
-    }
-}
-
-@media(max-width: 600px) {
-    body {
-        padding: 10px;
-    }
-
-    .header {
-        align-items: stretch;
-    }
-
-    .controls {
-        width: 100%;
-    }
-
-    .btn {
-        flex: 1;
-    }
-
-    .stats {
-        grid-template-columns: repeat(2, 1fr);
-    }
-
-    .console,
-    .operations {
-        height: 300px;
-    }
-}
-</style>
-</head>
-
-<body>
-
-<div class="container">
-
-<div class="header">
-    <div class="logo">🤖 Blaze <span>Double V3</span></div>
-
-    <div class="controls">
-        {% if running %}
-        <form method="POST" action="/stop">
-            <button class="btn btn-stop">⏹ PARAR V3</button>
-        </form>
-        {% else %}
-        <form method="POST" action="/start">
-            <button class="btn btn-start">▶ INICIAR V3</button>
-        </form>
-        {% endif %}
-
-        <form method="POST" action="/reset">
-            <button class="btn btn-reset">↻ ZERAR</button>
-        </form>
-    </div>
-</div>
-
-<div class="status-grid">
-
-    <div class="status-card">
-        <div class="status-title">Socket Blaze</div>
-        <div class="status-value {{ 'online' if connected else 'offline' }}">
-            {{ '● CONECTADO' if connected else '● DESCONECTADO' }}
-        </div>
-    </div>
-
-    <div class="status-card">
-        <div class="status-title">Coletor</div>
-        <div class="status-value online">
-            {{ total_results }} resultados
-        </div>
-    </div>
-
-    <div class="status-card">
-        <div class="status-title">Última rodada</div>
-        <div class="status-value">
-            {{ last_round or '—' }}
-        </div>
-    </div>
-
-    <div class="status-card">
-        <div class="status-title">Motor V3</div>
-        <div class="status-value">
-            {% if running %}
-                {% if state == 'ACOMPANHANDO' %}
-                    <span class="red">🚨 ACOMPANHANDO</span>
-                {% else %}
-                    <span class="yellow">🎯 CAÇANDO</span>
-                {% endif %}
-            {% else %}
-                <span class="offline">⏹ PARADO</span>
-            {% endif %}
-        </div>
-    </div>
-
-</div>
-
-<div class="signal-box">
-
-{% if running and state == 'ACOMPANHANDO' %}
-
-    {% if signal == 'R' %}
-        <div class="signal-red">🔴 ENTRAR RED</div>
-    {% else %}
-        <div class="signal-black">⚫ ENTRAR BLACK</div>
-    {% endif %}
-
-    <div class="signal-detail">
-        {{ signal_votes }} votos |
-        Regras: {{ signal_rules|join(', ') }} |
-        Aposta simulada: R$ {{ '%.2f'|format(profit if false else 1.00) }}
-    </div>
-
-{% elif running %}
-
-    <div class="signal-none">🎯 CAÇANDO SINAL V3</div>
-
-    <div class="signal-detail">
-        Mínimo de {{ min_confluencia }} votos.
-        Empates não geram sinal.
-    </div>
-
-{% else %}
-
-    <div class="signal-none">⏹ V3 PARADO</div>
-
-    <div class="signal-detail">
-        A coleta continua mesmo com o motor V3 parado.
-    </div>
-
-{% endif %}
-
-</div>
-
-<div class="trend">
-    {% for i in range(numbers|length) %}
-        <div class="pill pill-{{ colors[i].lower() }}">
-            {{ numbers[i] }}
-        </div>
-    {% endfor %}
-</div>
-
-<div class="stats">
-
-    <div class="card">
-        <div class="card-title">Saldo</div>
-        <div class="value {{ 'profit-positive' if profit >= 0 else 'profit-negative' }}">
-            R$ {{ '%.2f'|format(profit) }}
-        </div>
-    </div>
-
-    <div class="card">
-        <div class="card-title">Wins</div>
-        <div class="value green">{{ wins }}</div>
-    </div>
-
-    <div class="card">
-        <div class="card-title">Losses</div>
-        <div class="value red">{{ losses }}</div>
-    </div>
-
-    <div class="card">
-        <div class="card-title">White</div>
-        <div class="value white">{{ white }}</div>
-    </div>
-
-    <div class="card">
-        <div class="card-title">Win rate</div>
-        <div class="value yellow">{{ win_rate }}%</div>
-    </div>
-
-    <div class="card">
-        <div class="card-title">Ticks</div>
-        <div class="value">{{ total_ticks }}</div>
-    </div>
-
-</div>
-
-<div class="main-grid">
-
-    <div class="console">
-        <div class="section-title">Console V3 / Coletor</div>
-
-        {% for line in logs %}
-            <div class="log
-                {% if 'WIN' in line %}log-win
-                {% elif 'LOSS' in line %}log-loss
-                {% elif 'SINAL' in line or '🚨' in line %}log-signal
-                {% endif %}">
-                {{ line }}
-            </div>
-        {% endfor %}
-    </div>
-
-    <div class="operations">
-        <div class="section-title">Histórico da sessão</div>
-
-        {% if not operations %}
-            <div style="color:#7d8794;text-align:center;padding:30px 5px;">
-                Nenhuma operação nesta sessão.
-            </div>
-        {% endif %}
-
-        {% for item in operations|reverse %}
-
-            <div class="operation">
-
-                <div class="issue">
-                    {{ item.issue }}
-                </div>
-
-                {% if item.result == 'WIN' %}
-                    <div class="badge badge-win">WIN</div>
-                    <div class="green">
-                        +R$ {{ '%.2f'|format(item.value) }}
-                    </div>
-
-                {% elif item.result == 'LOSS' %}
-                    <div class="badge badge-loss">LOSS</div>
-                    <div class="red">
-                        -R$ {{ '%.2f'|format(-item.value) }}
-                    </div>
-
-                {% else %}
-                    <div class="badge badge-white">WHITE</div>
-                    <div>R$ 0,00</div>
-                {% endif %}
-
-            </div>
-
-        {% endfor %}
-
-    </div>
-
-</div>
-
-<div class="footer">
-    Coleta contínua • PostgreSQL • Socket.IO • V3
-    {% if db_errors > 0 %}
-        • Erros DB: {{ db_errors }}
-    {% endif %}
-</div>
-
-</div>
-
-<script>
-const consoleBox = document.querySelector(".console");
-if (consoleBox) {
-    consoleBox.scrollTop = consoleBox.scrollHeight;
-}
-</script>
-
-</body>
-</html>
-"""
 
 
 # ================================================================
@@ -3128,19 +1237,14 @@ if (consoleBox) {
 # ================================================================
 
 def bot_loop():
-
     add_log("🤖 Aplicação Blaze V3 iniciada.")
     add_log("📡 Coleta será mantida mesmo com V3 parado.")
-
-    # O Socket.IO possui sua própria thread interna.
-    # Aqui mantemos o processo vivo e monitorado.
 
     while rodando:
         time.sleep(1)
 
 
 def main():
-
     add_log("==========================================")
     add_log("BLAZE DOUBLE — BOT V3")
     add_log("==========================================")
@@ -3153,32 +1257,21 @@ def main():
         add_log("❌ Banco não inicializado.")
         return
 
-    # Recupera histórico antes de começar a operar.
     carregar_historico()
 
-    # Começa parado.
-    # O coletor continua ativo.
     global bot_running
     bot_running = False
 
-    # Socket
     sucesso = iniciar_socket()
-
     if not sucesso:
         add_log(
             "⚠️ Conexão inicial falhou. "
             "O processo continuará tentando reconectar."
         )
 
-    # Monitor
-    thread_status = threading.Thread(
-        target=monitor_status,
-        daemon=True
-    )
-
+    thread_status = threading.Thread(target=monitor_status, daemon=True)
     thread_status.start()
 
-    # Loop
     bot_loop()
 
 
@@ -3187,22 +1280,9 @@ def main():
 # ================================================================
 
 if __name__ == "__main__":
+    port = int(os.environ.get("PORT", "5000"))
 
-    port = int(
-        os.environ.get(
-            "PORT",
-            "5000"
-        )
-    )
-
-    thread_main = threading.Thread(
-        target=main,
-        daemon=True
-    )
-
+    thread_main = threading.Thread(target=main, daemon=True)
     thread_main.start()
 
-    app.run(
-        host="0.0.0.0",
-        port=port
-    )
+    app.run(host="0.0.0.0", port=port)
