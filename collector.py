@@ -1,96 +1,45 @@
-# ================================================================
-# BLAZE COLLECTOR V2.2 — SOCKET.IO -> NEON
-# ================================================================
-# Collector-only:
-# - Conecta no Socket.IO da Blaze
-# - Escuta double.tick
-# - Salva somente resultados completos
-# - Usa DATABASE_URL do Render/Neon
-# - Reconecta automaticamente
-# ================================================================
-
 import os
-import threading
 import time
-from datetime import datetime
+import threading
+import traceback
+from datetime import datetime, timezone
 
 import psycopg2
 import socketio
 
 
-BLAZE_URL = os.getenv(
-    "BLAZE_URL",
-    "https://api-gaming.blaze.bet.br"
-)
+# ============================================================
+# CONFIGURAÇÃO
+# ============================================================
 
-SOCKET_PATH = os.getenv(
-    "SOCKET_PATH",
-    "/replication/"
-)
-
-ROOM = os.getenv(
-    "BLAZE_ROOM",
-    "double_room_1"
-)
+BLAZE_URL = os.getenv("BLAZE_URL", "https://api-gaming.blaze.bet.br")
+SOCKET_PATH = os.getenv("SOCKET_PATH", "/replication/")
+ROOM = os.getenv("BLAZE_ROOM", "double_room_1")
 
 EVENT_NAME = "data"
 TICK_NAME = "double.tick"
 
+DATABASE_URL = os.getenv("DATABASE_URL")
 
-estado = {
-    "rodando": False,
-    "conectado": False,
-    "total_ticks": 0,
-    "total_resultados": 0,
-    "total_duplicados": 0,
-    "total_erros_db": 0,
-    "ultima_rodada": None,
-}
-
-estado_lock = threading.Lock()
-thread_collector = None
+rodando = True
 sio = None
 
 
-# ================================================================
+# ============================================================
 # BANCO
-# ================================================================
+# ============================================================
 
 def get_db_connection():
-    database_url = os.getenv("DATABASE_URL")
+    if not DATABASE_URL:
+        raise RuntimeError("DATABASE_URL não configurada")
 
-    if not database_url:
-        raise RuntimeError("DATABASE_URL não configurada.")
+    url = DATABASE_URL
 
-    if "sslmode=" not in database_url:
-        separator = "&" if "?" in database_url else "?"
-        database_url = f"{database_url}{separator}sslmode=require"
+    if "sslmode=" not in url:
+        separator = "&" if "?" in url else "?"
+        url += f"{separator}sslmode=require"
 
-    return psycopg2.connect(
-        database_url,
-        connect_timeout=10,
-    )
-
-
-def testar_postgresql():
-    conn = get_db_connection()
-
-    try:
-        with conn.cursor() as cur:
-            cur.execute("SELECT 1;")
-            cur.fetchone()
-
-        conn.close()
-        print("✅ Neon PostgreSQL conectado.")
-        return True
-
-    except Exception as e:
-        print(f"❌ Erro PostgreSQL: {e}")
-        try:
-            conn.close()
-        except Exception:
-            pass
-        return False
+    return psycopg2.connect(url)
 
 
 def init_db():
@@ -100,286 +49,217 @@ def init_db():
         with conn.cursor() as cur:
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS blaze_historico (
-                    id SERIAL PRIMARY KEY,
-                    rodada_id VARCHAR(100) UNIQUE NOT NULL,
-                    color INTEGER,
-                    cor VARCHAR(20),
+                    id BIGSERIAL PRIMARY KEY,
+                    rodada_id TEXT UNIQUE NOT NULL,
+                    color TEXT,
+                    cor TEXT,
                     roll INTEGER,
-                    status VARCHAR(30),
-                    room_id VARCHAR(100),
-                    created_at TIMESTAMP,
-                    updated_at TIMESTAMP,
-                    coletado_em TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                );
+                    status TEXT,
+                    room_id TEXT,
+                    created_at TIMESTAMPTZ,
+                    updated_at TIMESTAMPTZ,
+                    coletado_em TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                )
             """)
 
             cur.execute("""
-                CREATE INDEX IF NOT EXISTS idx_blaze_created_at
-                ON blaze_historico(created_at);
+                CREATE INDEX IF NOT EXISTS idx_blaze_historico_rodada
+                ON blaze_historico (rodada_id)
+            """)
+
+            cur.execute("""
+                CREATE INDEX IF NOT EXISTS idx_blaze_historico_coletado
+                ON blaze_historico (coletado_em DESC)
             """)
 
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS collector_status (
                     id INTEGER PRIMARY KEY,
-                    conectado BOOLEAN DEFAULT FALSE,
-                    ultima_rodada VARCHAR(100),
-                    ultimo_resultado_em TIMESTAMP,
-                    total_ticks INTEGER DEFAULT 0,
-                    total_resultados INTEGER DEFAULT 0,
-                    total_duplicados INTEGER DEFAULT 0,
-                    total_erros_db INTEGER DEFAULT 0,
-                    atualizado_em TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                );
-            """)
-
-            cur.execute("""
-                INSERT INTO collector_status (id)
-                VALUES (1)
-                ON CONFLICT (id) DO NOTHING;
+                    status TEXT,
+                    ultima_atualizacao TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    ultima_rodada TEXT,
+                    ultima_cor TEXT,
+                    ultimo_roll INTEGER,
+                    mensagem TEXT
+                )
             """)
 
         conn.commit()
+
+    finally:
         conn.close()
 
-    except Exception:
-        try:
-            conn.rollback()
-            conn.close()
-        except Exception:
-            pass
-        raise
 
-
-def atualizar_status_db(conectado=None, ultima_rodada=None,
-                         resultado_novo=False, duplicado=False,
-                         erro_db=False, tick=False):
+def atualizar_status(
+    status,
+    mensagem=None,
+    rodada=None,
+    cor=None,
+    roll=None
+):
     try:
         conn = get_db_connection()
 
-        with conn.cursor() as cur:
-            sets = [
-                "atualizado_em = CURRENT_TIMESTAMP"
-            ]
-            values = []
+        try:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    INSERT INTO collector_status
+                        (
+                            id,
+                            status,
+                            ultima_atualizacao,
+                            ultima_rodada,
+                            ultima_cor,
+                            ultimo_roll,
+                            mensagem
+                        )
+                    VALUES
+                        (1, %s, NOW(), %s, %s, %s, %s)
+                    ON CONFLICT (id)
+                    DO UPDATE SET
+                        status = EXCLUDED.status,
+                        ultima_atualizacao = NOW(),
+                        ultima_rodada = COALESCE(
+                            EXCLUDED.ultima_rodada,
+                            collector_status.ultima_rodada
+                        ),
+                        ultima_cor = COALESCE(
+                            EXCLUDED.ultima_cor,
+                            collector_status.ultima_cor
+                        ),
+                        ultimo_roll = COALESCE(
+                            EXCLUDED.ultimo_roll,
+                            collector_status.ultimo_roll
+                        ),
+                        mensagem = EXCLUDED.mensagem
+                """, (
+                    status,
+                    rodada,
+                    cor,
+                    roll,
+                    mensagem
+                ))
 
-            if conectado is not None:
-                sets.append("conectado = %s")
-                values.append(conectado)
+            conn.commit()
 
-            if ultima_rodada is not None:
-                sets.append("ultima_rodada = %s")
-                values.append(str(ultima_rodada))
-
-            if resultado_novo:
-                sets.append("total_resultados = total_resultados + 1")
-                sets.append("ultimo_resultado_em = CURRENT_TIMESTAMP")
-
-            if duplicado:
-                sets.append("total_duplicados = total_duplicados + 1")
-
-            if erro_db:
-                sets.append("total_erros_db = total_erros_db + 1")
-
-            if tick:
-                sets.append("total_ticks = total_ticks + 1")
-
-            query = f"""
-                UPDATE collector_status
-                SET {", ".join(sets)}
-                WHERE id = 1;
-            """
-
-            cur.execute(query, values)
-
-        conn.commit()
-        conn.close()
+        finally:
+            conn.close()
 
     except Exception as e:
-        print(f"⚠️ Erro ao atualizar status: {e}")
+        print(f"⚠️ Erro ao atualizar status do coletor: {e}", flush=True)
 
-
-# ================================================================
-# NORMALIZAÇÃO
-# ================================================================
-
-def normalizar_cor(color):
-    try:
-        color = int(color)
-    except Exception:
-        return None
-
-    if color == 0:
-        return "BRANCO"
-    if color == 1:
-        return "VERMELHO"
-    if color == 2:
-        return "PRETO"
-
-    return None
-
-
-def extrair_valor(payload, *chaves):
-    for chave in chaves:
-        if isinstance(payload, dict) and chave in payload:
-            return payload[chave]
-    return None
-
-
-# ================================================================
-# SALVAR RESULTADO
-# ================================================================
 
 def salvar_resultado(payload):
     if not isinstance(payload, dict):
         return False
 
-    rodada_id = extrair_valor(
-        payload,
-        "id",
-        "round_id",
-        "roundId",
-        "rodada_id",
-        "game_id",
-        "gameId",
+    rodada_id = (
+        payload.get("id")
+        or payload.get("round_id")
+        or payload.get("roundId")
+        or payload.get("rodada_id")
+        or payload.get("game_id")
+        or payload.get("gameId")
     )
 
-    color = extrair_valor(
-        payload,
-        "color",
-        "colour",
+    color = (
+        payload.get("color")
+        or payload.get("colour")
     )
 
-    roll = extrair_valor(
-        payload,
-        "roll",
-        "number",
+    roll = (
+        payload.get("roll")
+        if payload.get("roll") is not None
+        else payload.get("number")
     )
 
-    status = extrair_valor(payload, "status")
-    room_id = extrair_valor(
-        payload,
-        "room_id",
-        "roomId",
-    ) or ROOM
+    status = payload.get("status")
 
-    created_at = extrair_valor(
-        payload,
-        "created_at",
-        "createdAt",
+    room_id = (
+        payload.get("room_id")
+        or payload.get("roomId")
+        or ROOM
     )
 
-    updated_at = extrair_valor(
-        payload,
-        "updated_at",
-        "updatedAt",
-    )
-
-    if status is not None and str(status).lower() != "complete":
+    if rodada_id is None:
         return False
 
-    if rodada_id is None or color is None or roll is None:
-        return False
-
-    cor = normalizar_cor(color)
-
-    if cor is None:
+    if color is None or roll is None:
         return False
 
     try:
-        conn = get_db_connection()
+        roll = int(roll)
+    except (TypeError, ValueError):
+        return False
 
+    rodada_id = str(rodada_id)
+    color = str(color).lower()
+
+    created_at = payload.get("created_at") or payload.get("createdAt")
+    updated_at = payload.get("updated_at") or payload.get("updatedAt")
+
+    conn = get_db_connection()
+
+    try:
         with conn.cursor() as cur:
             cur.execute("""
-                INSERT INTO blaze_historico (
-                    rodada_id,
-                    color,
-                    cor,
-                    roll,
-                    status,
-                    room_id,
-                    created_at,
-                    updated_at
-                )
-                VALUES (%s,%s,%s,%s,%s,%s,%s,%s)
+                INSERT INTO blaze_historico
+                    (
+                        rodada_id,
+                        color,
+                        cor,
+                        roll,
+                        status,
+                        room_id,
+                        created_at,
+                        updated_at,
+                        coletado_em
+                    )
+                VALUES
+                    (%s, %s, %s, %s, %s, %s, %s, %s, NOW())
                 ON CONFLICT (rodada_id) DO NOTHING
-                RETURNING id;
+                RETURNING id
             """, (
-                str(rodada_id),
-                int(color),
-                cor,
-                int(roll),
-                str(status or "complete"),
-                str(room_id),
+                rodada_id,
+                color,
+                color,
+                roll,
+                status,
+                room_id,
                 created_at,
-                updated_at,
+                updated_at
             ))
 
-            inserted = cur.fetchone()
+            inserted = cur.fetchone() is not None
 
         conn.commit()
+
+    finally:
         conn.close()
 
-        if inserted:
-            with estado_lock:
-                estado["total_resultados"] += 1
-                estado["ultima_rodada"] = str(rodada_id)
+    if inserted:
+        print(
+            f"💾 NOVO JOGO | rodada={rodada_id} "
+            f"| cor={color} | roll={roll}",
+            flush=True
+        )
 
-            atualizar_status_db(
-                ultima_rodada=rodada_id,
-                resultado_novo=True,
-            )
+        atualizar_status(
+            "COLETANDO",
+            "Novo resultado recebido",
+            rodada_id,
+            color,
+            roll
+        )
 
-            print(
-                f"💾 RESULTADO | rodada={rodada_id} "
-                f"| roll={roll} | cor={cor}"
-            )
-
-            return True
-
-        with estado_lock:
-            estado["total_duplicados"] += 1
-
-        atualizar_status_db(duplicado=True)
-        return False
-
-    except Exception as e:
-        with estado_lock:
-            estado["total_erros_db"] += 1
-
-        print(f"❌ Erro salvando resultado: {e}")
-        atualizar_status_db(erro_db=True)
-        return False
+    return inserted
 
 
-# ================================================================
-# PROCESSAR EVENTO
-# ================================================================
-
-def processar_tick(data):
-    with estado_lock:
-        estado["total_ticks"] += 1
-
-    atualizar_status_db(tick=True)
-
-    if not isinstance(data, dict):
-        return
-
-    if data.get("id") != TICK_NAME:
-        return
-
-    payload = data.get("payload")
-
-    if not isinstance(payload, dict):
-        return
-
-    salvar_resultado(payload)
-
-
-# ================================================================
+# ============================================================
 # SOCKET.IO
-# ================================================================
+# ============================================================
 
-def configurar_socket():
+def criar_socket():
     global sio
 
     sio = socketio.Client(
@@ -393,15 +273,74 @@ def configurar_socket():
 
     @sio.event
     def connect():
-        with estado_lock:
-            estado["conectado"] = True
+        print("🟢 SOCKET.IO CONECTADO AO BLAZE", flush=True)
 
-        print("🟢 SOCKET.IO CONECTADO AO BLAZE")
-        print(f"📡 Room: {ROOM}")
+        atualizar_status(
+            "CONECTADO",
+            "Socket.IO conectado; aguardando inscrição"
+        )
 
-        atualizar_status_db(conectado=True)
+        # IMPORTANTE:
+        # Não fazemos sio.emit() aqui.
+        #
+        # O erro anterior:
+        # BadNamespaceError: '/' is not a connected namespace
+        #
+        # acontecia porque o callback connect() era disparado
+        # durante o processo interno de conexão do namespace.
+        #
+        # A inscrição será feita pela thread principal depois
+        # que connect() retornar e o cliente estiver efetivamente
+        # conectado.
 
-        # Assinatura usada pelo collector original.
+    @sio.event
+    def disconnect():
+        print("🔴 SOCKET.IO DESCONECTADO", flush=True)
+
+        atualizar_status(
+            "DESCONECTADO",
+            "Socket.IO desconectado"
+        )
+
+    @sio.event
+    def connect_error(data):
+        print(
+            f"⚠️ ERRO DE CONEXÃO SOCKET.IO: {data}",
+            flush=True
+        )
+
+        atualizar_status(
+            "ERRO",
+            f"Erro de conexão: {data}"
+        )
+
+    @sio.on(EVENT_NAME)
+    def on_data(data):
+        processar_tick(data)
+
+
+def inscrever_room():
+    """
+    Envia a inscrição somente depois de sio.connect()
+    ter retornado com o namespace conectado.
+    """
+
+    if sio is None:
+        return False
+
+    if not sio.connected:
+        print(
+            "⚠️ Tentativa de inscrição sem Socket.IO conectado",
+            flush=True
+        )
+        return False
+
+    try:
+        print(
+            f"📡 ENVIANDO INSCRIÇÃO | room={ROOM}",
+            flush=True
+        )
+
         sio.emit(
             "cmd",
             {
@@ -409,106 +348,182 @@ def configurar_socket():
             }
         )
 
-        print("📡 Assinatura enviada.")
+        print(
+            f"📡 INSCRIÇÃO ENVIADA | room={ROOM}",
+            flush=True
+        )
 
-    @sio.event
-    def disconnect():
-        with estado_lock:
-            estado["conectado"] = False
+        atualizar_status(
+            "INSCRITO",
+            f"Inscrição enviada para {ROOM}"
+        )
 
-        print("🔴 SOCKET.IO DESCONECTADO")
-        atualizar_status_db(conectado=False)
+        return True
 
-    @sio.event
-    def connect_error(data):
-        with estado_lock:
-            estado["conectado"] = False
+    except Exception as e:
+        print(
+            f"❌ ERRO AO ENVIAR INSCRIÇÃO: {e}",
+            flush=True
+        )
 
-        print(f"⚠️ SOCKET.IO connect_error: {data}")
-        atualizar_status_db(conectado=False)
+        atualizar_status(
+            "ERRO",
+            f"Erro na inscrição: {e}"
+        )
 
-    @sio.on(EVENT_NAME)
-    def on_data(data):
-        processar_tick(data)
+        return False
 
 
-# ================================================================
+def processar_tick(data):
+    if not isinstance(data, dict):
+        return
+
+    if data.get("id") != TICK_NAME:
+        return
+
+    payload = data.get("payload")
+
+    if not isinstance(payload, dict):
+        return
+
+    status = str(payload.get("status", "")).lower()
+
+    if status != "complete":
+        return
+
+    salvar_resultado(payload)
+
+
+# ============================================================
 # EXECUÇÃO
-# ================================================================
+# ============================================================
 
 def executar_coletor():
-    global sio
+    print("=" * 72, flush=True)
+    print("🎰 BLAZE COLLECTOR - RENDER + NEON", flush=True)
+    print("=" * 72, flush=True)
+    print(f"🌐 Blaze: {BLAZE_URL}", flush=True)
+    print(f"🔌 Socket path: {SOCKET_PATH}", flush=True)
+    print(f"🏠 Room: {ROOM}", flush=True)
+    print("=" * 72, flush=True)
 
-    with estado_lock:
-        estado["rodando"] = True
+    while rodando:
 
-    print("=" * 70)
-    print("🚀 BLAZE COLLECTOR V2.2")
-    print("=" * 70)
-    print(f"🌐 URL: {BLAZE_URL}")
-    print(f"🔌 Socket path: {SOCKET_PATH}")
-    print(f"🏠 Room: {ROOM}")
-    print("=" * 70)
-
-    while True:
         try:
-            if not testar_postgresql():
-                time.sleep(10)
-                continue
+            print("🔌 Testando conexão com PostgreSQL...", flush=True)
 
             init_db()
 
-            configurar_socket()
+            atualizar_status(
+                "INICIANDO",
+                "Inicializando coletor"
+            )
 
-            print("🔌 Conectando ao Socket.IO...")
+            print("✅ PostgreSQL conectado", flush=True)
+
+            criar_socket()
+
+            print("🔌 Conectando ao Socket.IO...", flush=True)
+
+            atualizar_status(
+                "CONECTANDO",
+                "Conectando ao Socket.IO da Blaze"
+            )
 
             sio.connect(
                 BLAZE_URL,
                 socketio_path=SOCKET_PATH,
                 transports=["websocket"],
-                wait_timeout=20,
+                wait_timeout=20
             )
 
-            while True:
-                time.sleep(5)
+            # Neste ponto sio.connect() já retornou.
+            # Agora verificamos explicitamente o estado antes
+            # de enviar o comando "cmd".
+            if sio.connected:
+                print(
+                    "✅ SOCKET.IO CONFIRMADO COMO CONECTADO",
+                    flush=True
+                )
 
-                if sio is None or not sio.connected:
-                    print("⚠️ Socket não está conectado. Recomeçando...")
-                    break
+                inscrever_room()
+
+                atualizar_status(
+                    "COLETANDO",
+                    "Coletor ativo"
+                )
+
+                # Mantém a conexão viva.
+                while rodando and sio.connected:
+                    time.sleep(1)
+
+            else:
+                print(
+                    "⚠️ sio.connect() retornou, mas sio.connected=False",
+                    flush=True
+                )
 
         except Exception as e:
-            with estado_lock:
-                estado["conectado"] = False
+            print("=" * 72, flush=True)
+            print("❌ ERRO NO COLETOR", flush=True)
+            print(f"{type(e).__name__}: {e}", flush=True)
+            traceback.print_exc()
+            print("=" * 72, flush=True)
 
-            print(f"❌ Erro no collector: {e}")
-            atualizar_status_db(conectado=False)
+            try:
+                atualizar_status(
+                    "ERRO",
+                    f"{type(e).__name__}: {e}"
+                )
+            except Exception:
+                pass
 
+        finally:
             try:
                 if sio is not None and sio.connected:
                     sio.disconnect()
             except Exception:
                 pass
 
+        if rodando:
+            print(
+                "🔄 Reconectando em 5 segundos...",
+                flush=True
+            )
+
             time.sleep(5)
 
 
+# ============================================================
+# THREAD DO COLETOR
+# ============================================================
+
 def iniciar_coletor_em_thread():
-    global thread_collector
-
-    if thread_collector and thread_collector.is_alive():
-        return thread_collector
-
-    thread_collector = threading.Thread(
+    thread = threading.Thread(
         target=executar_coletor,
         name="blaze-collector",
-        daemon=True,
+        daemon=True
     )
 
-    thread_collector.start()
+    thread.start()
 
-    return thread_collector
+    return thread
 
+
+# ============================================================
+# SNAPSHOT
+# ============================================================
 
 def snapshot_estado():
-    with estado_lock:
-        return dict(estado)
+    return {
+        "rodando": rodando,
+        "socket_connected": bool(
+            sio is not None and sio.connected
+        ),
+        "room": ROOM,
+        "socket_path": SOCKET_PATH,
+    }
+
+
+if __name__ == "__main__":
+    executar_coletor()
