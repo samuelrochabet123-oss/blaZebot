@@ -1,37 +1,62 @@
-# =============================================================================
-# BLAZE COLLECTOR V2.2 — DIAGNÓSTICO SOCKET.IO
-# Render + Neon PostgreSQL
+# ================================================================
+# BLAZE DOUBLE — COLLECTOR V2.1 RENDER TEST
+# ================================================================
+# Objetivo:
+#   Testar no Render o MESMO protocolo Socket.IO do Collector V2.1
+#   que funcionava no Colab.
 #
-# OBJETIVO DESTA VERSÃO:
-# - NÃO altera a lógica do banco além da compatibilidade necessária.
-# - NÃO faz apostas nem possui estratégia.
-# - NÃO usa REST /roulette_games/recent/1.
-# - Conecta ao Socket.IO da Blaze.
-# - Envia a inscrição da room.
-# - MOSTRA EVENTOS RECEBIDOS para descobrir por que nenhum double.tick
-#   está chegando ao Render.
-# =============================================================================
+# IMPORTANTE:
+#   - Não usa a API REST /roulette_games/recent/1
+#   - Usa Socket.IO /replication/
+#   - Mantém o subscribe original:
+#
+#       {
+#           "id": "subscribe",
+#           "payload": {
+#               "room": "double_room_1"
+#           }
+#       }
+#
+#   - DATABASE_URL vem exclusivamente do ambiente do Render.
+#   - Não colocar senha diretamente neste arquivo.
+# ================================================================
 
 import os
+import sys
 import time
-import json
+import signal
 import threading
-from datetime import datetime, timezone
+from datetime import datetime
 
-import psycopg2
 import socketio
+import psycopg2
 
 
-# =============================================================================
+# ================================================================
 # CONFIGURAÇÃO
-# =============================================================================
+# ================================================================
 
 BLAZE_URL = "https://api-gaming.blaze.bet.br"
 SOCKET_PATH = "/replication/"
 ROOM = "double_room_1"
+EVENT_NAME = "data"
 TICK_NAME = "double.tick"
 
-DATABASE_URL = os.getenv("DATABASE_URL")
+MOSTRAR_TICKS = True
+INTERVALO_STATUS = 30
+MAX_RECONEXOES = 999999
+
+
+rodando = True
+conectado = False
+sio = None
+
+ultima_rodada = None
+total_ticks = 0
+total_resultados = 0
+total_duplicados = 0
+total_erros_db = 0
+
 
 CORES = {
     0: "BRANCO",
@@ -39,258 +64,184 @@ CORES = {
     2: "PRETO",
 }
 
-rodando = True
-ultimo_evento = None
-contador_eventos = 0
-ultimo_tick = None
+
+def nome_cor(cor):
+    try:
+        return CORES.get(int(cor), f"DESCONHECIDA({cor})")
+    except Exception:
+        return "DESCONHECIDA"
 
 
-# =============================================================================
-# BANCO
-# =============================================================================
+# ================================================================
+# POSTGRESQL / NEON
+# ================================================================
 
 def get_db_connection():
-    if not DATABASE_URL:
-        raise RuntimeError("DATABASE_URL não configurada no Render.")
+    database_url = os.environ.get("DATABASE_URL")
 
-    url = DATABASE_URL
+    if not database_url:
+        print("❌ DATABASE_URL não configurada no Render.")
+        return None
 
-    if "sslmode=" not in url:
-        url += "&sslmode=require" if "?" in url else "?sslmode=require"
-
-    return psycopg2.connect(url)
+    try:
+        return psycopg2.connect(
+            database_url,
+            connect_timeout=15,
+        )
+    except Exception as e:
+        print(f"❌ Erro PostgreSQL: {e}")
+        return None
 
 
 def init_db():
-    conn = None
-    cur = None
+    conn = get_db_connection()
+    if not conn:
+        return False
 
     try:
-        conn = get_db_connection()
-        cur = conn.cursor()
-
-        cur.execute("""
-            CREATE TABLE IF NOT EXISTS blaze_historico (
-                id BIGSERIAL PRIMARY KEY,
-                rodada_id TEXT UNIQUE,
-                color INTEGER,
-                cor TEXT,
-                roll INTEGER,
-                status TEXT,
-                room_id INTEGER,
-                created_at TIMESTAMP,
-                updated_at TIMESTAMP,
-                coletado_em TIMESTAMP
-            )
-        """)
-
-        # Compatibilidade com tabelas antigas já existentes no Neon.
-        colunas = {
-            "rodada_id": "TEXT",
-            "color": "INTEGER",
-            "cor": "TEXT",
-            "roll": "INTEGER",
-            "status": "TEXT",
-            "room_id": "INTEGER",
-            "created_at": "TIMESTAMP",
-            "updated_at": "TIMESTAMP",
-            "coletado_em": "TIMESTAMP",
-        }
-
-        for coluna, tipo in colunas.items():
-            cur.execute(
-                f"ALTER TABLE blaze_historico "
-                f"ADD COLUMN IF NOT EXISTS {coluna} {tipo}"
-            )
-
-        cur.execute("""
-            CREATE UNIQUE INDEX IF NOT EXISTS idx_blaze_historico_rodada
-            ON blaze_historico (rodada_id)
-        """)
-
-        cur.execute("""
-            CREATE INDEX IF NOT EXISTS idx_blaze_historico_coletado
-            ON blaze_historico (coletado_em DESC)
-        """)
-
-        cur.execute("""
-            CREATE TABLE IF NOT EXISTS collector_status (
-                id INTEGER PRIMARY KEY,
-                status TEXT,
-                mensagem TEXT,
-                ultimo_tick TIMESTAMP,
-                atualizado_em TIMESTAMP
-            )
-        """)
-
-        status_cols = {
-            "status": "TEXT",
-            "mensagem": "TEXT",
-            "ultimo_tick": "TIMESTAMP",
-            "atualizado_em": "TIMESTAMP",
-        }
-
-        for coluna, tipo in status_cols.items():
-            cur.execute(
-                f"ALTER TABLE collector_status "
-                f"ADD COLUMN IF NOT EXISTS {coluna} {tipo}"
-            )
-
-        conn.commit()
-
-        print("✅ Banco PostgreSQL verificado/migrado", flush=True)
-        print("✅ PostgreSQL/Neon OK", flush=True)
-
-    except Exception as e:
-        print(f"❌ Erro ao inicializar banco: {e}", flush=True)
-        raise
-
-    finally:
-        if cur:
-            cur.close()
-        if conn:
-            conn.close()
-
-
-def atualizar_status(status, mensagem="", ultimo_tick=None):
-    conn = None
-    cur = None
-
-    try:
-        conn = get_db_connection()
-        cur = conn.cursor()
-
-        agora = datetime.now(timezone.utc).replace(tzinfo=None)
-
-        cur.execute("""
-            UPDATE collector_status
-               SET status = %s,
-                   mensagem = %s,
-                   ultimo_tick = %s,
-                   atualizado_em = %s
-             WHERE id = 1
-        """, (
-            status,
-            mensagem,
-            ultimo_tick,
-            agora,
-        ))
-
-        if cur.rowcount == 0:
+        with conn.cursor() as cur:
             cur.execute("""
-                INSERT INTO collector_status
-                    (id, status, mensagem, ultimo_tick, atualizado_em)
-                VALUES
-                    (1, %s, %s, %s, %s)
-            """, (
-                status,
-                mensagem,
-                ultimo_tick,
-                agora,
-            ))
+                CREATE TABLE IF NOT EXISTS blaze_historico (
+                    id SERIAL PRIMARY KEY,
+                    rodada_id VARCHAR(100) UNIQUE NOT NULL,
+                    color INTEGER,
+                    cor VARCHAR(20),
+                    roll INTEGER,
+                    status VARCHAR(30),
+                    room_id INTEGER,
+                    created_at TIMESTAMP,
+                    updated_at TIMESTAMP,
+                    coletado_em TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                );
+            """)
+
+            # Compatibilidade com tabela já existente no Neon.
+            cur.execute("""
+                ALTER TABLE blaze_historico
+                ADD COLUMN IF NOT EXISTS color INTEGER;
+            """)
+            cur.execute("""
+                ALTER TABLE blaze_historico
+                ADD COLUMN IF NOT EXISTS cor VARCHAR(20);
+            """)
+            cur.execute("""
+                ALTER TABLE blaze_historico
+                ADD COLUMN IF NOT EXISTS roll INTEGER;
+            """)
+            cur.execute("""
+                ALTER TABLE blaze_historico
+                ADD COLUMN IF NOT EXISTS status VARCHAR(30);
+            """)
+            cur.execute("""
+                ALTER TABLE blaze_historico
+                ADD COLUMN IF NOT EXISTS room_id INTEGER;
+            """)
+            cur.execute("""
+                ALTER TABLE blaze_historico
+                ADD COLUMN IF NOT EXISTS created_at TIMESTAMP;
+            """)
+            cur.execute("""
+                ALTER TABLE blaze_historico
+                ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP;
+            """)
+            cur.execute("""
+                ALTER TABLE blaze_historico
+                ADD COLUMN IF NOT EXISTS coletado_em TIMESTAMP DEFAULT CURRENT_TIMESTAMP;
+            """)
+
+            cur.execute("""
+                CREATE INDEX IF NOT EXISTS idx_blaze_created_at
+                ON blaze_historico(created_at);
+            """)
+
+            cur.execute("""
+                CREATE INDEX IF NOT EXISTS idx_blaze_cor
+                ON blaze_historico(cor);
+            """)
+
+            cur.execute("""
+                CREATE INDEX IF NOT EXISTS idx_blaze_roll
+                ON blaze_historico(roll);
+            """)
 
         conn.commit()
+        conn.close()
+
+        print("✅ PostgreSQL/Neon OK")
+        return True
 
     except Exception as e:
-        print(f"⚠️ Erro ao atualizar status do coletor: {e}", flush=True)
-
-    finally:
-        if cur:
-            cur.close()
-        if conn:
+        print(f"❌ Erro inicializando banco: {e}")
+        try:
+            conn.rollback()
             conn.close()
-
-
-# =============================================================================
-# SALVAMENTO
-# =============================================================================
-
-def converter_datetime(valor):
-    if not valor:
-        return None
-
-    if isinstance(valor, datetime):
-        if valor.tzinfo:
-            return valor.astimezone(timezone.utc).replace(tzinfo=None)
-        return valor
-
-    try:
-        texto = str(valor).replace("Z", "+00:00")
-        dt = datetime.fromisoformat(texto)
-
-        if dt.tzinfo:
-            dt = dt.astimezone(timezone.utc).replace(tzinfo=None)
-
-        return dt
-
-    except Exception:
-        return None
+        except Exception:
+            pass
+        return False
 
 
 def salvar_resultado(payload):
-    if not isinstance(payload, dict):
-        return False
+    global total_resultados
+    global total_duplicados
+    global total_erros_db
+    global ultima_rodada
 
-    status = str(payload.get("status", "")).lower()
-
-    if status != "complete":
-        return False
-
-    rodada_id = (
-        payload.get("id")
-        or payload.get("round_id")
-        or payload.get("rodada_id")
-    )
-
+    rodada_id = payload.get("id")
     color = payload.get("color")
     roll = payload.get("roll")
+    status = payload.get("status")
+    room_id = payload.get("room_id")
 
-    if rodada_id is None or color is None or roll is None:
+    created_at = payload.get("created_at")
+    updated_at = payload.get("updated_at")
+
+    if not rodada_id or color is None or roll is None:
+        return False
+
+    if status != "complete":
         return False
 
     try:
         color = int(color)
         roll = int(roll)
     except Exception:
+        print(f"⚠️ Dados inválidos: id={rodada_id}")
         return False
-
-    cor = CORES.get(color, f"DESCONHECIDA({color})")
-
-    room_id = payload.get("room_id")
 
     try:
         room_id = int(room_id) if room_id is not None else None
     except Exception:
         room_id = None
 
-    created_at = converter_datetime(
-        payload.get("created_at")
-        or payload.get("createdAt")
-    )
-
-    updated_at = converter_datetime(
-        payload.get("updated_at")
-        or payload.get("updatedAt")
-    )
-
-    agora = datetime.now(timezone.utc).replace(tzinfo=None)
-
-    if created_at is None:
-        created_at = agora
-
-    if updated_at is None:
-        updated_at = agora
-
-    conn = None
-    cur = None
+    created_datetime = None
+    updated_datetime = None
 
     try:
-        conn = get_db_connection()
-        cur = conn.cursor()
+        if created_at:
+            created_datetime = datetime.fromisoformat(
+                str(created_at).replace("Z", "+00:00")
+            ).replace(tzinfo=None)
+    except Exception:
+        pass
 
-        cur.execute("""
-            INSERT INTO blaze_historico
-                (
+    try:
+        if updated_at:
+            updated_datetime = datetime.fromisoformat(
+                str(updated_at).replace("Z", "+00:00")
+            ).replace(tzinfo=None)
+    except Exception:
+        pass
+
+    conn = get_db_connection()
+
+    if not conn:
+        total_erros_db += 1
+        return False
+
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO blaze_historico (
                     rodada_id,
                     color,
                     cor,
@@ -298,244 +249,252 @@ def salvar_resultado(payload):
                     status,
                     room_id,
                     created_at,
-                    updated_at,
-                    coletado_em
+                    updated_at
                 )
-            VALUES
-                (%s, %s, %s, %s, %s, %s, %s, %s, %s)
-            ON CONFLICT (rodada_id) DO NOTHING
-        """, (
-            str(rodada_id),
-            color,
-            cor,
-            roll,
-            status,
-            room_id,
-            created_at,
-            updated_at,
-            agora,
-        ))
+                VALUES (%s,%s,%s,%s,%s,%s,%s,%s)
+                ON CONFLICT (rodada_id) DO NOTHING
+                RETURNING id;
+            """, (
+                str(rodada_id),
+                color,
+                nome_cor(color),
+                roll,
+                status,
+                room_id,
+                created_datetime,
+                updated_datetime,
+            ))
 
-        inserido = cur.rowcount > 0
+            inserted = cur.fetchone()
+
         conn.commit()
+        conn.close()
 
-        if inserido:
+        if inserted:
+            total_resultados += 1
+            ultima_rodada = str(rodada_id)
+
+            print("")
+            print("=" * 70)
+            print("✅ RESULTADO SALVO NO NEON")
+            print(f"Rodada : {rodada_id}")
+            print(f"Cor    : {nome_cor(color)}")
+            print(f"Color  : {color}")
+            print(f"Roll   : {roll}")
+            print(f"Status : {status}")
+            print(f"Room   : {room_id}")
+            print("=" * 70)
+            print("")
+
+            return True
+
+        total_duplicados += 1
+
+        if MOSTRAR_TICKS:
             print(
-                f"✅ RESULTADO SALVO | rodada={rodada_id} "
-                f"| roll={roll} | cor={cor}",
-                flush=True
-            )
-        else:
-            print(
-                f"ℹ️ RESULTADO JÁ EXISTIA | rodada={rodada_id}",
-                flush=True
+                f"↩️ DUPLICADO | {rodada_id} | "
+                f"{nome_cor(color)} | roll={roll}"
             )
 
-        atualizar_status(
-            "ONLINE",
-            f"Último resultado: {rodada_id} | {cor} | roll={roll}",
-            agora,
-        )
-
-        return inserido
-
-    except Exception as e:
-        print(f"❌ Erro ao salvar resultado: {e}", flush=True)
         return False
 
-    finally:
-        if cur:
-            cur.close()
-        if conn:
+    except Exception as e:
+        total_erros_db += 1
+
+        print(f"❌ Erro salvando no Neon: {e}")
+
+        try:
+            conn.rollback()
             conn.close()
+        except Exception:
+            pass
+
+        return False
 
 
-# =============================================================================
-# SOCKET.IO
-# =============================================================================
+# ================================================================
+# SOCKET.IO — MESMO PROTOCOLO DO V2.1
+# ================================================================
 
-sio = socketio.Client(
-    reconnection=False,
-    logger=False,
-    engineio_logger=False,
-)
+def on_connect():
+    global conectado
 
+    conectado = True
 
-def resumo_evento(data, limite=2000):
+    print("")
+    print("=" * 70)
+    print("🟢 SOCKET.IO CONECTADO AO BLAZE")
+    print("=" * 70)
+    print(f"Servidor : {BLAZE_URL}")
+    print(f"Path     : {SOCKET_PATH}")
+    print(f"Namespace: /")
+    print(f"Room     : {ROOM}")
+    print("=" * 70)
+
+    # IMPORTANTE:
+    # Este é EXATAMENTE o subscribe do V2.1 que funcionava no Colab.
     try:
-        texto = json.dumps(
-            data,
-            ensure_ascii=False,
-            default=str,
-        )
-    except Exception:
-        texto = repr(data)
+        payload = {
+            "id": "subscribe",
+            "payload": {
+                "room": ROOM
+            }
+        }
 
-    if len(texto) > limite:
-        texto = texto[:limite] + "... [TRUNCADO]"
+        print("📡 ENVIANDO SUBSCRIBE ORIGINAL V2.1")
+        print(f"   evento  = cmd")
+        print(f"   payload = {payload}")
 
-    return texto
+        sio.emit("cmd", payload)
 
+        print("✅ SUBSCRIBE ENVIADO")
 
-def registrar_evento(nome_evento, data):
-    global ultimo_evento, contador_eventos
-
-    contador_eventos += 1
-    ultimo_evento = nome_evento
-
-    print("", flush=True)
-    print("=" * 78, flush=True)
-    print(f"📥 EVENTO RECEBIDO #{contador_eventos}", flush=True)
-    print(f"   Evento : {nome_evento}", flush=True)
-    print(f"   Tipo   : {type(data).__name__}", flush=True)
-    print(f"   Dados  : {resumo_evento(data)}", flush=True)
-    print("=" * 78, flush=True)
-
-    atualizar_status(
-        "ONLINE",
-        f"Evento recebido: {nome_evento} | #{contador_eventos}",
-        None,
-    )
+    except Exception as e:
+        print(f"❌ Erro enviando subscribe: {e}")
 
 
-@sio.event
-def connect():
-    print("🟢 SOCKET.IO CONECTADO AO BLAZE", flush=True)
-    print("🟢 Namespace '/' conectado", flush=True)
+def on_disconnect():
+    global conectado
 
-    atualizar_status(
-        "CONECTADO",
-        f"Socket conectado. Room alvo: {ROOM}",
-        None,
-    )
+    conectado = False
 
-
-@sio.event
-def disconnect():
-    print("🔴 SOCKET.IO DESCONECTADO", flush=True)
-
-    atualizar_status(
-        "DESCONECTADO",
-        "Socket.IO desconectado",
-        None,
-    )
+    print("")
+    print("=" * 70)
+    print("🔴 SOCKET.IO DESCONECTADO")
+    print("=" * 70)
 
 
-@sio.event
-def connect_error(data):
-    print(f"❌ SOCKET.IO CONNECT_ERROR: {resumo_evento(data)}", flush=True)
+def on_connect_error(data):
+    global conectado
 
-    atualizar_status(
-        "ERRO",
-        f"connect_error: {resumo_evento(data, 500)}",
-        None,
-    )
+    conectado = False
+
+    print("")
+    print("=" * 70)
+    print("❌ ERRO DE CONEXÃO SOCKET.IO")
+    print("=" * 70)
+    print(data)
+    print("=" * 70)
 
 
-# -----------------------------------------------------------------------------
-# EVENTO "data" — captura tudo, depois tenta reconhecer double.tick
-# -----------------------------------------------------------------------------
-
-@sio.on("data")
 def on_data(data):
-    global ultimo_tick
+    global total_ticks
 
-    registrar_evento("data", data)
+    total_ticks += 1
+
+    print("")
+    print("📥 EVENTO DATA RECEBIDO")
+    print(f"   tipo = {type(data).__name__}")
+
+    if MOSTRAR_TICKS:
+        print(f"   data = {data}")
 
     if not isinstance(data, dict):
         return
 
     event_id = data.get("id")
+    payload = data.get("payload")
 
-    if event_id == TICK_NAME:
-        ultimo_tick = datetime.now(timezone.utc).replace(tzinfo=None)
-
-        print("🎯 DOUBLE.TICK ENCONTRADO!", flush=True)
-
-        payload = (
-            data.get("data")
-            or data.get("payload")
-            or data.get("result")
-        )
-
-        print(
-            f"   Payload: {resumo_evento(payload)}",
-            flush=True
-        )
-
-        if isinstance(payload, dict):
-            salvar_resultado(payload)
-
-
-# -----------------------------------------------------------------------------
-# CATCH-ALL
-#
-# python-socketio permite registrar '*' para observar eventos recebidos.
-# Isso é importante para descobrir se a Blaze está enviando outro nome de
-# evento em vez de "data".
-# -----------------------------------------------------------------------------
-
-@sio.on("*")
-def catch_all(event, data):
-    if event == "data":
+    if event_id != TICK_NAME:
+        print(f"ℹ️ DATA recebido, mas id={event_id!r}")
         return
 
-    registrar_evento(
-        f"CATCH-ALL: {event}",
-        data,
+    if not isinstance(payload, dict):
+        print("⚠️ double.tick sem payload dict")
+        return
+
+    rodada_id = payload.get("id")
+    status = payload.get("status")
+    color = payload.get("color")
+    roll = payload.get("roll")
+
+    print(
+        f"🎲 TICK | ID={rodada_id} | "
+        f"STATUS={status} | "
+        f"COR={nome_cor(color) if color is not None else '-'} | "
+        f"ROLL={roll}"
     )
 
+    if status == "complete" and color is not None and roll is not None:
+        salvar_resultado(payload)
 
-# =============================================================================
-# INSCRIÇÃO
-# =============================================================================
 
-def inscrever_room():
-    if not sio.connected:
-        print("⚠️ Não é possível inscrever: Socket.IO não conectado", flush=True)
-        return False
+# ================================================================
+# MONITOR
+# ================================================================
 
-    try:
-        print("", flush=True)
-        print("📡 ENVIANDO INSCRIÇÃO", flush=True)
-        print(f"   room = {ROOM}", flush=True)
+def monitor_status():
+    while rodando:
+        time.sleep(INTERVALO_STATUS)
+
+        if not rodando:
+            break
+
+        print("")
         print(
-            '   payload = {"room": "double_room_1"}',
-            flush=True
+            f"📊 STATUS | "
+            f"Socket={'CONECTADO' if conectado else 'DESCONECTADO'} | "
+            f"Ticks={total_ticks} | "
+            f"Resultados={total_resultados} | "
+            f"Duplicados={total_duplicados} | "
+            f"ErrosDB={total_erros_db}"
         )
 
-        sio.emit("cmd", {"room": ROOM})
 
-        print("📡 INSCRIÇÃO ENVIADA", flush=True)
+# ================================================================
+# ENCERRAMENTO
+# ================================================================
 
-        atualizar_status(
-            "CONECTADO",
-            f"Inscrição enviada para {ROOM}; aguardando eventos...",
-            None,
-        )
+def encerrar(sig=None, frame=None):
+    global rodando
 
-        return True
+    if not rodando:
+        return
 
-    except Exception as e:
-        print(f"❌ Erro ao enviar inscrição: {e}", flush=True)
+    print("")
+    print("🛑 Encerrando collector...")
 
-        atualizar_status(
-            "ERRO",
-            f"Erro na inscrição: {e}",
-            None,
-        )
+    rodando = False
 
-        return False
-
-
-# =============================================================================
-# CONEXÃO
-# =============================================================================
-
-def conectar():
     try:
-        print("🔌 Conectando ao Socket.IO da Blaze...", flush=True)
+        if sio:
+            sio.disconnect()
+    except Exception:
+        pass
 
+
+# ================================================================
+# INICIAR SOCKET
+# ================================================================
+
+def iniciar_socket():
+    global sio
+
+    sio = socketio.Client(
+        reconnection=True,
+        reconnection_attempts=MAX_RECONEXOES,
+        reconnection_delay=2,
+        reconnection_delay_max=10,
+        logger=False,
+        engineio_logger=False,
+    )
+
+    sio.on("connect", on_connect)
+    sio.on("disconnect", on_disconnect)
+    sio.on("connect_error", on_connect_error)
+    sio.on(EVENT_NAME, on_data)
+
+    print("")
+    print("=" * 70)
+    print("CONECTANDO AO BLAZE DOUBLE")
+    print("=" * 70)
+    print(f"URL    : {BLAZE_URL}")
+    print(f"SOCKET : {SOCKET_PATH}")
+    print(f"ROOM   : {ROOM}")
+    print("Transporte: websocket")
+    print("=" * 70)
+
+    try:
         sio.connect(
             BLAZE_URL,
             socketio_path=SOCKET_PATH,
@@ -543,107 +502,78 @@ def conectar():
             wait_timeout=20,
         )
 
-        if sio.connected:
-            print("✅ SOCKET.IO CONFIRMADO COMO CONECTADO", flush=True)
-
-            # IMPORTANTE:
-            # A inscrição acontece somente depois que sio.connect() retorna.
-            inscrever_room()
-
-            return True
-
-        print("❌ sio.connected=False após connect()", flush=True)
-        return False
+        return True
 
     except Exception as e:
-        print(f"❌ Falha ao conectar Socket.IO: {e}", flush=True)
-
-        atualizar_status(
-            "ERRO",
-            f"Falha Socket.IO: {e}",
-            None,
-        )
-
+        print("")
+        print("=" * 70)
+        print("❌ FALHA AO CONECTAR AO SOCKET.IO")
+        print("=" * 70)
+        print(e)
+        print("=" * 70)
         return False
 
 
-# =============================================================================
-# LOOP PRINCIPAL
-# =============================================================================
+# ================================================================
+# MAIN
+# ================================================================
 
-def executar():
+def main():
     global rodando
 
-    print("", flush=True)
-    print("=" * 78, flush=True)
-    print("🎰 BLAZE COLLECTOR — DIAGNÓSTICO SOCKET.IO", flush=True)
-    print("=" * 78, flush=True)
-    print(f"🌐 Blaze       : {BLAZE_URL}", flush=True)
-    print(f"🔌 Socket Path : {SOCKET_PATH}", flush=True)
-    print(f"🏠 Room        : {ROOM}", flush=True)
-    print(f"🎯 Tick alvo   : {TICK_NAME}", flush=True)
-    print("=" * 78, flush=True)
+    print("")
+    print("=" * 70)
+    print("BLAZE DOUBLE — RENDER TEST V2.1")
+    print("=" * 70)
+    print("Teste do protocolo Socket.IO original do Colab")
+    print("=" * 70)
 
-    print("🔌 Verificando PostgreSQL/Neon...", flush=True)
-    init_db()
+    if not os.environ.get("DATABASE_URL"):
+        print("❌ DATABASE_URL não encontrada.")
+        sys.exit(1)
 
-    while rodando:
-        try:
-            if not sio.connected:
-                print("🔄 Iniciando nova conexão...", flush=True)
+    print("✅ DATABASE_URL encontrada no ambiente.")
 
-                conectado = conectar()
+    if not init_db():
+        print("❌ Banco não inicializado.")
+        sys.exit(1)
 
-                if not conectado:
-                    print(
-                        "🔄 Reconectando em 5 segundos...",
-                        flush=True
-                    )
-                    time.sleep(5)
-                    continue
+    signal.signal(signal.SIGTERM, encerrar)
+    signal.signal(signal.SIGINT, encerrar)
 
-            # Mantém o cliente vivo e processando eventos.
-            while rodando and sio.connected:
-                time.sleep(1)
-
-            if rodando:
-                print(
-                    "🔴 Conexão encerrada pelo servidor.",
-                    flush=True
-                )
-                print(
-                    "🔄 Reconectando em 5 segundos...",
-                    flush=True
-                )
-                time.sleep(5)
-
-        except Exception as e:
-            print(f"❌ Erro no loop principal: {e}", flush=True)
-
-            try:
-                if sio.connected:
-                    sio.disconnect()
-            except Exception:
-                pass
-
-            time.sleep(5)
-
-
-# =============================================================================
-# START
-# =============================================================================
-
-def iniciar_coletor_em_thread():
     thread = threading.Thread(
-        target=executar,
+        target=monitor_status,
         daemon=True,
-        name="blaze-collector",
     )
-
     thread.start()
 
-    return thread
+    while rodando:
+        print("")
+        print("🔄 Iniciando conexão...")
+
+        sucesso = iniciar_socket()
+
+        if not sucesso:
+            print("🔄 Nova tentativa em 5 segundos...")
+            time.sleep(5)
+            continue
+
+        print("")
+        print("🟢 COLLECTOR TESTE OPERANDO")
+        print("Aguardando eventos data / double.tick...")
+        print("")
+
+        # Mantém a conexão viva.
+        while rodando and sio and sio.connected:
+            time.sleep(1)
+
+        if rodando:
+            print("⚠️ Socket desconectado.")
+            print("🔄 Reconectando em 5 segundos...")
+            time.sleep(5)
+
+    print("Collector encerrado.")
 
 
 if __name__ == "__main__":
-    executar()
+    main()
