@@ -557,8 +557,12 @@ def main():
         print("❌ Banco não inicializado.")
         sys.exit(1)
 
-    signal.signal(signal.SIGTERM, encerrar)
-    signal.signal(signal.SIGINT, encerrar)
+    # Signals só podem ser registrados na thread principal.
+    if threading.current_thread() is threading.main_thread():
+        signal.signal(signal.SIGTERM, encerrar)
+        signal.signal(signal.SIGINT, encerrar)
+    else:
+        print("ℹ️ Collector em background: registro de signals ignorado.", flush=True)
 
     thread = threading.Thread(
         target=monitor_status,
