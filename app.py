@@ -2,7 +2,7 @@ import os
 import requests
 import psycopg2
 from flask import Flask, redirect, render_template_string
-from collections import deque
+from datetime import datetime
 
 app = Flask(__name__)
 
@@ -17,7 +17,6 @@ def get_db_connection():
     database_url = os.getenv("DATABASE_URL")
     if not database_url: return None
     try:
-        # Garante o SSL do Neon
         if "sslmode" not in database_url:
             database_url += "?sslmode=require"
         return psycopg2.connect(database_url, connect_timeout=10)
@@ -38,7 +37,6 @@ def init_db():
                     status VARCHAR(30), created_at TIMESTAMP
                 );
             """)
-            # Tabela que guarda o placar e o sinal atual do bot
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS bot_estado (
                     id SERIAL PRIMARY KEY,
@@ -51,7 +49,6 @@ def init_db():
                     ultima_rodada_processada VARCHAR(100)
                 );
             """)
-            # Insere uma linha inicial se a tabela estiver vazia
             cur.execute("SELECT COUNT(*) FROM bot_estado;")
             if cur.fetchone()[0] == 0:
                 cur.execute("INSERT INTO bot_estado (wins, losses, whites, profit) VALUES (0,0,0,0);")
@@ -101,7 +98,7 @@ def get_active_signal(rolls, colors):
     return None
 
 # ================================================================
-# LÓGICA PRINCIPAL (Executada a cada 10s quando o site carrega)
+# LÓGICA PRINCIPAL
 # ================================================================
 def processar_blaze():
     init_db()
@@ -117,83 +114,70 @@ def processar_blaze():
         jogos_blaze = resp.json()
         jogos_blaze.reverse() # Do mais antigo para o mais novo
         
+        # Guarda os últimos 10 jogos para mostrar na tela (SEMPRE)
+        rolls_tela = []
+        colors_tela = []
+        for jogo in jogos_blaze[-10:]:
+            rolls_tela.append(int(jogo.get("roll")))
+            colors_tela.append(COR_SIGLA.get(CORES.get(int(jogo.get("color")))))
+            
         with conn.cursor() as cur:
-            # Pega o estado atual do bot
             cur.execute("SELECT wins, losses, whites, profit, sinal_ativo, cor_sinal, ultima_rodada_processada FROM bot_estado WHERE id=1;")
             estado = cur.fetchone()
             wins, losses, whites, profit, sinal_ativo, cor_sinal, ultima_processada = estado
             
             rolls_mem = []
             colors_mem = []
-            novos_jogos = False
             
-            # 2. Salva novos jogos no Neon e atualiza memória
             for jogo in jogos_blaze:
-                rodada_id = str(jogo.get("id"))
-                roll = int(jogo.get("roll"))
-                color_int = int(jogo.get("color"))
-                cor_nome = CORES.get(color_int)
-                sigla = COR_SIGLA.get(cor_nome)
+                rolls_mem.append(int(jogo.get("roll")))
+                colors_mem.append(COR_SIGLA.get(CORES.get(int(jogo.get("color")))))
+            
+            nova_rodada_id = str(jogos_blaze[-1]["id"])
+            
+            # 2. Se a rodada fechou, contabiliza o sinal ativo
+            if nova_rodada_id != ultima_processada:
+                if sinal_ativo:
+                    result_sigla = colors_mem[-1]
+                    if result_sigla == "W":
+                        whites += 1; profit -= APOSTA_BASE
+                    elif result_sigla == cor_sinal:
+                        wins += 1; profit += APOSTA_BASE
+                    else:
+                        losses += 1; profit -= APOSTA_BASE
+                    sinal_ativo = None
+                
+                # Salva os novos jogos no Neon
+                for jogo in jogos_blaze:
+                    rodada_id = str(jogo.get("id"))
+                    roll = int(jogo.get("roll"))
+                    color_int = int(jogo.get("color"))
+                    cor_nome = CORES.get(color_int)
+                    cur.execute("""
+                        INSERT INTO blaze_historico (rodada_id, color, cor, roll, status, created_at)
+                        VALUES (%s,%s,%s,%s,'complete', NOW()) ON CONFLICT (rodada_id) DO NOTHING;
+                    """, (rodada_id, color_int, cor_nome, roll))
+
+                # 3. Verifica as estratégias para a PRÓXIMA rodada
+                r_check = rolls_mem[:-1]
+                c_check = colors_mem[:-1]
+                
+                novo_sinal = get_active_signal(r_check, c_check)
+                if novo_sinal:
+                    sinal_ativo = novo_sinal[0]
+                    cor_sinal = novo_sinal[1]
+                
+                ultima_processada = nova_rodada_id
                 
                 cur.execute("""
-                    INSERT INTO blaze_historico (rodada_id, color, cor, roll, status, created_at)
-                    VALUES (%s,%s,%s,%s,'complete', NOW()) ON CONFLICT (rodada_id) DO NOTHING RETURNING id;
-                """, (rodada_id, color_int, cor_nome, roll))
-                inserido = cur.fetchone()
-                
-                # Adiciona na memória apenas jogos que já estavam no banco ou são novos
-                if inserido or rodada_id == ultima_processada or len(rolls_mem) > 0:
-                    rolls_mem.append(roll)
-                    colors_mem.append(sigla)
-                
-                # Se for a rodada que acabou de ser processada, começa a coletar dali pra frente
-                if rodada_id == ultima_processada:
-                    rolls_mem = [roll]
-                    colors_mem = [sigla]
-            
-            # Pega exatamente os últimos 10 da memória
-            rolls_recentes = rolls_mem[-10:]
-            colors_recentes = colors_mem[-10:]
-            
-            # 3. Se houver sinal ativo e a próxima rodada fechou, contabiliza
-            if sinal_ativo and len(rolls_mem) > 0:
-                # O último jogo da lista é o que fechou após o sinal
-                result_roll = rolls_mem[-1]
-                result_sigla = colors_mem[-1]
-                
-                if result_sigla == "W":
-                    whites += 1; profit -= APOSTA_BASE
-                elif result_sigla == cor_sinal:
-                    wins += 1; profit += APOSTA_BASE
-                else:
-                    losses += 1; profit -= APOSTA_BASE
-                
-                sinal_ativo = None # Reseta o sinal
-            
-            # 4. Verifica as estratégias para a PRÓXIMA rodada
-            # Usamos todos exceto o último (que já foi avaliado acima)
-            r_check = rolls_mem[:-1] if sinal_ativo is None and len(rolls_mem)>0 else rolls_mem
-            c_check = colors_mem[:-1] if sinal_ativo is None and len(rolls_mem)>0 else colors_mem
-            
-            novo_sinal = get_active_signal(r_check, c_check)
-            if novo_sinal:
-                sinal_ativo = novo_sinal[0]
-                cor_sinal = novo_sinal[1]
-                ultima_processada = str(jogos_blaze[-1]["id"]) # Marca que vai aguardar a próxima
-            else:
-                sinal_ativo = None
-                ultima_processada = str(jogos_blaze[-1]["id"])
-            
-            # 5. Atualiza o banco
-            cur.execute("""
-                UPDATE bot_estado SET wins=%s, losses=%s, whites=%s, profit=%s, 
-                sinal_ativo=%s, cor_sinal=%s, ultima_rodada_processada=%s WHERE id=1;
-            """, (wins, losses, whites, profit, sinal_ativo, cor_sinal, ultima_processada))
+                    UPDATE bot_estado SET wins=%s, losses=%s, whites=%s, profit=%s, 
+                    sinal_ativo=%s, cor_sinal=%s, ultima_rodada_processada=%s WHERE id=1;
+                """, (wins, losses, whites, profit, sinal_ativo, cor_sinal, ultima_processada))
             
         conn.commit()
         conn.close()
         
-        return (sinal_ativo, cor_sinal), rolls_recentes, colors_recentes, wins, losses, whites, profit
+        return (sinal_ativo, cor_sinal), rolls_tela, colors_tela, wins, losses, whites, profit
     except Exception as e:
         print(f"Erro processar: {e}")
         try: conn.close()
@@ -233,19 +217,35 @@ body { background: radial-gradient(circle at top, #171d28 0%, var(--bg) 52%); co
 .value { font-size: 26px; font-weight: 950; }
 .green { color: var(--green); } .red { color: var(--red); } .yellow { color: var(--yellow); } .white { color: var(--white); }
 .profit-positive { color: var(--green); } .profit-negative { color: var(--red); }
-.trend { display: flex; gap: 6px; overflow-x: auto; padding: 10px; margin-bottom: 12px; background: var(--card); border: 1px solid var(--border); border-radius: 14px; }
+.trend-section { margin-top: 15px; }
+.section-title { color: var(--muted); font-size: 11px; font-weight: 900; text-transform: uppercase; margin-bottom: 10px; }
+.trend { display: flex; gap: 6px; overflow-x: auto; padding: 10px; background: var(--card); border: 1px solid var(--border); border-radius: 14px; }
 .pill { min-width: 38px; height: 38px; border-radius: 9px; display: flex; align-items: center; justify-content: center; font-weight: 900; flex-shrink: 0; }
 .pill-r { background: var(--red); color: white; } .pill-b { background: #252a31; color: white; border: 1px solid #454c55; } .pill-w { background: white; color: #111; }
 </style>
 </head>
 <body>
 <div class="container">
-    <div class="header"><div class="logo">🤖 Robô <span>5 Estratégias</span></div></div>
+    <div class="header">
+        <div class="logo">🤖 Robô <span>5 Estratégias</span></div>
+    </div>
     <div class="status-grid">
-        <div class="status-card"><div class="status-title">Status</div><div class="status-value online">🟢 ATIVO</div></div>
-        <div class="status-card"><div class="status-title">Atualização</div><div class="status-value">10s</div></div>
-        <div class="status-card"><div class="status-title">Aposta Base</div><div class="status-value">R$ {{ '%.2f'|format(bet_amount) }}</div></div>
-        <div class="status-card"><div class="status-title">Win Rate</div><div class="value yellow">{{ win_rate }}%</div></div>
+        <div class="status-card">
+            <div class="status-title">Status</div>
+            <div class="status-value online">🟢 ATIVO</div>
+        </div>
+        <div class="status-card">
+            <div class="status-title">Atualização</div>
+            <div class="status-value">{{ current_time }}</div>
+        </div>
+        <div class="status-card">
+            <div class="status-title">Aposta Base</div>
+            <div class="status-value">R$ {{ '%.2f'|format(bet_amount) }}</div>
+        </div>
+        <div class="status-card">
+            <div class="status-title">Win Rate</div>
+            <div class="value yellow">{{ win_rate }}%</div>
+        </div>
     </div>
     <div class="signal-box">
         {% if active_signal %}
@@ -264,8 +264,11 @@ body { background: radial-gradient(circle at top, #171d28 0%, var(--bg) 52%); co
         <div class="card"><div class="status-title">Whites</div><div class="value white">{{ whites }}</div></div>
         <div class="card"><div class="status-title">Total Ops</div><div class="value">{{ total_ops }}</div></div>
     </div>
-    <div class="trend">
-        {% for i in range(numbers|length) %}<div class="pill pill-{{ colors[i].lower() }}">{{ numbers[i] }}</div>{% endfor %}
+    <div class="trend-section">
+        <div class="section-title">Últimos Jogos (Tempo Real)</div>
+        <div class="trend">
+            {% for i in range(numbers|length) %}<div class="pill pill-{{ colors[i].lower() }}">{{ numbers[i] }}</div>{% endfor %}
+        </div>
     </div>
 </div>
 </body>
@@ -282,15 +285,17 @@ def home():
     total_ops = wins + losses + whites
     win_rate = round(wins / total_ops * 100, 1) if total_ops > 0 else 0.0
     
-    numbers_display = list(reversed(rolls))
-    colors_display = list(reversed(colors))
+    # O histórico já vem ordenado do mais antigo para o mais novo, 
+    # então não precisamos reverter para exibir na tela.
+    current_time = datetime.now().strftime("%H:%M:%S")
     
     return render_template_string(
         HTML_TEMPLATE,
         active_signal=signal,
-        numbers=numbers_display, colors=colors_display,
+        numbers=rolls, colors=colors,
         wins=wins, losses=losses, whites=whites, profit=profit,
-        win_rate=win_rate, total_ops=total_ops, bet_amount=APOSTA_BASE
+        win_rate=win_rate, total_ops=total_ops, bet_amount=APOSTA_BASE,
+        current_time=current_time
     )
 
 @app.route("/health")
