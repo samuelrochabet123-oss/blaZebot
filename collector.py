@@ -30,6 +30,7 @@ from datetime import datetime
 
 import socketio
 import psycopg2
+from strategy_engine import processar_novo_resultado
 
 
 # ================================================================
@@ -42,7 +43,7 @@ ROOM = "double_room_1"
 EVENT_NAME = "data"
 TICK_NAME = "double.tick"
 
-MOSTRAR_TICKS = True
+MOSTRAR_TICKS = False
 INTERVALO_STATUS = 30
 MAX_RECONEXOES = 999999
 
@@ -285,6 +286,22 @@ def salvar_resultado(payload):
             print(f"Room   : {room_id}")
             print("=" * 70)
             print("")
+
+            # ============================================================
+            # MOTOR DAS 5 ESTRATÉGIAS
+            # ============================================================
+            # O resultado já foi confirmado no Neon. Agora o motor:
+            # 1) liquida eventual sinal anterior;
+            # 2) analisa o histórico sem o resultado recém-chegado;
+            # 3) cria o sinal para a próxima rodada, se houver gatilho.
+            try:
+                processar_novo_resultado(
+                    rodada_id=str(rodada_id),
+                    color=color,
+                    roll=roll,
+                )
+            except Exception as e:
+                print(f"⚠️ Erro no motor das estratégias: {e}")
 
             return True
 
