@@ -518,6 +518,25 @@ def iniciar_socket():
 # MAIN
 # ================================================================
 
+
+def iniciar_coletor_em_thread():
+    """
+    Compatibilidade com o app.py do Render.
+
+    Inicia o collector em uma thread daemon para que o Gunicorn
+    consiga subir o Flask normalmente enquanto o Socket.IO roda
+    em segundo plano.
+    """
+    thread = threading.Thread(
+        target=main,
+        name="blaze-collector",
+        daemon=True,
+    )
+    thread.start()
+    print("🚀 Collector V2.1 iniciado em background", flush=True)
+    return thread
+
+
 def main():
     global rodando
 
