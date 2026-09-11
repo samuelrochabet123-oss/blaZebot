@@ -1,10 +1,5 @@
 # ================================================================
-# BLAZE BOT — WEB APP PARA RENDER + NEON
-# ================================================================
-# O collector roda em uma thread dentro do mesmo Web Service.
-#
-# Render Start Command:
-# gunicorn --workers 1 --bind 0.0.0.0:$PORT app:app
+# BLAZE BOT — DASHBOARD WEB + COLLECTOR + MOTOR
 # ================================================================
 
 import os
@@ -31,17 +26,14 @@ def get_db_connection():
             database_url = f"{database_url}{separator}sslmode=require"
 
         return psycopg2.connect(database_url, connect_timeout=10)
-
     except Exception as e:
-        print(f"❌ Erro Neon: {e}")
+        print(f"❌ Erro Neon: {e}", flush=True)
         return None
 
 
 def init_web_db():
     conn = get_db_connection()
-
     if not conn:
-        print("⚠️ DATABASE_URL não disponível.")
         return
 
     try:
@@ -88,10 +80,8 @@ def init_web_db():
 
         conn.commit()
         conn.close()
-        print("✅ Banco Neon inicializado.")
-
     except Exception as e:
-        print(f"❌ Erro init web DB: {e}")
+        print(f"❌ Erro init web DB: {e}", flush=True)
         try:
             conn.rollback()
             conn.close()
@@ -99,70 +89,246 @@ def init_web_db():
             pass
 
 
+# ================================================================
+# DADOS DO DASHBOARD
+# ================================================================
+
+ESTRATEGIAS = [
+    "EST 1 (Sniper Par)",
+    "EST 1 (Sniper Ímpar)",
+    "EST 2 (Operacional)",
+    "EST 3 (Franco-Atirador)",
+    "EST 4 (Bala de Prata)",
+    "EST 5 (Mina Oculta)",
+]
+
+
+def cor_info(color, cor_texto=None):
+    try:
+        color = int(color)
+    except Exception:
+        color = None
+
+    if color == 0:
+        return {"sigla": "W", "nome": "BRANCO", "classe": "white", "emoji": "⚪"}
+    if color == 1:
+        return {"sigla": "R", "nome": "VERMELHO", "classe": "red", "emoji": "🔴"}
+    if color == 2:
+        return {"sigla": "B", "nome": "PRETO", "classe": "black", "emoji": "⚫"}
+
+    texto = (cor_texto or "").upper()
+    if "VERMELHO" in texto or texto == "RED":
+        return {"sigla": "R", "nome": "VERMELHO", "classe": "red", "emoji": "🔴"}
+    if "PRETO" in texto or texto == "BLACK":
+        return {"sigla": "B", "nome": "PRETO", "classe": "black", "emoji": "⚫"}
+    return {"sigla": "W", "nome": "BRANCO", "classe": "white", "emoji": "⚪"}
+
+
+def estrategia_curta(nome):
+    if not nome:
+        return "—"
+    return (
+        nome.replace("EST 1 (Sniper Par)", "EST 1 • Sniper Par")
+        .replace("EST 1 (Sniper Ímpar)", "EST 1 • Sniper Ímpar")
+        .replace("EST 2 (Operacional)", "EST 2 • Operacional")
+        .replace("EST 3 (Franco-Atirador)", "EST 3 • Franco-Atirador")
+        .replace("EST 4 (Bala de Prata)", "EST 4 • Bala de Prata")
+        .replace("EST 5 (Mina Oculta)", "EST 5 • Mina Oculta")
+    )
+
+
 def consultar_dashboard():
     vazio = {
         "conectado": False,
         "ultima_rodada": None,
         "ultimo_resultado_em": None,
-        "total_ticks": 0,
-        "total_resultados": 0,
-        "total_duplicados": 0,
-        "total_erros_db": 0,
         "total_jogos": 0,
         "jogos": [],
+        "motor": {
+            "ativo": False,
+            "sinal": None,
+            "cor": None,
+            "estrategia": None,
+            "wins": 0,
+            "losses": 0,
+            "whites": 0,
+            "profit": 0.0,
+        },
+        "estrategias": [],
+        "historico_sinais": [],
     }
 
     conn = get_db_connection()
-
     if not conn:
         return vazio
 
     try:
         with conn.cursor() as cur:
+            # --------------------------------------------------------
+            # Coletor
+            # --------------------------------------------------------
             cur.execute("""
                 SELECT
                     conectado,
                     ultima_rodada,
-                    ultimo_resultado_em,
-                    total_ticks,
-                    total_resultados,
-                    total_duplicados,
-                    total_erros_db
+                    ultimo_resultado_em
                 FROM collector_status
                 WHERE id = 1;
             """)
-
             row = cur.fetchone()
-
             if row:
-                (
-                    vazio["conectado"],
-                    vazio["ultima_rodada"],
-                    vazio["ultimo_resultado_em"],
-                    vazio["total_ticks"],
-                    vazio["total_resultados"],
-                    vazio["total_duplicados"],
-                    vazio["total_erros_db"],
-                ) = row
+                vazio["conectado"] = bool(row[0])
+                vazio["ultima_rodada"] = row[1]
+                vazio["ultimo_resultado_em"] = row[2]
 
             cur.execute("SELECT COUNT(*) FROM blaze_historico;")
             vazio["total_jogos"] = cur.fetchone()[0]
 
+            # --------------------------------------------------------
+            # Últimos resultados
+            # --------------------------------------------------------
             cur.execute("""
                 SELECT roll, color, cor, rodada_id
                 FROM blaze_historico
+                WHERE status = 'complete'
                 ORDER BY id DESC
-                LIMIT 20;
+                LIMIT 24;
             """)
 
-            vazio["jogos"] = list(reversed(cur.fetchall()))
+            rows = list(reversed(cur.fetchall()))
+            for roll, color, cor, rodada_id in rows:
+                info = cor_info(color, cor)
+                vazio["jogos"].append({
+                    "roll": roll,
+                    "color": color,
+                    "cor": cor,
+                    "rodada": rodada_id,
+                    **info,
+                })
+
+            # --------------------------------------------------------
+            # Estado do motor
+            # --------------------------------------------------------
+            try:
+                cur.execute("""
+                    SELECT
+                        motor_ativo,
+                        sinal_ativo,
+                        cor_sinal,
+                        ultima_estrategia,
+                        wins,
+                        losses,
+                        whites,
+                        profit
+                    FROM bot_estado
+                    WHERE id = 1;
+                """)
+                row = cur.fetchone()
+                if row:
+                    vazio["motor"] = {
+                        "ativo": bool(row[0]),
+                        "sinal": row[1],
+                        "cor": row[2],
+                        "estrategia": row[3],
+                        "wins": row[4] or 0,
+                        "losses": row[5] or 0,
+                        "whites": row[6] or 0,
+                        "profit": float(row[7] or 0),
+                    }
+            except Exception:
+                # O dashboard continua funcionando mesmo antes do motor
+                # criar suas tabelas.
+                conn.rollback()
+
+            # --------------------------------------------------------
+            # Desempenho por estratégia
+            # --------------------------------------------------------
+            try:
+                cur.execute("""
+                    SELECT
+                        estrategia,
+                        COUNT(*) AS sinais,
+                        COUNT(*) FILTER (WHERE resultado = 'WIN') AS wins,
+                        COUNT(*) FILTER (WHERE resultado = 'LOSS') AS losses,
+                        COUNT(*) FILTER (WHERE resultado = 'WHITE') AS whites,
+                        COUNT(*) FILTER (WHERE resultado = 'PENDENTE') AS pendentes
+                    FROM estrategia_sinais
+                    GROUP BY estrategia;
+                """)
+                perf_rows = cur.fetchall()
+            except Exception:
+                conn.rollback()
+                perf_rows = []
+
+            perf_map = {}
+            for nome, sinais, wins, losses, whites, pendentes in perf_rows:
+                resolvidos = (wins or 0) + (losses or 0) + (whites or 0)
+                taxa = (wins / resolvidos * 100) if resolvidos else 0
+                perf_map[nome] = {
+                    "nome": nome,
+                    "curto": estrategia_curta(nome),
+                    "sinais": sinais or 0,
+                    "wins": wins or 0,
+                    "losses": losses or 0,
+                    "whites": whites or 0,
+                    "pendentes": pendentes or 0,
+                    "taxa": round(taxa, 1),
+                }
+
+            # O motor possui EST 1 Par e Ímpar como gatilhos separados.
+            for nome in ESTRATEGIAS:
+                vazio["estrategias"].append(
+                    perf_map.get(nome, {
+                        "nome": nome,
+                        "curto": estrategia_curta(nome),
+                        "sinais": 0,
+                        "wins": 0,
+                        "losses": 0,
+                        "whites": 0,
+                        "pendentes": 0,
+                        "taxa": 0,
+                    })
+                )
+
+            # --------------------------------------------------------
+            # Histórico dos últimos sinais
+            # --------------------------------------------------------
+            try:
+                cur.execute("""
+                    SELECT
+                        estrategia,
+                        cor_prevista,
+                        rodada_base,
+                        rodada_resultado,
+                        cor_resultado,
+                        resultado,
+                        criado_em
+                    FROM estrategia_sinais
+                    ORDER BY id DESC
+                    LIMIT 12;
+                """)
+                for r in cur.fetchall():
+                    estrategia, prevista, base, resultado_rodada, cor_resultado, resultado, criado = r
+                    vazio["historico_sinais"].append({
+                        "estrategia": estrategia_curta(estrategia),
+                        "estrategia_full": estrategia,
+                        "prevista": prevista,
+                        "base": base,
+                        "rodada_resultado": resultado_rodada,
+                        "cor_resultado": cor_resultado,
+                        "resultado": resultado,
+                        "criado_em": criado,
+                    })
+            except Exception:
+                conn.rollback()
 
         conn.close()
         return vazio
 
     except Exception as e:
-        print(f"❌ Erro dashboard: {e}")
+        print(f"❌ Erro dashboard: {e}", flush=True)
         try:
+            conn.rollback()
             conn.close()
         except Exception:
             pass
@@ -179,249 +345,283 @@ HTML = r"""
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<meta http-equiv="refresh" content="10">
-<title>Blaze Collector — Render + Neon</title>
-
+<meta http-equiv="refresh" content="5">
+<title>Blaze Bot</title>
 <style>
 :root {
     --bg: #07090d;
-    --card: #11151c;
+    --panel: #10141b;
+    --panel2: #151a22;
     --border: rgba(255,255,255,.08);
-    --text: #e8edf3;
-    --muted: #7d8794;
-    --red: #ff4d57;
-    --green: #19df78;
-    --white: #f1f3f5;
-    --yellow: #ffc247;
+    --text: #eef2f7;
+    --muted: #8993a1;
+    --red: #ff4d5d;
+    --green: #23e27c;
+    --yellow: #ffc857;
+    --blue: #6ea8ff;
+    --white: #f4f5f7;
 }
-
 * { box-sizing: border-box; margin: 0; padding: 0; }
-
 body {
-    background: radial-gradient(circle at top, #171d28 0%, var(--bg) 52%);
-    color: var(--text);
-    font-family: Arial, sans-serif;
     min-height: 100vh;
-    padding: 18px;
-}
-
-.container { max-width: 1180px; margin: auto; }
-
-.header { margin-bottom: 15px; }
-
-.logo {
-    font-size: 25px;
-    font-weight: 900;
-}
-
-.logo span { color: var(--red); }
-
-.status-grid {
-    display: grid;
-    grid-template-columns: repeat(4, 1fr);
-    gap: 10px;
-    margin-bottom: 12px;
-}
-
-.status-card, .card, .signal-box, .trend {
-    background: rgba(17,21,28,.86);
-    border: 1px solid var(--border);
-    border-radius: 14px;
-}
-
-.status-card, .card { padding: 15px; }
-
-.status-title {
-    color: var(--muted);
-    text-transform: uppercase;
-    font-size: 10px;
-    font-weight: 800;
-    margin-bottom: 8px;
-}
-
-.status-value {
-    font-size: 15px;
-    font-weight: 900;
-}
-
-.online { color: var(--green); }
-.offline { color: var(--red); }
-
-.stats {
-    display: grid;
-    grid-template-columns: repeat(5, 1fr);
-    gap: 10px;
-    margin-bottom: 12px;
-}
-
-.value {
-    font-size: 26px;
-    font-weight: 950;
-}
-
-.green { color: var(--green); }
-.red { color: var(--red); }
-.yellow { color: var(--yellow); }
-.white { color: var(--white); }
-
-.signal-box {
-    margin-bottom: 12px;
+    background: radial-gradient(circle at top, #1a202b 0%, var(--bg) 48%);
+    color: var(--text);
+    font-family: Inter, Arial, sans-serif;
     padding: 20px;
-    text-align: center;
 }
-
-.signal-title {
-    font-size: 25px;
-    font-weight: 900;
+.container { max-width: 1180px; margin: 0 auto; }
+.header {
+    display:flex; justify-content:space-between; align-items:center;
+    margin-bottom: 16px;
 }
-
-.signal-detail {
-    margin-top: 8px;
-    color: var(--muted);
-    font-size: 13px;
+.logo { font-size: 25px; font-weight: 900; letter-spacing: -.5px; }
+.logo span { color: var(--red); }
+.live {
+    display:flex; align-items:center; gap:8px;
+    font-size:12px; font-weight:900; color:var(--green);
 }
-
-.trend-section { margin-top: 15px; }
-
-.section-title {
-    color: var(--muted);
-    font-size: 11px;
-    font-weight: 900;
-    text-transform: uppercase;
-    margin-bottom: 10px;
+.dot { width:9px; height:9px; border-radius:50%; background:currentColor; box-shadow:0 0 12px currentColor; }
+.top-grid { display:grid; grid-template-columns: 1.2fr 1fr 1fr 1fr; gap:10px; margin-bottom:12px; }
+.card {
+    background: rgba(16,20,27,.92);
+    border:1px solid var(--border);
+    border-radius:15px;
+    padding:15px;
 }
+.label { color:var(--muted); font-size:10px; font-weight:900; text-transform:uppercase; letter-spacing:.7px; margin-bottom:7px; }
+.big { font-size:23px; font-weight:950; }
+.small { color:var(--muted); font-size:11px; margin-top:5px; }
+.green { color:var(--green); }
+.red { color:var(--red); }
+.yellow { color:var(--yellow); }
+.white { color:var(--white); }
+.black { color:#d7dce3; }
 
-.trend {
-    display: flex;
-    gap: 6px;
-    overflow-x: auto;
-    padding: 10px;
+.signal {
+    position:relative; overflow:hidden;
+    margin-bottom:12px; padding:24px;
+    border-radius:18px;
+    background:linear-gradient(145deg, rgba(22,27,36,.98), rgba(12,15,21,.98));
+    border:1px solid rgba(255,255,255,.10);
+    text-align:center;
 }
+.signal.active { border-color:rgba(35,226,124,.28); box-shadow:0 0 35px rgba(35,226,124,.06); }
+.signal.wait { border-color:rgba(255,255,255,.08); }
+.signal .eyebrow { color:var(--muted); font-size:11px; font-weight:900; text-transform:uppercase; letter-spacing:1px; }
+.signal .color { font-size:38px; font-weight:950; margin:7px 0 4px; }
+.signal .strategy { font-size:15px; font-weight:850; }
+.signal .entry { margin-top:9px; color:var(--muted); font-size:12px; }
 
-.pill {
-    min-width: 42px;
-    height: 42px;
-    border-radius: 9px;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    font-weight: 900;
-    flex-shrink: 0;
+.section-title { display:flex; justify-content:space-between; align-items:end; margin:18px 0 9px; }
+.section-title h2 { font-size:13px; text-transform:uppercase; letter-spacing:.8px; }
+.section-title span { color:var(--muted); font-size:11px; }
+
+.performance { display:grid; grid-template-columns: repeat(6, 1fr); gap:9px; margin-bottom:12px; }
+.metric { text-align:center; padding:13px 8px; background:rgba(16,20,27,.92); border:1px solid var(--border); border-radius:13px; }
+.metric .num { font-size:22px; font-weight:950; }
+.metric .m-label { margin-top:4px; color:var(--muted); font-size:9px; text-transform:uppercase; font-weight:900; }
+
+.strategy-grid { display:grid; grid-template-columns:repeat(3, 1fr); gap:10px; }
+.strategy {
+    background:rgba(16,20,27,.92); border:1px solid var(--border);
+    border-radius:15px; padding:14px;
 }
+.strategy-head { display:flex; justify-content:space-between; gap:10px; align-items:start; }
+.strategy-name { font-size:13px; font-weight:900; }
+.badge { font-size:8px; font-weight:900; padding:5px 7px; border-radius:999px; background:rgba(35,226,124,.10); color:var(--green); white-space:nowrap; }
+.strategy-stats { display:grid; grid-template-columns:repeat(4,1fr); gap:6px; margin-top:12px; }
+.strategy-stat { background:rgba(255,255,255,.025); border-radius:9px; padding:7px 4px; text-align:center; }
+.strategy-stat b { display:block; font-size:14px; }
+.strategy-stat span { display:block; color:var(--muted); font-size:8px; margin-top:2px; text-transform:uppercase; }
 
-.pill-r { background: var(--red); color: white; }
-.pill-b { background: #252a31; color: white; border: 1px solid #454c55; }
-.pill-w { background: white; color: #111; }
+.history { background:rgba(16,20,27,.92); border:1px solid var(--border); border-radius:15px; overflow:hidden; }
+.history-row { display:grid; grid-template-columns:1.7fr .7fr 1fr 1fr 1fr; gap:8px; align-items:center; padding:11px 13px; border-bottom:1px solid rgba(255,255,255,.045); font-size:11px; }
+.history-row:last-child { border-bottom:0; }
+.history-head { color:var(--muted); font-size:9px; font-weight:900; text-transform:uppercase; }
+.result-badge { display:inline-flex; align-items:center; justify-content:center; min-width:58px; padding:5px 7px; border-radius:7px; font-size:9px; font-weight:950; }
+.result-win { background:rgba(35,226,124,.12); color:var(--green); }
+.result-loss { background:rgba(255,77,93,.12); color:var(--red); }
+.result-white { background:rgba(255,255,255,.10); color:var(--white); }
+.result-pending { background:rgba(255,200,87,.12); color:var(--yellow); }
 
-@media (max-width: 800px) {
-    .status-grid, .stats {
-        grid-template-columns: repeat(2, 1fr);
-    }
+.results { display:flex; gap:7px; overflow-x:auto; padding:12px; background:rgba(16,20,27,.92); border:1px solid var(--border); border-radius:15px; }
+.pill { flex:0 0 auto; width:48px; height:48px; border-radius:10px; display:flex; flex-direction:column; align-items:center; justify-content:center; font-weight:950; }
+.pill small { font-size:8px; opacity:.75; margin-top:2px; }
+.pill.red-bg { background:var(--red); color:white; }
+.pill.black-bg { background:#262c35; color:white; border:1px solid #444b55; }
+.pill.white-bg { background:white; color:#111; }
+.footer { text-align:center; color:#56606d; font-size:9px; padding:18px 0 4px; }
+
+@media (max-width: 900px) {
+    .top-grid { grid-template-columns:repeat(2,1fr); }
+    .performance { grid-template-columns:repeat(3,1fr); }
+    .strategy-grid { grid-template-columns:repeat(2,1fr); }
+}
+@media (max-width: 600px) {
+    body { padding:12px; }
+    .top-grid, .strategy-grid { grid-template-columns:1fr; }
+    .performance { grid-template-columns:repeat(2,1fr); }
+    .history-row { grid-template-columns:1.4fr .7fr 1fr 1fr; }
+    .history-row .hide-mobile { display:none; }
 }
 </style>
 </head>
-
 <body>
 <div class="container">
 
     <div class="header">
-        <div class="logo">🤖 Blaze <span>Collector</span></div>
+        <div class="logo">🤖 Blaze <span>Bot</span></div>
+        <div class="live">
+            <span class="dot"></span>
+            {% if status.conectado %}COLETOR ONLINE{% else %}COLETOR OFFLINE{% endif %}
+        </div>
     </div>
 
-    <div class="status-grid">
-
-        <div class="status-card">
-            <div class="status-title">Socket</div>
-            {% if status.conectado %}
-                <div class="status-value online">🟢 CONECTADO</div>
+    <div class="top-grid">
+        <div class="card">
+            <div class="label">Última rodada</div>
+            <div class="big">{{ status.ultima_rodada or 'Aguardando...' }}</div>
+            <div class="small">Atualização automática a cada 5s</div>
+        </div>
+        <div class="card">
+            <div class="label">Jogos no histórico</div>
+            <div class="big yellow">{{ status.total_jogos }}</div>
+            <div class="small">Neon PostgreSQL</div>
+        </div>
+        <div class="card">
+            <div class="label">Motor de estratégias</div>
+            {% if status.motor.ativo %}
+                <div class="big green">🟢 ATIVO</div>
             {% else %}
-                <div class="status-value offline">🔴 DESCONECTADO</div>
+                <div class="big red">🔴 INATIVO</div>
+            {% endif %}
+            <div class="small">5 estratégias carregadas</div>
+        </div>
+        <div class="card">
+            <div class="label">Resultado do último sinal</div>
+            {% if status.motor.wins + status.motor.losses + status.motor.whites > 0 %}
+                <div class="big">{{ status.motor.wins }}W / {{ status.motor.losses }}L</div>
+                <div class="small">{{ status.motor.whites }} branco(s)</div>
+            {% else %}
+                <div class="big">—</div>
+                <div class="small">Nenhum sinal resolvido</div>
             {% endif %}
         </div>
-
-        <div class="status-card">
-            <div class="status-title">Última rodada</div>
-            <div class="status-value">
-                {{ status.ultima_rodada or 'Aguardando...' }}
-            </div>
-        </div>
-
-        <div class="status-card">
-            <div class="status-title">Último resultado</div>
-            <div class="status-value">
-                {{ status.ultimo_resultado_em or 'Aguardando...' }}
-            </div>
-        </div>
-
-        <div class="status-card">
-            <div class="status-title">Jogos no Neon</div>
-            <div class="value yellow">{{ status.total_jogos }}</div>
-        </div>
-
     </div>
 
-    <div class="signal-box">
-        {% if status.conectado %}
-            <div class="signal-title online">🟢 COLETANDO EM TEMPO REAL</div>
-            <div class="signal-detail">
-                Socket.IO → double.tick → Neon PostgreSQL
+    {% if status.motor.sinal and status.motor.cor %}
+        <div class="signal active">
+            <div class="eyebrow">🎯 SINAL ATUAL • ENTRADA NA PRÓXIMA RODADA</div>
+            {% if status.motor.cor == 'R' %}
+                <div class="color red">🔴 VERMELHO</div>
+            {% elif status.motor.cor == 'B' %}
+                <div class="color black">⚫ PRETO</div>
+            {% else %}
+                <div class="color white">⚪ BRANCO</div>
+            {% endif %}
+            <div class="strategy">{{ status.motor.estrategia or status.motor.sinal }}</div>
+            <div class="entry">Previsão: <strong>{{ status.motor.cor }}</strong> • aguardando o próximo resultado para resolver o sinal</div>
+        </div>
+    {% else %}
+        <div class="signal wait">
+            <div class="eyebrow">🎯 SINAL ATUAL</div>
+            <div class="color" style="font-size:27px">⚪ AGUARDANDO GATILHO</div>
+            <div class="strategy">Nenhuma das estratégias encontrou um padrão neste momento.</div>
+            <div class="entry">Isso é normal: o motor continua analisando cada nova rodada.</div>
+        </div>
+    {% endif %}
+
+    <div class="section-title">
+        <h2>📊 Desempenho geral</h2>
+        <span>Todos os sinais resolvidos</span>
+    </div>
+    <div class="performance">
+        <div class="metric"><div class="num green">{{ status.motor.wins }}</div><div class="m-label">Acertos</div></div>
+        <div class="metric"><div class="num red">{{ status.motor.losses }}</div><div class="m-label">Erros</div></div>
+        <div class="metric"><div class="num white">{{ status.motor.whites }}</div><div class="m-label">Brancos</div></div>
+        <div class="metric"><div class="num">{{ status.motor.wins + status.motor.losses + status.motor.whites }}</div><div class="m-label">Sinais</div></div>
+        <div class="metric">
+            <div class="num yellow">
+                {% set total_res = status.motor.wins + status.motor.losses + status.motor.whites %}
+                {% if total_res > 0 %}{{ '%.1f'|format(status.motor.wins / total_res * 100) }}%{% else %}—{% endif %}
             </div>
+            <div class="m-label">Taxa de acerto</div>
+        </div>
+        <div class="metric">
+            <div class="num {% if status.motor.profit >= 0 %}green{% else %}red{% endif %}">
+                {{ '%+.2f'|format(status.motor.profit) }}
+            </div>
+            <div class="m-label">Resultado base</div>
+        </div>
+    </div>
+
+    <div class="section-title">
+        <h2>🧠 Estratégias</h2>
+        <span>Habilitadas no motor</span>
+    </div>
+    <div class="strategy-grid">
+        {% for est in status.estrategias %}
+        <div class="strategy">
+            <div class="strategy-head">
+                <div class="strategy-name">{{ est.curto }}</div>
+                <div class="badge">● HABILITADA</div>
+            </div>
+            <div class="strategy-stats">
+                <div class="strategy-stat"><b>{{ est.sinais }}</b><span>Sinais</span></div>
+                <div class="strategy-stat"><b class="green">{{ est.wins }}</b><span>Wins</span></div>
+                <div class="strategy-stat"><b class="red">{{ est.losses }}</b><span>Losses</span></div>
+                <div class="strategy-stat"><b class="yellow">{{ est.taxa }}%</b><span>Acerto</span></div>
+            </div>
+        </div>
+        {% endfor %}
+    </div>
+
+    <div class="section-title">
+        <h2>🧾 Últimos sinais</h2>
+        <span>Mais recente primeiro</span>
+    </div>
+    <div class="history">
+        <div class="history-row history-head">
+            <div>Estratégia</div><div>Previsão</div><div>Rodada base</div><div>Resultado</div><div class="hide-mobile">Rodada resolvida</div>
+        </div>
+        {% if status.historico_sinais %}
+            {% for s in status.historico_sinais %}
+            <div class="history-row">
+                <div>{{ s.estrategia }}</div>
+                <div>
+                    {% if s.prevista == 'R' %}<span class="red">🔴 R</span>
+                    {% elif s.prevista == 'B' %}<span class="black">⚫ B</span>
+                    {% else %}<span>⚪ {{ s.prevista or '—' }}</span>{% endif %}
+                </div>
+                <div>{{ s.base }}</div>
+                <div>
+                    {% if s.resultado == 'WIN' %}<span class="result-badge result-win">✓ WIN</span>
+                    {% elif s.resultado == 'LOSS' %}<span class="result-badge result-loss">✕ LOSS</span>
+                    {% elif s.resultado == 'WHITE' %}<span class="result-badge result-white">⚪ WHITE</span>
+                    {% else %}<span class="result-badge result-pending">⏳ PENDENTE</span>{% endif %}
+                </div>
+                <div class="hide-mobile">{{ s.rodada_resultado or '—' }}</div>
+            </div>
+            {% endfor %}
         {% else %}
-            <div class="signal-title red">🔴 AGUARDANDO CONEXÃO</div>
-            <div class="signal-detail">
-                O coletor continuará tentando reconectar automaticamente.
-            </div>
+            <div style="padding:20px;text-align:center;color:#8993a1;font-size:12px">Ainda não há sinais registrados.</div>
         {% endif %}
     </div>
 
-    <div class="stats">
-
-        <div class="card">
-            <div class="status-title">Resultados novos</div>
-            <div class="value green">{{ status.total_resultados }}</div>
-        </div>
-
-        <div class="card">
-            <div class="status-title">Ticks</div>
-            <div class="value">{{ status.total_ticks }}</div>
-        </div>
-
-        <div class="card">
-            <div class="status-title">Duplicados</div>
-            <div class="value">{{ status.total_duplicados }}</div>
-        </div>
-
-        <div class="card">
-            <div class="status-title">Erros DB</div>
-            <div class="value red">{{ status.total_erros_db }}</div>
-        </div>
-
-        <div class="card">
-            <div class="status-title">Banco</div>
-            <div class="value green">NEON</div>
-        </div>
-
+    <div class="section-title">
+        <h2>🎲 Últimos resultados</h2>
+        <span>24 rodadas mais recentes</span>
+    </div>
+    <div class="results">
+        {% for jogo in status.jogos %}
+            <div class="pill {% if jogo.sigla == 'R' %}red-bg{% elif jogo.sigla == 'B' %}black-bg{% else %}white-bg{% endif %}" title="{{ jogo.rodada }}">
+                {{ jogo.emoji }} {{ jogo.roll }}
+                <small>{{ jogo.sigla }}</small>
+            </div>
+        {% endfor %}
     </div>
 
-    <div class="trend-section">
-        <div class="section-title">Últimos jogos coletados</div>
-
-        <div class="trend">
-            {% for jogo in status.jogos %}
-                {% set roll = jogo[0] %}
-                {% set color = jogo[1] %}
-
-                {% if color == 0 %}
-                    <div class="pill pill-w">{{ roll }}</div>
-                {% elif color == 1 %}
-                    <div class="pill pill-r">{{ roll }}</div>
-                {% else %}
-                    <div class="pill pill-b">{{ roll }}</div>
-                {% endif %}
-            {% endfor %}
-        </div>
-    </div>
-
+    <div class="footer">Blaze Bot • coleta em tempo real • motor de 5 estratégias • dashboard atualizado automaticamente</div>
 </div>
 </body>
 </html>
@@ -454,12 +654,10 @@ def status():
 def iniciar_background_collector():
     try:
         from collector import iniciar_coletor_em_thread
-
-        print("🚀 Iniciando Collector V2.2 em background...")
+        print("🚀 Iniciando Collector em background...", flush=True)
         iniciar_coletor_em_thread()
-
     except Exception as e:
-        print(f"❌ Não foi possível iniciar o collector: {e}")
+        print(f"❌ Não foi possível iniciar o collector: {e}", flush=True)
 
 
 init_web_db()
