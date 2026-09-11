@@ -199,7 +199,7 @@ def processar_blaze():
         # ========================================================
         # API BLAZE
         # ========================================================
-        url = "https://api-gaming.blaze.bet.br/roulette_games/recent/1"
+        url = "https://blaze.bet.br/api/singleplayer-originals/originals/roulette_games/recent/1"
 
         resp = requests.get(
             url,
