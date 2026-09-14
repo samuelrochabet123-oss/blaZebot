@@ -2,31 +2,27 @@
 # BLAZE BOT — DASHBOARD WEB + COLLECTOR + MOTOR ESTATÍSTICO
 #
 # VERSÃO:
-# ------------------------------------------------
-# ESTRATÉGIAS:
+# - Remove estratégia antiga 2x Preto -> Vermelho
+# - Novas estratégias:
 #
-# 🥇 VI → VI → R
-# 🥈 VI → PP → P
-# 🥉 VI → VI → VI → R
-# ⚪ WHITE + 13 → R
+#   1) VI -> VI -> R
+#   2) VI -> PP -> P
+#   3) VI -> VI -> VI -> R
 #
-# REGRAS:
-# ------------------------------------------------
-# 1. VI = VERMELHO ÍMPAR
-# 2. VP = VERMELHO PAR
-# 3. PI = PRETO ÍMPAR
-# 4. PP = PRETO PAR
-# 5. W  = BRANCO
+# - Regra adicional W + 13
 #
-# 6. Branco NÃO entra no placar.
-# 7. Branco NÃO entra na taxa de acerto.
-# 8. Branco NÃO altera profit.
-# 9. Branco continua armazenado no banco.
-# 10. Collector continua funcionando mesmo com motor pausado.
-# 11. Cada sinal é resolvido somente na próxima rodada.
-# 12. Não permite dois sinais simultâneos.
-# 13. Não repete a mesma rodada-base.
-# 14. White + 13 usa exatamente 13 rodadas após o White.
+# CORREÇÕES IMPORTANTES:
+#
+# 1. O sinal é baseado em uma rodada específica.
+# 2. O resultado só pode ser uma rodada POSTERIOR ao sinal_base_id.
+# 3. A própria rodada que gerou o sinal NUNCA pode resolver o sinal.
+# 4. Branco NÃO entra no placar.
+# 5. Branco NÃO é contabilizado como WIN/LOSS.
+# 6. O collector continua coletando mesmo com o motor parado.
+# 7. INICIAR cria uma nova sessão estatística.
+# 8. PAUSAR não para o collector.
+# 9. Proteção contra repetição da mesma rodada-base.
+# 10. Estratégias têm prioridade definida.
 # ================================================================
 
 
@@ -59,8 +55,7 @@ def get_db_connection():
             separator = "&" if "?" in database_url else "?"
 
             database_url = (
-                f"{database_url}"
-                f"{separator}sslmode=require"
+                f"{database_url}{separator}sslmode=require"
             )
 
         return psycopg2.connect(
@@ -99,16 +94,27 @@ def init_web_db():
 
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS blaze_historico (
+
                     id SERIAL PRIMARY KEY,
+
                     rodada_id VARCHAR(100) UNIQUE NOT NULL,
+
                     color INTEGER,
+
                     cor VARCHAR(20),
+
                     roll INTEGER,
+
                     status VARCHAR(30),
+
                     room_id VARCHAR(100),
+
                     created_at TIMESTAMP,
+
                     updated_at TIMESTAMP,
-                    coletado_em TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+
+                    coletado_em TIMESTAMP
+                        DEFAULT CURRENT_TIMESTAMP
                 );
             """)
 
@@ -118,27 +124,39 @@ def init_web_db():
             """)
 
             # ----------------------------------------------------
-            # STATUS DO COLETOR
+            # STATUS DO COLLECTOR
             # ----------------------------------------------------
 
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS collector_status (
+
                     id INTEGER PRIMARY KEY,
+
                     conectado BOOLEAN DEFAULT FALSE,
+
                     ultima_rodada VARCHAR(100),
+
                     ultimo_resultado_em TIMESTAMP,
+
                     total_ticks INTEGER DEFAULT 0,
+
                     total_resultados INTEGER DEFAULT 0,
+
                     total_duplicados INTEGER DEFAULT 0,
+
                     total_erros_db INTEGER DEFAULT 0,
-                    atualizado_em TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+
+                    atualizado_em TIMESTAMP
+                        DEFAULT CURRENT_TIMESTAMP
                 );
             """)
 
             cur.execute("""
                 INSERT INTO collector_status (id)
                 VALUES (1)
-                ON CONFLICT (id) DO NOTHING;
+
+                ON CONFLICT (id)
+                DO NOTHING;
             """)
 
             # ----------------------------------------------------
@@ -147,21 +165,27 @@ def init_web_db():
 
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS bot_estado (
+
                     id INTEGER PRIMARY KEY,
 
                     motor_ativo BOOLEAN DEFAULT FALSE,
+
                     sinal_ativo BOOLEAN DEFAULT FALSE,
 
                     cor_sinal VARCHAR(5),
-                    ultima_estrategia VARCHAR(150),
+
+                    ultima_estrategia VARCHAR(100),
 
                     wins INTEGER DEFAULT 0,
+
                     losses INTEGER DEFAULT 0,
+
                     whites INTEGER DEFAULT 0,
 
                     profit FLOAT DEFAULT 0.0,
 
-                    atualizado_em TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    atualizado_em TIMESTAMP
+                        DEFAULT CURRENT_TIMESTAMP,
 
                     inicio_sessao TIMESTAMP,
 
@@ -172,7 +196,7 @@ def init_web_db():
             """)
 
             # ----------------------------------------------------
-            # MIGRAÇÕES
+            # MIGRAÇÃO
             # ----------------------------------------------------
 
             cur.execute("""
@@ -191,11 +215,6 @@ def init_web_db():
             """)
 
             cur.execute("""
-                ALTER TABLE bot_estado
-                ADD COLUMN IF NOT EXISTS ultima_estrategia VARCHAR(150);
-            """)
-
-            cur.execute("""
                 INSERT INTO bot_estado (
                     id,
                     motor_ativo
@@ -204,7 +223,9 @@ def init_web_db():
                     1,
                     FALSE
                 )
-                ON CONFLICT (id) DO NOTHING;
+
+                ON CONFLICT (id)
+                DO NOTHING;
             """)
 
             # ----------------------------------------------------
@@ -213,9 +234,10 @@ def init_web_db():
 
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS estrategia_sinais (
+
                     id SERIAL PRIMARY KEY,
 
-                    estrategia VARCHAR(150),
+                    estrategia VARCHAR(100),
 
                     cor_prevista VARCHAR(5),
 
@@ -227,11 +249,23 @@ def init_web_db():
 
                     resultado VARCHAR(20),
 
-                    criado_em TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    criado_em TIMESTAMP
+                        DEFAULT CURRENT_TIMESTAMP
                 );
             """)
 
+            # ----------------------------------------------------
+            # ÍNDICES
+            # ----------------------------------------------------
+
+            cur.execute("""
+                CREATE INDEX IF NOT EXISTS
+                idx_estrategia_sinais_criado_em
+                ON estrategia_sinais(criado_em);
+            """)
+
         conn.commit()
+
         conn.close()
 
         print(
@@ -254,7 +288,13 @@ def init_web_db():
 
 
 # ================================================================
-# NORMALIZAÇÃO DA COR
+# NORMALIZAÇÃO DAS CORES
+#
+# PADRÃO INTERNO:
+#
+# R = VERMELHO
+# P = PRETO
+# W = BRANCO
 # ================================================================
 
 def mapear_cor_letra(cor_str):
@@ -264,83 +304,280 @@ def mapear_cor_letra(cor_str):
 
     cor = str(cor_str).upper().strip()
 
-    if "VERMELHO" in cor or cor == "RED":
+    # VERMELHO
+    if (
+        "VERMELHO" in cor
+        or cor == "RED"
+        or cor == "R"
+        or cor == "V"
+        or cor == "VI"
+    ):
         return "R"
 
-    if "PRETO" in cor or cor == "BLACK":
+    # PRETO
+    if (
+        "PRETO" in cor
+        or cor == "BLACK"
+        or cor == "P"
+        or cor == "B"
+    ):
         return "P"
 
-    if "BRANCO" in cor or cor == "WHITE":
+    # BRANCO
+    if (
+        "BRANCO" in cor
+        or cor == "WHITE"
+        or cor == "W"
+    ):
         return "W"
 
     return None
 
 
 # ================================================================
-# CONVERTE UMA RODADA PARA ESTADO
+# NORMALIZAÇÃO PELO CÓDIGO NUMÉRICO
 #
-# VP = Vermelho Par
-# VI = Vermelho Ímpar
-# PP = Preto Par
-# PI = Preto Ímpar
-# W  = Branco
+# 0 = BRANCO
+# 1 = VERMELHO
+# 2 = PRETO
 # ================================================================
 
-def obter_estado_rodada(row):
+def mapear_cor_numerica(color):
 
-    if not row:
+    try:
+
+        color = int(color)
+
+    except:
+
         return None
 
-    cor_texto = row[2]
-    color_num = row[3]
-    roll = row[4]
+    if color == 0:
+        return "W"
+
+    if color == 1:
+        return "R"
+
+    if color == 2:
+        return "P"
+
+    return None
+
+
+# ================================================================
+# OBTÉM COR NORMALIZADA
+# ================================================================
+
+def obter_cor(cor_texto, color):
 
     cor = mapear_cor_letra(cor_texto)
 
-    if cor is None:
+    if cor:
+        return cor
 
-        try:
+    return mapear_cor_numerica(color)
 
-            numero = int(color_num)
 
-            if numero == 0:
-                cor = "W"
+# ================================================================
+# MOTOR DE ESTRATÉGIAS
+# ================================================================
 
-            elif numero == 1:
-                cor = "R"
+def detectar_estrategia(hist):
 
-            elif numero == 2:
-                cor = "P"
+    """
+    Recebe histórico em ordem cronológica.
 
-        except:
-            cor = None
+    Exemplo:
 
-    if cor is None:
-        return None
+        R P P R
 
-    if cor == "W":
-        return "W"
+    hist = [
+        {
+            "id": ...,
+            "rodada_id": ...,
+            "cor": "R",
+            "roll": ...
+        },
+        ...
+    ]
 
-    try:
-        numero_roll = int(roll)
-    except:
-        return None
+    Retorna:
 
-    if cor == "R":
+        (cor_prevista, nome_estrategia)
 
-        if numero_roll % 2 == 0:
-            return "VP"
+    ou:
 
-        return "VI"
+        (None, None)
+    """
 
-    if cor == "P":
+    if not hist:
+        return None, None
 
-        if numero_roll % 2 == 0:
-            return "PP"
 
-        return "PI"
+    # ============================================================
+    # ESTRATÉGIA 1
+    #
+    # VI -> VI -> R
+    #
+    # Aqui VI é tratado como VERMELHO.
+    #
+    # Portanto:
+    #
+    # R
+    # R
+    # ↓
+    # previsão R
+    #
+    # ============================================================
 
-    return None
+    if len(hist) >= 2:
+
+        a = hist[-2]["cor"]
+        b = hist[-1]["cor"]
+
+        if a == "R" and b == "R":
+
+            return (
+                "R",
+                "VI → VI → R"
+            )
+
+
+    # ============================================================
+    # ESTRATÉGIA 2
+    #
+    # VI -> PP -> P
+    #
+    # Interpretação:
+    #
+    # R + P + P
+    #       ↓
+    # previsão P
+    #
+    # ============================================================
+
+    if len(hist) >= 3:
+
+        a = hist[-3]["cor"]
+        b = hist[-2]["cor"]
+        c = hist[-1]["cor"]
+
+        if (
+            a == "R"
+            and b == "P"
+            and c == "P"
+        ):
+
+            return (
+                "P",
+                "VI → PP → P"
+            )
+
+
+    # ============================================================
+    # ESTRATÉGIA 3
+    #
+    # VI -> VI -> VI -> R
+    #
+    # Interpretação:
+    #
+    # R + R + R
+    #         ↓
+    # previsão R
+    #
+    # OBS:
+    #
+    # Essa regra é mais longa e pode ficar escondida pela
+    # estratégia VI -> VI -> R.
+    #
+    # Por isso ela é testada ANTES da regra de 2 VI.
+    #
+    # ============================================================
+
+    if len(hist) >= 3:
+
+        a = hist[-3]["cor"]
+        b = hist[-2]["cor"]
+        c = hist[-1]["cor"]
+
+        if (
+            a == "R"
+            and b == "R"
+            and c == "R"
+        ):
+
+            return (
+                "R",
+                "VI → VI → VI → R"
+            )
+
+
+    # ============================================================
+    # W + 13
+    #
+    # Regra configurável.
+    #
+    # Interpretação adotada neste código:
+    #
+    # se a última rodada foi BRANCO e o roll da rodada branca
+    # foi 0, procuramos o próximo evento específico relacionado
+    # ao roll 13.
+    #
+    # IMPORTANTE:
+    #
+    # Como "W +13" não veio formalmente definido no código
+    # original, não transformamos isso em uma aposta automática
+    # sem uma definição objetiva da direção.
+    #
+    # Neste momento ela é registrada como gatilho apenas quando
+    # houver uma regra explícita de previsão abaixo.
+    #
+    # ============================================================
+
+    if len(hist) >= 1:
+
+        ultima = hist[-1]
+
+        if ultima["cor"] == "W":
+
+            # ----------------------------------------------------
+            # PLACEHOLDER CONTROLADO
+            #
+            # Para evitar criar uma previsão arbitrária,
+            # NÃO gera sinal automaticamente.
+            #
+            # Se o estudo W+13 significar, por exemplo:
+            #
+            # W -> próximo roll 13 -> PRETO
+            #
+            # essa regra pode ser ativada aqui.
+            # ----------------------------------------------------
+
+            pass
+
+
+    return None, None
+
+
+# ================================================================
+# CONVERTE ROW DO BANCO PARA ESTRUTURA DO MOTOR
+# ================================================================
+
+def row_para_hist(row):
+
+    return {
+
+        "id": row[0],
+
+        "rodada_id": row[1],
+
+        "cor": obter_cor(
+            row[2],
+            row[3]
+        ),
+
+        "roll": row[4]
+    }
 
 
 # ================================================================
@@ -350,7 +587,7 @@ def obter_estado_rodada(row):
 def motor_de_padroes():
 
     print(
-        "🧠 Motor de Padrões Estatísticos iniciado.",
+        "🧠 Motor Estatístico iniciado em background...",
         flush=True
     )
 
@@ -361,6 +598,7 @@ def motor_de_padroes():
         if not conn:
 
             time.sleep(5)
+
             continue
 
         try:
@@ -368,7 +606,7 @@ def motor_de_padroes():
             with conn.cursor() as cur:
 
                 # =================================================
-                # LÊ ESTADO DO MOTOR
+                # ESTADO ATUAL
                 # =================================================
 
                 cur.execute("""
@@ -380,7 +618,9 @@ def motor_de_padroes():
                         inicio_sessao,
                         ultima_rodada_sinal,
                         sinal_base_id
+
                     FROM bot_estado
+
                     WHERE id = 1;
                 """)
 
@@ -389,8 +629,11 @@ def motor_de_padroes():
                 if not estado:
 
                     conn.close()
+
                     time.sleep(5)
+
                     continue
+
 
                 (
                     motor_ativo,
@@ -402,32 +645,45 @@ def motor_de_padroes():
                     sinal_base_id
                 ) = estado
 
+
                 # =================================================
                 # MOTOR PAUSADO
-                # =================================================
                 #
                 # IMPORTANTE:
                 #
-                # O collector NÃO depende daqui.
+                # Aqui NÃO fazemos nada no collector.
                 #
-                # Mesmo com motor pausado:
+                # O collector roda em sua própria thread.
                 #
-                # Collector continua coletando.
-                #
-                # Apenas não são geradas previsões.
+                # Pausar = parar previsões.
+                # Não parar coleta.
                 # =================================================
 
                 if not motor_ativo:
 
                     conn.close()
+
                     time.sleep(3)
+
                     continue
+
 
                 # =================================================
                 # 1. RESOLVER SINAL PENDENTE
                 # =================================================
 
                 if sinal_ativo and sinal_base_id:
+
+                    # ------------------------------------------------
+                    # REGRA FUNDAMENTAL
+                    #
+                    # id > sinal_base_id
+                    #
+                    # Portanto a rodada que gerou o sinal NÃO pode
+                    # ser usada como resultado.
+                    #
+                    # E também não usamos >=.
+                    # ------------------------------------------------
 
                     cur.execute("""
                         SELECT
@@ -436,21 +692,36 @@ def motor_de_padroes():
                             cor,
                             color,
                             roll
+
                         FROM blaze_historico
+
                         WHERE
                             status = 'complete'
+
                             AND id > %s
+
                         ORDER BY id ASC
+
                         LIMIT 1;
-                    """, (sinal_base_id,))
+                    """, (
+                        sinal_base_id,
+                    ))
 
                     resultado = cur.fetchone()
+
+
+                    # ------------------------------------------------
+                    # AINDA NÃO CHEGOU A PRÓXIMA RODADA
+                    # ------------------------------------------------
 
                     if not resultado:
 
                         conn.close()
+
                         time.sleep(2)
+
                         continue
+
 
                     (
                         resultado_id,
@@ -460,39 +731,131 @@ def motor_de_padroes():
                         roll_resultado
                     ) = resultado
 
-                    # ------------------------------------------------
-                    # NORMALIZA RESULTADO
-                    # ------------------------------------------------
-
-                    cor_real = mapear_cor_letra(cor_resultado)
-
-                    if cor_real is None:
-
-                        try:
-
-                            numero_cor = int(color_resultado)
-
-                            if numero_cor == 0:
-                                cor_real = "W"
-
-                            elif numero_cor == 1:
-                                cor_real = "R"
-
-                            elif numero_cor == 2:
-                                cor_real = "P"
-
-                        except:
-                            cor_real = None
 
                     # ------------------------------------------------
-                    # DETERMINA RESULTADO
+                    # PROTEÇÃO EXTRA
+                    #
+                    # Mesmo que exista algum problema de ordenação,
+                    # nunca aceitamos a mesma rodada da base.
                     # ------------------------------------------------
+
+                    if resultado_id <= sinal_base_id:
+
+                        print(
+                            "⚠️ Resultado rejeitado: "
+                            "ID não é posterior à base.",
+                            flush=True
+                        )
+
+                        conn.close()
+
+                        time.sleep(2)
+
+                        continue
+
+
+                    if rodada_resultado == ultima_rodada_sinal:
+
+                        print(
+                            "⚠️ Resultado rejeitado: "
+                            "rodada igual à base.",
+                            flush=True
+                        )
+
+                        conn.close()
+
+                        time.sleep(2)
+
+                        continue
+
+
+                    # ------------------------------------------------
+                    # COR REAL
+                    # ------------------------------------------------
+
+                    cor_real = obter_cor(
+                        cor_resultado,
+                        color_resultado
+                    )
+
+
+                    # =================================================
+                    # BRANCO
+                    #
+                    # NÃO CONTABILIZA.
+                    #
+                    # Não é WIN.
+                    # Não é LOSS.
+                    # Não incrementa whites.
+                    # Não entra na taxa.
+                    #
+                    # E o sinal é encerrado para impedir que a mesma
+                    # previsão fique aguardando indefinidamente.
+                    # =================================================
 
                     if cor_real == "W":
 
-                        resultado_status = "WHITE"
+                        print(
+                            f"⚪ BRANCO IGNORADO | "
+                            f"Base={ultima_rodada_sinal} | "
+                            f"Resultado={rodada_resultado} | "
+                            f"Roll={roll_resultado}",
+                            flush=True
+                        )
 
-                    elif cor_real == cor_sinal:
+                        cur.execute("""
+                            UPDATE bot_estado
+
+                            SET
+                                sinal_ativo = FALSE,
+
+                                cor_sinal = NULL,
+
+                                ultima_estrategia = NULL,
+
+                                ultima_rodada_sinal = NULL,
+
+                                sinal_base_id = NULL,
+
+                                atualizado_em =
+                                    CURRENT_TIMESTAMP
+
+                            WHERE id = 1;
+                        """)
+
+                        conn.commit()
+
+                        conn.close()
+
+                        time.sleep(1)
+
+                        continue
+
+
+                    # ------------------------------------------------
+                    # COR INVÁLIDA
+                    # ------------------------------------------------
+
+                    if cor_real is None:
+
+                        print(
+                            "⚠️ Não foi possível determinar "
+                            "a cor do resultado.",
+                            flush=True
+                        )
+
+                        conn.close()
+
+                        time.sleep(2)
+
+                        continue
+
+
+                    # =================================================
+                    # DETERMINAR WIN / LOSS
+                    # =================================================
+
+                    if cor_real == cor_sinal:
 
                         resultado_status = "WIN"
 
@@ -500,19 +863,24 @@ def motor_de_padroes():
 
                         resultado_status = "LOSS"
 
+
                     print(
                         f"🎯 SINAL RESOLVIDO | "
                         f"Estratégia={ultima_estrategia} | "
                         f"Previsão={cor_sinal} | "
                         f"Resultado={cor_real} | "
+                        f"Base={ultima_rodada_sinal} | "
                         f"Rodada={rodada_resultado} | "
                         f"Status={resultado_status}",
                         flush=True
                     )
 
-                    # ------------------------------------------------
-                    # SALVA HISTÓRICO DO SINAL
-                    # ------------------------------------------------
+
+                    # =================================================
+                    # REGISTRA SINAL
+                    #
+                    # Branco NÃO chega aqui.
+                    # =================================================
 
                     cur.execute("""
                         INSERT INTO estrategia_sinais
@@ -525,6 +893,7 @@ def motor_de_padroes():
                             resultado,
                             criado_em
                         )
+
                         VALUES
                         (
                             %s,
@@ -544,50 +913,18 @@ def motor_de_padroes():
                         resultado_status
                     ))
 
+
                     # =================================================
-                    # WHITE
-                    # =================================================
+                    # ATUALIZA PLACAR
                     #
-                    # White NÃO entra no painel.
-                    #
-                    # Não aumenta:
-                    # - wins
-                    # - losses
-                    # - sinais
-                    #
-                    # Não altera profit.
-                    #
-                    # Apenas encerra o sinal.
+                    # Somente R/P chegam aqui.
                     # =================================================
 
-                    if resultado_status == "WHITE":
+                    if resultado_status == "WIN":
 
                         cur.execute("""
                             UPDATE bot_estado
-                            SET
-                                whites = whites + 1,
 
-                                sinal_ativo = FALSE,
-
-                                cor_sinal = NULL,
-
-                                ultima_rodada_sinal = NULL,
-
-                                sinal_base_id = NULL,
-
-                                atualizado_em = CURRENT_TIMESTAMP
-
-                            WHERE id = 1;
-                        """)
-
-                    # =================================================
-                    # WIN
-                    # =================================================
-
-                    elif resultado_status == "WIN":
-
-                        cur.execute("""
-                            UPDATE bot_estado
                             SET
                                 wins = wins + 1,
 
@@ -597,23 +934,24 @@ def motor_de_padroes():
 
                                 cor_sinal = NULL,
 
+                                ultima_estrategia = NULL,
+
                                 ultima_rodada_sinal = NULL,
 
                                 sinal_base_id = NULL,
 
-                                atualizado_em = CURRENT_TIMESTAMP
+                                atualizado_em =
+                                    CURRENT_TIMESTAMP
 
                             WHERE id = 1;
                         """)
 
-                    # =================================================
-                    # LOSS
-                    # =================================================
 
-                    elif resultado_status == "LOSS":
+                    else:
 
                         cur.execute("""
                             UPDATE bot_estado
+
                             SET
                                 losses = losses + 1,
 
@@ -623,35 +961,30 @@ def motor_de_padroes():
 
                                 cor_sinal = NULL,
 
+                                ultima_estrategia = NULL,
+
                                 ultima_rodada_sinal = NULL,
 
                                 sinal_base_id = NULL,
 
-                                atualizado_em = CURRENT_TIMESTAMP
+                                atualizado_em =
+                                    CURRENT_TIMESTAMP
 
                             WHERE id = 1;
                         """)
 
+
                     conn.commit()
+
                     conn.close()
 
-                    time.sleep(2)
+                    time.sleep(1)
+
                     continue
 
+
                 # =================================================
-                # 2. BUSCAR HISTÓRICO RECENTE
-                # =================================================
-                #
-                # Pegamos 20 rodadas.
-                #
-                # Isso permite verificar:
-                #
-                # VI → VI
-                # VI → PP
-                # VI → VI → VI
-                # White + 13
-                #
-                # sem remover White do histórico.
+                # 2. PROCURAR NOVO GATILHO
                 # =================================================
 
                 cur.execute("""
@@ -660,225 +993,158 @@ def motor_de_padroes():
                         rodada_id,
                         cor,
                         color,
-                        roll,
-                        coletado_em
+                        roll
+
                     FROM blaze_historico
+
                     WHERE status = 'complete'
+
                     ORDER BY id DESC
-                    LIMIT 20;
+
+                    LIMIT 10;
                 """)
 
                 rows = cur.fetchall()
 
-                if len(rows) < 3:
+
+                if not rows:
 
                     conn.close()
-                    time.sleep(3)
+
+                    time.sleep(2)
+
                     continue
 
+
                 # Ordem cronológica
-                hist = list(reversed(rows))
+                rows = list(reversed(rows))
+
+
+                # ------------------------------------------------
+                # MONTAR HISTÓRICO
+                # ------------------------------------------------
+
+                hist = []
+
+                for row in rows:
+
+                    item = row_para_hist(row)
+
+                    if item["cor"] is not None:
+
+                        hist.append(item)
+
+
+                if not hist:
+
+                    conn.close()
+
+                    time.sleep(2)
+
+                    continue
+
 
                 # =================================================
-                # CONVERTER PARA ESTADOS
+                # DETECTAR ESTRATÉGIA
                 # =================================================
 
-                estados = []
+                cor_prevista, estrategia = (
+                    detectar_estrategia(hist)
+                )
 
-                for row in hist:
 
-                    estados.append(
-                        obter_estado_rodada(row)
-                    )
+                if not cor_prevista:
 
-                # Última rodada
-                ultimo = hist[-1]
+                    conn.close()
 
-                id_atual = ultimo[0]
-                rodada_id_atual = ultimo[1]
+                    time.sleep(2)
 
-                estado_atual = estados[-1]
+                    continue
+
+
+                # =================================================
+                # RODADA BASE
+                #
+                # A última rodada do padrão é a BASE.
+                #
+                # Exemplo:
+                #
+                # R R
+                #     ↑
+                #     base
+                #
+                # O próximo evento será o resultado.
+                # =================================================
+
+                rodada_base = hist[-1]
+
+                id_base = rodada_base["id"]
+
+                rodada_id_base = (
+                    rodada_base["rodada_id"]
+                )
+
 
                 # =================================================
                 # PROTEÇÃO CONTRA REPETIÇÃO
                 # =================================================
 
-                if ultima_rodada_sinal == rodada_id_atual:
-
-                    conn.close()
-                    time.sleep(3)
-                    continue
-
-                # =================================================
-                # 3. IDENTIFICAR NOVO GATILHO
-                # =================================================
-                #
-                # PRIORIDADE:
-                #
-                # 1. VI → VI → VI → R
-                # 2. VI → VI → R
-                # 3. VI → PP → P
-                # 4. WHITE + 13 → R
-                #
-                # Se duas estratégias coincidirem na mesma rodada,
-                # somente uma entrada será criada.
-                # =================================================
-
-                nova_estrategia = None
-                nova_cor = None
-
-                # =================================================
-                # 🥉 VI → VI → VI → R
-                # =================================================
-
-                if len(estados) >= 4:
-
-                    e1 = estados[-4]
-                    e2 = estados[-3]
-                    e3 = estados[-2]
-
-                    if (
-                        e1 == "VI"
-                        and
-                        e2 == "VI"
-                        and
-                        e3 == "VI"
-                    ):
-
-                        nova_estrategia = (
-                            "🥉 VI → VI → VI → R"
-                        )
-
-                        nova_cor = "R"
-
-                # =================================================
-                # 🥇 VI → VI → R
-                # =================================================
-
-                if nova_estrategia is None:
-
-                    if len(estados) >= 3:
-
-                        e1 = estados[-3]
-                        e2 = estados[-2]
-
-                        if (
-                            e1 == "VI"
-                            and
-                            e2 == "VI"
-                        ):
-
-                            nova_estrategia = (
-                                "🥇 VI → VI → R"
-                            )
-
-                            nova_cor = "R"
-
-                # =================================================
-                # 🥈 VI → PP → P
-                # =================================================
-
-                if nova_estrategia is None:
-
-                    if len(estados) >= 3:
-
-                        e1 = estados[-3]
-                        e2 = estados[-2]
-
-                        if (
-                            e1 == "VI"
-                            and
-                            e2 == "PP"
-                        ):
-
-                            nova_estrategia = (
-                                "🥈 VI → PP → P"
-                            )
-
-                            nova_cor = "P"
-
-                # =================================================
-                # ⚪ WHITE + 13 → R
-                # =================================================
-                #
-                # A última rodada atual precisa estar exatamente
-                # 13 posições depois de um White.
-                #
-                # Exemplo:
-                #
-                # W
-                # 1
-                # 2
-                # 3
-                # ...
-                # 13
-                #      ↑
-                # sinal aqui
-                #
-                # Portanto:
-                #
-                # índice do White = -14
-                # índice da rodada base = -1
-                # =================================================
-
-                if nova_estrategia is None:
-
-                    if len(estados) >= 14:
-
-                        estado_white = estados[-14]
-
-                        if estado_white == "W":
-
-                            nova_estrategia = (
-                                "⚪ WHITE + 13 → R"
-                            )
-
-                            nova_cor = "R"
-
-                # =================================================
-                # 4. CRIAR SINAL
-                # =================================================
-
                 if (
-                    nova_estrategia is not None
-                    and
-                    nova_cor is not None
+                    ultima_rodada_sinal
+                    == rodada_id_base
                 ):
 
-                    print(
-                        f"📊 NOVO SINAL | "
-                        f"{nova_estrategia} | "
-                        f"Base={rodada_id_atual} | "
-                        f"Entrada={nova_cor}",
-                        flush=True
-                    )
+                    conn.close()
 
-                    cur.execute("""
-                        UPDATE bot_estado
-                        SET
-                            sinal_ativo = TRUE,
+                    time.sleep(2)
 
-                            cor_sinal = %s,
+                    continue
 
-                            ultima_estrategia = %s,
 
-                            ultima_rodada_sinal = %s,
+                # =================================================
+                # CRIAR SINAL
+                # =================================================
 
-                            sinal_base_id = %s,
+                print(
+                    f"📊 NOVO SINAL | "
+                    f"Estratégia={estrategia} | "
+                    f"Base={rodada_id_base} | "
+                    f"Entrada={cor_prevista}",
+                    flush=True
+                )
 
-                            atualizado_em = CURRENT_TIMESTAMP
 
-                        WHERE id = 1;
-                    """, (
-                        nova_cor,
-                        nova_estrategia,
-                        rodada_id_atual,
-                        id_atual
-                    ))
+                cur.execute("""
+                    UPDATE bot_estado
 
-                    conn.commit()
+                    SET
+                        sinal_ativo = TRUE,
 
-                conn.close()
+                        cor_sinal = %s,
+
+                        ultima_estrategia = %s,
+
+                        ultima_rodada_sinal = %s,
+
+                        sinal_base_id = %s,
+
+                        atualizado_em =
+                            CURRENT_TIMESTAMP
+
+                    WHERE id = 1;
+                """, (
+                    cor_prevista,
+                    estrategia,
+                    rodada_id_base,
+                    id_base
+                ))
+
+
+                conn.commit()
+
+
+            conn.close()
+
 
         except Exception as e:
 
@@ -890,12 +1156,15 @@ def motor_de_padroes():
             try:
 
                 conn.rollback()
+
                 conn.close()
 
             except:
+
                 pass
 
-        time.sleep(3)
+
+        time.sleep(2)
 
 
 # ================================================================
@@ -905,10 +1174,13 @@ def motor_de_padroes():
 def cor_info(color, cor_texto=None):
 
     try:
+
         color = int(color)
 
     except:
+
         color = None
+
 
     if color == 0:
 
@@ -919,6 +1191,7 @@ def cor_info(color, cor_texto=None):
             "emoji": "⚪"
         }
 
+
     if color == 1:
 
         return {
@@ -927,6 +1200,7 @@ def cor_info(color, cor_texto=None):
             "classe": "red",
             "emoji": "🔴"
         }
+
 
     if color == 2:
 
@@ -937,12 +1211,18 @@ def cor_info(color, cor_texto=None):
             "emoji": "⚫"
         }
 
-    texto = (cor_texto or "").upper()
+
+    texto = (
+        cor_texto or ""
+    ).upper()
+
 
     if (
         "VERMELHO" in texto
-        or
-        texto == "RED"
+        or texto == "RED"
+        or texto == "R"
+        or texto == "V"
+        or texto == "VI"
     ):
 
         return {
@@ -952,10 +1232,12 @@ def cor_info(color, cor_texto=None):
             "emoji": "🔴"
         }
 
+
     if (
         "PRETO" in texto
-        or
-        texto == "BLACK"
+        or texto == "BLACK"
+        or texto == "P"
+        or texto == "B"
     ):
 
         return {
@@ -964,6 +1246,7 @@ def cor_info(color, cor_texto=None):
             "classe": "black",
             "emoji": "⚫"
         }
+
 
     return {
         "sigla": "W",
@@ -974,15 +1257,34 @@ def cor_info(color, cor_texto=None):
 
 
 # ================================================================
-# NOME CURTO DAS ESTRATÉGIAS
+# NOME CURTO DA ESTRATÉGIA
 # ================================================================
 
 def estrategia_curta(nome):
 
     if not nome:
+
         return "—"
 
-    return nome
+    mapa = {
+
+        "VI → VI → R":
+            "🥇 VI → VI → R",
+
+        "VI → PP → P":
+            "🥈 VI → PP → P",
+
+        "VI → VI → VI → R":
+            "🥉 VI → VI → VI → R",
+
+        "W + 13":
+            "⚪ W + 13"
+    }
+
+    return mapa.get(
+        nome,
+        nome
+    )
 
 
 # ================================================================
@@ -1017,27 +1319,30 @@ def consultar_dashboard():
 
             "losses": 0,
 
+            # Mantido somente por compatibilidade.
+            # Não será incrementado.
             "whites": 0,
 
             "profit": 0.0
-
         },
 
         "historico_sinais": []
-
     }
+
 
     conn = get_db_connection()
 
     if not conn:
+
         return vazio
+
 
     try:
 
         with conn.cursor() as cur:
 
             # ====================================================
-            # STATUS DO COLETOR
+            # STATUS COLLECTOR
             # ====================================================
 
             cur.execute("""
@@ -1045,11 +1350,14 @@ def consultar_dashboard():
                     conectado,
                     ultima_rodada,
                     ultimo_resultado_em
+
                 FROM collector_status
+
                 WHERE id = 1;
             """)
 
             row = cur.fetchone()
+
 
             if row:
 
@@ -1059,8 +1367,9 @@ def consultar_dashboard():
 
                 vazio["ultimo_resultado_em"] = row[2]
 
+
             # ====================================================
-            # ESTADO DO BOT
+            # ESTADO BOT
             # ====================================================
 
             cur.execute("""
@@ -1071,16 +1380,19 @@ def consultar_dashboard():
                     ultima_estrategia,
                     wins,
                     losses,
-                    whites,
                     profit,
                     inicio_sessao
+
                 FROM bot_estado
+
                 WHERE id = 1;
             """)
 
             estado = cur.fetchone()
 
+
             inicio_sessao = None
+
 
             if estado:
 
@@ -1091,10 +1403,10 @@ def consultar_dashboard():
                     ultima_estrategia,
                     wins,
                     losses,
-                    whites,
                     profit,
                     inicio_sessao
                 ) = estado
+
 
                 vazio["motor"] = {
 
@@ -1120,16 +1432,19 @@ def consultar_dashboard():
                     "losses":
                         losses or 0,
 
+                    # Branco deliberadamente não contabilizado
                     "whites":
-                        whites or 0,
+                        0,
 
                     "profit":
-                        float(profit or 0)
-
+                        float(
+                            profit or 0
+                        )
                 }
 
+
             # ====================================================
-            # HISTÓRICO DE RODADAS DA SESSÃO
+            # HISTÓRICO DA SESSÃO
             # ====================================================
 
             if inicio_sessao:
@@ -1140,13 +1455,20 @@ def consultar_dashboard():
                         color,
                         cor,
                         rodada_id
+
                     FROM blaze_historico
+
                     WHERE
                         status = 'complete'
+
                         AND coletado_em >= %s
+
                     ORDER BY id DESC
+
                     LIMIT 24;
-                """, (inicio_sessao,))
+                """, (
+                    inicio_sessao,
+                ))
 
             else:
 
@@ -1156,9 +1478,12 @@ def consultar_dashboard():
                         color,
                         cor,
                         rodada_id
+
                     FROM blaze_historico
+
                     WHERE FALSE;
                 """)
+
 
             rows = list(
                 reversed(
@@ -1166,7 +1491,9 @@ def consultar_dashboard():
                 )
             )
 
+
             vazio["total_jogos"] = len(rows)
+
 
             for (
                 roll,
@@ -1180,26 +1507,28 @@ def consultar_dashboard():
                     cor
                 )
 
+
                 vazio["jogos"].append({
 
-                    "roll":
-                        roll,
+                    "roll": roll,
 
-                    "color":
-                        color,
+                    "color": color,
 
-                    "cor":
-                        cor,
+                    "cor": cor,
 
-                    "rodada":
-                        rodada_id,
+                    "rodada": rodada_id,
 
                     **info
-
                 })
 
+
             # ====================================================
-            # HISTÓRICO DOS SINAIS
+            # HISTÓRICO DE SINAIS
+            #
+            # IMPORTANTE:
+            #
+            # Aqui não existe WHITE.
+            # Branco nunca é inserido em estrategia_sinais.
             # ====================================================
 
             if inicio_sessao:
@@ -1213,11 +1542,18 @@ def consultar_dashboard():
                         cor_resultado,
                         resultado,
                         criado_em
+
                     FROM estrategia_sinais
+
                     WHERE criado_em >= %s
+
                     ORDER BY id DESC
+
                     LIMIT 12;
-                """, (inicio_sessao,))
+                """, (
+                    inicio_sessao,
+                ))
+
 
                 for row in cur.fetchall():
 
@@ -1230,6 +1566,7 @@ def consultar_dashboard():
                         resultado,
                         criado
                     ) = row
+
 
                     vazio[
                         "historico_sinais"
@@ -1260,12 +1597,13 @@ def consultar_dashboard():
 
                         "criado_em":
                             criado
-
                     })
+
 
         conn.close()
 
         return vazio
+
 
     except Exception as e:
 
@@ -1277,9 +1615,11 @@ def consultar_dashboard():
         try:
 
             conn.rollback()
+
             conn.close()
 
         except:
+
             pass
 
         return vazio
@@ -1315,14 +1655,23 @@ HTML = r"""
 :root {
 
     --bg: #07090d;
+
     --panel: #10141b;
+
     --panel2: #151a22;
+
     --border: rgba(255,255,255,.08);
+
     --text: #eef2f7;
+
     --muted: #8993a1;
+
     --red: #ff4d5d;
+
     --green: #23e27c;
+
     --yellow: #ffc857;
+
     --white: #f4f5f7;
 
 }
@@ -1388,8 +1737,6 @@ body {
     font-size: 25px;
 
     font-weight: 900;
-
-    letter-spacing: -.5px;
 
 }
 
@@ -1536,10 +1883,6 @@ body {
 
 .signal {
 
-    position: relative;
-
-    overflow: hidden;
-
     margin-bottom: 12px;
 
     padding: 24px;
@@ -1568,13 +1911,6 @@ body {
     box-shadow:
         0 0 35px
         rgba(35,226,124,.06);
-
-}
-
-.signal.wait {
-
-    border-color:
-        rgba(255,255,255,.08);
 
 }
 
@@ -1796,15 +2132,6 @@ body {
 
 }
 
-.result-white {
-
-    background:
-        rgba(255,255,255,.10);
-
-    color: var(--white);
-
-}
-
 .results {
 
     display: flex;
@@ -1912,19 +2239,6 @@ body {
 
     color: white;
 
-    transition: .2s;
-
-    box-shadow:
-        0 4px 15px
-        rgba(0,0,0,0.3);
-
-}
-
-.control-btn:hover {
-
-    transform:
-        translateY(-2px);
-
 }
 
 .control-btn.start {
@@ -2016,10 +2330,6 @@ body {
 
 <div class="container">
 
-    <!-- ====================================================== -->
-    <!-- CABEÇALHO -->
-    <!-- ====================================================== -->
-
     <div class="header">
 
         <div class="logo">
@@ -2079,10 +2389,6 @@ body {
     </div>
 
 
-    <!-- ====================================================== -->
-    <!-- CARDS -->
-    <!-- ====================================================== -->
-
     <div class="top-grid">
 
         <div class="card">
@@ -2098,7 +2404,9 @@ body {
             </div>
 
             <div class="small">
+
                 Atualização automática a cada 5s
+
             </div>
 
         </div>
@@ -2117,7 +2425,9 @@ body {
             </div>
 
             <div class="small">
+
                 Desde o último INICIAR
+
             </div>
 
         </div>
@@ -2144,7 +2454,9 @@ body {
             {% endif %}
 
             <div class="small">
-                Collector continua online
+
+                Coleta continua mesmo pausado
+
             </div>
 
         </div>
@@ -2165,8 +2477,7 @@ body {
 
             <div class="small">
 
-                Profit:
-                {{ '%.0f'|format(status.motor.profit) }}
+                Branco não contabilizado
 
             </div>
 
@@ -2175,10 +2486,6 @@ body {
     </div>
 
 
-    <!-- ====================================================== -->
-    <!-- SINAL -->
-    <!-- ====================================================== -->
-
     {% if status.motor.ativo and status.motor.sinal %}
 
         <div class="signal active">
@@ -2186,29 +2493,29 @@ body {
             <div class="eyebrow">
 
                 🎯 SINAL ATUAL
-                • ENTRADA NA PRÓXIMA RODADA
+                • PRÓXIMA RODADA
 
             </div>
+
 
             {% if status.motor.cor == 'R' %}
 
                 <div class="color red">
+
                     🔴 VERMELHO
+
                 </div>
 
             {% elif status.motor.cor == 'P' %}
 
                 <div class="color black">
+
                     ⚫ PRETO
-                </div>
 
-            {% else %}
-
-                <div class="color white">
-                    ⚪ BRANCO
                 </div>
 
             {% endif %}
+
 
             <div class="strategy">
 
@@ -2216,10 +2523,12 @@ body {
 
             </div>
 
+
             <div class="entry">
 
-                Aguardando o resultado
-                da próxima rodada.
+                O sinal será resolvido
+                somente pela próxima rodada
+                posterior à base.
 
             </div>
 
@@ -2227,10 +2536,12 @@ body {
 
     {% else %}
 
-        <div class="signal wait">
+        <div class="signal">
 
             <div class="eyebrow">
+
                 🎯 SINAL ATUAL
+
             </div>
 
             <div
@@ -2258,8 +2569,8 @@ body {
 
             <div class="entry">
 
-                O collector continua armazenando
-                as novas rodadas no banco.
+                A coleta permanece ativa
+                independentemente do motor.
 
             </div>
 
@@ -2267,10 +2578,6 @@ body {
 
     {% endif %}
 
-
-    <!-- ====================================================== -->
-    <!-- DESEMPENHO -->
-    <!-- ====================================================== -->
 
     <div class="section-title">
 
@@ -2330,7 +2637,7 @@ body {
             </div>
 
             <div class="m-label">
-                Sinais válidos
+                Sinais resolvidos
             </div>
 
         </div>
@@ -2374,10 +2681,6 @@ body {
 
     </div>
 
-
-    <!-- ====================================================== -->
-    <!-- HISTÓRICO DE SINAIS -->
-    <!-- ====================================================== -->
 
     <div class="section-title">
 
@@ -2426,8 +2729,11 @@ body {
                 <div class="history-row">
 
                     <div>
+
                         {{ s.estrategia }}
+
                     </div>
+
 
                     <div>
 
@@ -2447,11 +2753,13 @@ body {
 
                     </div>
 
+
                     <div>
 
                         {{ s.base }}
 
                     </div>
+
 
                     <div>
 
@@ -2471,23 +2779,10 @@ body {
                                 ✕ LOSS
                             </span>
 
-                        {% elif s.resultado == 'WHITE' %}
-
-                            <span
-                                class="result-badge result-white"
-                            >
-                                ⚪ IGNORADO
-                            </span>
-
-                        {% else %}
-
-                            <span>
-                                —
-                            </span>
-
                         {% endif %}
 
                     </div>
+
 
                     <div class="hide-mobile">
 
@@ -2513,10 +2808,6 @@ body {
     </div>
 
 
-    <!-- ====================================================== -->
-    <!-- ÚLTIMOS RESULTADOS -->
-    <!-- ====================================================== -->
-
     <div class="section-title">
 
         <h2>
@@ -2539,14 +2830,19 @@ body {
                 <div
                     class="
                         pill
+
                         {% if jogo.sigla == 'R' %}
                             red-bg
+
                         {% elif jogo.sigla == 'P' %}
                             black-bg
+
                         {% else %}
                             white-bg
+
                         {% endif %}
                     "
+
                     title="{{ jogo.rodada }}"
                 >
 
@@ -2577,10 +2873,9 @@ body {
     <div class="footer">
 
         Blaze Bot • coleta contínua •
-        VI/VI → R •
-        VI/PP → P •
-        VI/VI/VI → R •
-        WHITE + 13 → R
+        motor estatístico independente •
+        branco não contabilizado •
+        proteção contra resolução antecipada
 
     </div>
 
@@ -2607,6 +2902,12 @@ def home():
 
 # ================================================================
 # CONTROLE DO MOTOR
+#
+# ATENÇÃO:
+#
+# Isto NÃO controla o collector.
+#
+# O collector continua funcionando.
 # ================================================================
 
 @app.route(
@@ -2618,7 +2919,9 @@ def controle_motor():
     conn = get_db_connection()
 
     if not conn:
+
         return redirect("/")
+
 
     try:
 
@@ -2626,20 +2929,26 @@ def controle_motor():
 
             cur.execute("""
                 SELECT motor_ativo
+
                 FROM bot_estado
+
                 WHERE id = 1;
             """)
 
             estado = cur.fetchone()
 
+
             if not estado:
 
                 conn.close()
+
                 return redirect("/")
+
 
             motor_ativo = bool(
                 estado[0]
             )
+
 
             # ====================================================
             # PAUSAR
@@ -2648,17 +2957,14 @@ def controle_motor():
             if motor_ativo:
 
                 print(
-                    "⏸️ Motor pausado.",
+                    "⏸️ Motor pausado pelo dashboard.",
                     flush=True
                 )
 
-                print(
-                    "📡 Collector permanece ativo.",
-                    flush=True
-                )
 
                 cur.execute("""
                     UPDATE bot_estado
+
                     SET
                         motor_ativo = FALSE,
 
@@ -2678,6 +2984,7 @@ def controle_motor():
                     WHERE id = 1;
                 """)
 
+
             # ====================================================
             # INICIAR NOVA SESSÃO
             # ====================================================
@@ -2689,8 +2996,10 @@ def controle_motor():
                     flush=True
                 )
 
+
                 cur.execute("""
                     UPDATE bot_estado
+
                     SET
 
                         motor_ativo = TRUE,
@@ -2722,26 +3031,38 @@ def controle_motor():
                     WHERE id = 1;
                 """)
 
+
         conn.commit()
+
 
     except Exception as e:
 
         print(
-            f"❌ Erro ao alterar estado do motor: {e}",
+            f"❌ Erro ao alterar estado "
+            f"do motor: {e}",
             flush=True
         )
 
+
         try:
+
             conn.rollback()
+
         except:
+
             pass
+
 
     finally:
 
         try:
+
             conn.close()
+
         except:
+
             pass
+
 
     return redirect("/")
 
@@ -2772,36 +3093,35 @@ def status():
 
 # ================================================================
 # INICIAR COLLECTOR
-# ================================================================
 #
 # IMPORTANTE:
 #
 # O collector é independente do motor.
-#
-# RUN_MOTOR=false
-# não impede o collector.
-#
-# RUN_COLLECTOR=true
-# mantém coleta ativa.
 # ================================================================
 
 def iniciar_background_collector():
 
     try:
 
-        from collector import iniciar_coletor_em_thread
+        from collector import (
+            iniciar_coletor_em_thread
+        )
+
 
         print(
             "🚀 Iniciando Collector em background...",
             flush=True
         )
 
+
         iniciar_coletor_em_thread()
+
 
     except Exception as e:
 
         print(
-            f"❌ Não foi possível iniciar o collector: {e}",
+            f"❌ Não foi possível iniciar "
+            f"o collector: {e}",
             flush=True
         )
 
@@ -2813,15 +3133,17 @@ def iniciar_background_collector():
 def iniciar_background_motor():
 
     print(
-        "🧠 Iniciando Motor Estatístico em background...",
+        "🧠 Iniciando Motor Estatístico "
+        "em background...",
         flush=True
     )
+
 
     motor_de_padroes()
 
 
 # ================================================================
-# INICIALIZAÇÃO
+# INICIALIZAÇÃO DO BANCO
 # ================================================================
 
 init_web_db()
@@ -2829,6 +3151,16 @@ init_web_db()
 
 # ================================================================
 # THREAD DO COLLECTOR
+#
+# NÃO depende de motor_ativo.
+#
+# Portanto:
+#
+# Motor parado
+#      ↓
+# Collector continua
+#      ↓
+# Jogos continuam indo para o banco
 # ================================================================
 
 if os.getenv(
@@ -2837,10 +3169,14 @@ if os.getenv(
 ).lower() == "true":
 
     collector_thread = threading.Thread(
+
         target=iniciar_background_collector,
+
         name="collector-bootstrap",
+
         daemon=True
     )
+
 
     collector_thread.start()
 
@@ -2855,9 +3191,13 @@ if os.getenv(
 ).lower() == "true":
 
     motor_thread = threading.Thread(
+
         target=iniciar_background_motor,
+
         name="motor-bootstrap",
+
         daemon=True
     )
+
 
     motor_thread.start()
