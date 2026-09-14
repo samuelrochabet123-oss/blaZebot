@@ -125,13 +125,15 @@ def init_engine_db():
 
 def get_active_signal(rolls, colors):
     """
-    Motor NOVO. Não gera EST 1, EST 2, EST 3, EST 4 ou EST 5.
+    Motor atualizado para teste com 6 estratégias.
 
     Estratégias ativas:
       1) VI → VI → R
       2) VI → PP → P
       3) VI → VI → VI → R
       4) ⚪ WHITE + 13 → R
+      5) EST 3 (Franco-Atirador) [TESTE]
+      6) EST 5 (Mina Oculta) [TESTE]
 
     Convenção:
       R = vermelho
@@ -141,6 +143,10 @@ def get_active_signal(rolls, colors):
     WHITE + 13:
       W imediatamente seguido por uma rodada com roll 13
       gera previsão R para a próxima rodada.
+
+    EST 3 e EST 5:
+      entram como fallback após as quatro estratégias atuais,
+      pois o motor mantém apenas um sinal ativo por vez.
     """
     rolls = list(rolls)
     colors = list(colors)
@@ -164,6 +170,50 @@ def get_active_signal(rolls, colors):
     # 4) Branco + rodada com roll 13 -> vermelho.
     if colors[-2] == "W" and rolls[-1] == 13:
         return ("⚪ WHITE + 13 → R", "R")
+
+    # ============================================================
+    # 5) EST 3 — FRANCO-ATIRADOR (TESTE)
+    # Regras do motor original. No motor atual, P = preto.
+    # ============================================================
+    if n >= 5:
+        last_5 = colors[-5:]
+
+        if last_5 == ["R", "R", "R", "P", "R"]:
+            return ("EST 3 (Franco-Atirador)", "R")
+
+        if last_5 == ["R", "R", "P", "P", "R"]:
+            return ("EST 3 (Franco-Atirador)", "R")
+
+        if last_5 == ["P", "R", "P", "R", "R"]:
+            return ("EST 3 (Franco-Atirador)", "P")
+
+        if last_5 == ["R", "R", "R", "P", "P"]:
+            return ("EST 3 (Franco-Atirador)", "R")
+
+    # ============================================================
+    # 6) EST 5 — MINA OCULTA (TESTE)
+    # Regras do motor original. No motor atual, P = preto.
+    # ============================================================
+    if n >= 6:
+        last_6 = colors[-6:]
+
+        if last_6 == ["R", "P", "R", "R", "P", "P"]:
+            return ("EST 5 (Mina Oculta)", "P")
+
+        if last_6 == ["P", "R", "P", "R", "P", "P"]:
+            return ("EST 5 (Mina Oculta)", "P")
+
+        if last_6 == ["R", "R", "P", "R", "R", "P"]:
+            return ("EST 5 (Mina Oculta)", "P")
+
+        if last_6 == ["R", "P", "P", "R", "R", "R"]:
+            return ("EST 5 (Mina Oculta)", "R")
+
+        if last_6 == ["P", "P", "P", "R", "P", "R"]:
+            return ("EST 5 (Mina Oculta)", "R")
+
+        if last_6 == ["R", "R", "R", "R", "P", "R"]:
+            return ("EST 5 (Mina Oculta)", "R")
 
     return None
 
@@ -471,3 +521,5 @@ if __name__ == "__main__":
         print("   2. VI → PP → P")
         print("   3. VI → VI → VI → R")
         print("   4. ⚪ WHITE + 13 → R")
+        print("   5. EST 3 (Franco-Atirador) [TESTE]")
+        print("   6. EST 5 (Mina Oculta) [TESTE]")
