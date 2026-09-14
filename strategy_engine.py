@@ -6,42 +6,24 @@ import psycopg2
 
 APOSTA_BASE = 1.00
 
+CORES = {0: "BRANCO", 1: "VERMELHO", 2: "PRETO"}
+COR_SIGLA = {"BRANCO": "W", "VERMELHO": "R", "PRETO": "P"}
 
-CORES = {
-    0: "BRANCO",
-    1: "VERMELHO",
-    2: "PRETO",
-}
-
-
-# Convenção única do motor:
-# R = vermelho
-# P = preto
-# W = branco
-COR_SIGLA = {
-    "BRANCO": "W",
-    "VERMELHO": "R",
-    "PRETO": "P",
-}
+RESULTADO_PENDENTE = "PENDENTE"
+RESULTADO_WIN = "WIN"
+RESULTADO_LOSS = "LOSS"
 
 
 def get_db_connection():
     database_url = os.getenv("DATABASE_URL")
-
     if not database_url:
         print("❌ MOTOR: DATABASE_URL não configurada.")
         return None
-
     try:
         if "sslmode=" not in database_url:
             separator = "&" if "?" in database_url else "?"
             database_url = f"{database_url}{separator}sslmode=require"
-
-        return psycopg2.connect(
-            database_url,
-            connect_timeout=15
-        )
-
+        return psycopg2.connect(database_url, connect_timeout=15)
     except Exception as e:
         print(f"❌ MOTOR: erro PostgreSQL: {e}")
         return None
@@ -49,16 +31,10 @@ def get_db_connection():
 
 def init_engine_db():
     conn = get_db_connection()
-
     if not conn:
         return False
-
     try:
         with conn.cursor() as cur:
-
-            # ========================================================
-            # BOT ESTADO
-            # ========================================================
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS bot_estado (
                     id INTEGER PRIMARY KEY,
@@ -75,7 +51,6 @@ def init_engine_db():
                     atualizado_em TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 );
             """)
-
             columns = [
                 ("wins", "INTEGER DEFAULT 0"),
                 ("losses", "INTEGER DEFAULT 0"),
@@ -89,39 +64,16 @@ def init_engine_db():
                 ("ultima_estrategia", "VARCHAR(150)"),
                 ("atualizado_em", "TIMESTAMP DEFAULT CURRENT_TIMESTAMP"),
             ]
-
             for name, definition in columns:
-                cur.execute(
-                    f"""
-                    ALTER TABLE bot_estado
-                    ADD COLUMN IF NOT EXISTS {name} {definition};
-                    """
-                )
+                cur.execute(f"ALTER TABLE bot_estado ADD COLUMN IF NOT EXISTS {name} {definition};")
 
             cur.execute("""
                 INSERT INTO bot_estado
-                    (
-                        id,
-                        wins,
-                        losses,
-                        whites,
-                        profit,
-                        motor_ativo
-                    )
-                VALUES (
-                    1,
-                    0,
-                    0,
-                    0,
-                    0.00,
-                    TRUE
-                )
+                    (id, wins, losses, whites, profit, motor_ativo)
+                VALUES (1, 0, 0, 0, 0.00, TRUE)
                 ON CONFLICT (id) DO NOTHING;
             """)
 
-            # ========================================================
-            # ESTRATÉGIA SINAIS
-            # ========================================================
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS estrategia_sinais (
                     id SERIAL PRIMARY KEY,
@@ -135,826 +87,623 @@ def init_engine_db():
                     resolvido_em TIMESTAMP
                 );
             """)
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_estrategia_sinais_base ON estrategia_sinais(rodada_base);")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_estrategia_sinais_estrategia ON estrategia_sinais(estrategia);")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_estrategia_sinais_resultado ON estrategia_sinais(resultado);")
 
+            # Regra operacional: WHITE contra aposta R/P = LOSS.
+            # Normaliza registros antigos para não criar uma terceira categoria.
             cur.execute("""
-                CREATE INDEX IF NOT EXISTS idx_estrategia_sinais_base
-                ON estrategia_sinais(rodada_base);
-            """)
-
-            cur.execute("""
-                CREATE INDEX IF NOT EXISTS idx_estrategia_sinais_estrategia
-                ON estrategia_sinais(estrategia);
+                UPDATE estrategia_sinais
+                SET resultado = 'LOSS'
+                WHERE resultado = 'WHITE';
             """)
 
         conn.commit()
         conn.close()
-
         return True
-
     except Exception as e:
         print(f"❌ MOTOR: erro inicializando banco: {e}")
-
         try:
             conn.rollback()
             conn.close()
         except Exception:
             pass
-
         return False
 
 
+def cor_para_sigla(color):
+    try:
+        return COR_SIGLA.get(CORES.get(int(color)))
+    except (TypeError, ValueError):
+        return None
+
+
+def carregar_historico(conn, ate_id=None):
+    """Carrega apenas rodadas completas e, quando solicitado, apenas até ate_id."""
+    with conn.cursor() as cur:
+        if ate_id is None:
+            cur.execute("""
+                SELECT id, rodada_id, color, roll
+                FROM blaze_historico
+                WHERE status = 'complete'
+                  AND color IN (0, 1, 2)
+                  AND roll IS NOT NULL
+                ORDER BY id ASC;
+            """)
+        else:
+            cur.execute("""
+                SELECT id, rodada_id, color, roll
+                FROM blaze_historico
+                WHERE status = 'complete'
+                  AND color IN (0, 1, 2)
+                  AND roll IS NOT NULL
+                  AND id <= %s
+                ORDER BY id ASC;
+            """, (ate_id,))
+        rows = cur.fetchall()
+
+    ids, rodadas, rolls, colors = [], [], [], []
+    for db_id, rodada_id, color, roll in rows:
+        try:
+            color, roll = int(color), int(roll)
+        except (TypeError, ValueError):
+            continue
+        sigla = cor_para_sigla(color)
+        if sigla is None:
+            continue
+        ids.append(int(db_id))
+        rodadas.append(str(rodada_id))
+        rolls.append(roll)
+        colors.append(sigla)
+    return ids, rodadas, rolls, colors
+
+
 def get_active_signal(rolls, colors):
-    """
-    MOTOR DE ESTRATÉGIAS — MODO OUSADO
-
-    Estratégias ativas:
-
-      1) PRR → R
-      2) RRPP → R
-      3) RRP → P
-      4) VI → PP → P
-      5) VI → VI → R
-      6) VI → VI → VI → R
-      7) ⚪ WHITE + 13 → R
-      8) EST 3 (Franco-Atirador)
-      9) EST 5 (Mina Oculta)
-
-    Convenção:
-      R = vermelho
-      P = preto
-      W = branco
-
-    O motor mantém apenas UM sinal ativo por vez.
-
-    Portanto, quando duas ou mais estratégias podem disparar
-    simultaneamente, a ordem abaixo define a prioridade.
-
-    NOVAS ESTRATÉGIAS:
-
-      PRR → R
-        P, R, R
-        Previsão: R
-
-      RRPP → R
-        R, R, P, P
-        Previsão: R
-
-      RRP → P
-        R, R, P
-        Previsão: P
-
-    RRPP vem antes de RRP porque RRPP é uma sequência
-    mais específica e também termina em RRP.
-
-    WHITE + 13:
-
-      W imediatamente seguido por uma rodada com roll 13
-      gera previsão R para a próxima rodada.
-    """
-
+    """Detecta uma única estratégia respeitando a prioridade definida."""
     rolls = list(rolls)
     colors = list(colors)
-
     n = len(colors)
-
     if n < 2:
         return None
 
-    # ============================================================
-    # 1) NOVA — PRR → R
-    #
-    # Sequência:
-    #
-    # P → R → R
-    #
-    # Previsão:
-    #
-    # R
-    #
-    # Histórico da validação:
-    # estratégia considerada forte para paper trading.
-    # ============================================================
+    # 1) PRR -> R
     if n >= 3 and colors[-3:] == ["P", "R", "R"]:
         return ("PRR → R", "R")
 
-    # ============================================================
-    # 2) NOVA — RRPP → R
-    #
-    # Sequência:
-    #
-    # R → R → P → P
-    #
-    # Previsão:
-    #
-    # R
-    #
-    # IMPORTANTE:
-    # Deve vir antes de RRP → P porque:
-    #
-    # R R P P
-    #     ^^^
-    #     RRP
-    #
-    # Caso contrário, RRP ganharia prioridade.
-    # ============================================================
+    # 2) RRPP -> R (antes de RRP, pois RRP é sufixo de RRPP)
     if n >= 4 and colors[-4:] == ["R", "R", "P", "P"]:
         return ("RRPP → R", "R")
 
-    # ============================================================
-    # 3) NOVA — RRP → P
-    #
-    # Sequência:
-    #
-    # R → R → P
-    #
-    # Previsão:
-    #
-    # P
-    #
-    # Histórico da validação:
-    # uma das estratégias com melhor desempenho.
-    # ============================================================
+    # 3) RRP -> P
     if n >= 3 and colors[-3:] == ["R", "R", "P"]:
         return ("RRP → P", "P")
 
-    # ============================================================
-    # 4) VI → PP → P
-    #
-    # Sequência:
-    #
-    # R → P → P
-    #
-    # Previsão:
-    #
-    # P
-    # ============================================================
+    # 4) VI -> VI -> R
+    if colors[-2:] == ["R", "R"]:
+        return ("VI → VI → R", "R")
+
+    # 5) VI -> PP -> P
     if n >= 3 and colors[-3:] == ["R", "P", "P"]:
         return ("VI → PP → P", "P")
 
-    # ============================================================
-    # 5) VI → VI → R
-    #
-    # Dois vermelhos consecutivos.
-    #
-    # R → R
-    #
-    # Previsão:
-    #
-    # R
-    # ============================================================
-    if n >= 2 and colors[-2:] == ["R", "R"]:
-        return ("VI → VI → R", "R")
-
-    # ============================================================
-    # 6) VI → VI → VI → R
-    #
-    # Três vermelhos consecutivos.
-    #
-    # R → R → R
-    #
-    # Previsão:
-    #
-    # R
-    #
-    # OBSERVAÇÃO:
-    #
-    # Esta estratégia é estruturalmente sombreada pela regra
-    # anterior VI → VI → R.
-    #
-    # Quando temos:
-    #
-    # R R R
-    #
-    # o final também contém:
-    #
-    # R R
-    #
-    # Como VI → VI → R está acima, ela será escolhida.
-    #
-    # Mantemos a regra registrada para preservar o comportamento
-    # original do motor.
-    # ============================================================
+    # 6) VI -> VI -> VI -> R
+    # Fica depois de R,R para preservar a prioridade do motor.
     if n >= 3 and colors[-3:] == ["R", "R", "R"]:
         return ("VI → VI → VI → R", "R")
 
-    # ============================================================
-    # 7) WHITE + 13 → R
-    #
-    # Sequência:
-    #
-    # W + rodada cujo roll = 13
-    #
-    # Previsão:
-    #
-    # R
-    #
-    # Exemplo:
-    #
-    # rodada anterior = W
-    # rodada atual     = qualquer cor com roll 13
-    # próxima rodada   = R
-    # ============================================================
-    if (
-        n >= 2
-        and colors[-2] == "W"
-        and rolls[-1] == 13
-    ):
+    # 7) WHITE + 13 -> R
+    if n >= 2 and colors[-2] == "W" and rolls[-1] == 13:
         return ("⚪ WHITE + 13 → R", "R")
 
-    # ============================================================
-    # 8) EST 3 — FRANCO-ATIRADOR
-    #
-    # Regras originais.
-    # ============================================================
+    # 8) EST 3 — Franco-Atirador
     if n >= 5:
         last_5 = colors[-5:]
-
-        # R R R P R -> R
         if last_5 == ["R", "R", "R", "P", "R"]:
-            return (
-                "EST 3 (Franco-Atirador)",
-                "R"
-            )
-
-        # R R P P R -> R
+            return ("EST 3 (Franco-Atirador)", "R")
         if last_5 == ["R", "R", "P", "P", "R"]:
-            return (
-                "EST 3 (Franco-Atirador)",
-                "R"
-            )
-
-        # P R P R R -> P
+            return ("EST 3 (Franco-Atirador)", "R")
         if last_5 == ["P", "R", "P", "R", "R"]:
-            return (
-                "EST 3 (Franco-Atirador)",
-                "P"
-            )
-
-        # R R R P P -> R
+            return ("EST 3 (Franco-Atirador)", "P")
         if last_5 == ["R", "R", "R", "P", "P"]:
-            return (
-                "EST 3 (Franco-Atirador)",
-                "R"
-            )
+            return ("EST 3 (Franco-Atirador)", "R")
 
-    # ============================================================
-    # 9) EST 5 — MINA OCULTA
-    #
-    # Regras originais.
-    # ============================================================
+    # 9) EST 5 — Mina Oculta
     if n >= 6:
         last_6 = colors[-6:]
-
-        # R P R R P P -> P
         if last_6 == ["R", "P", "R", "R", "P", "P"]:
-            return (
-                "EST 5 (Mina Oculta)",
-                "P"
-            )
-
-        # P R P R P P -> P
+            return ("EST 5 (Mina Oculta)", "P")
         if last_6 == ["P", "R", "P", "R", "P", "P"]:
-            return (
-                "EST 5 (Mina Oculta)",
-                "P"
-            )
-
-        # R R P R R P -> P
+            return ("EST 5 (Mina Oculta)", "P")
         if last_6 == ["R", "R", "P", "R", "R", "P"]:
-            return (
-                "EST 5 (Mina Oculta)",
-                "P"
-            )
-
-        # R P P R R R -> R
+            return ("EST 5 (Mina Oculta)", "P")
         if last_6 == ["R", "P", "P", "R", "R", "R"]:
-            return (
-                "EST 5 (Mina Oculta)",
-                "R"
-            )
-
-        # P P P R P R -> R
+            return ("EST 5 (Mina Oculta)", "R")
         if last_6 == ["P", "P", "P", "R", "P", "R"]:
-            return (
-                "EST 5 (Mina Oculta)",
-                "R"
-            )
-
-        # R R R R P R -> R
+            return ("EST 5 (Mina Oculta)", "R")
         if last_6 == ["R", "R", "R", "R", "P", "R"]:
-            return (
-                "EST 5 (Mina Oculta)",
-                "R"
-            )
+            return ("EST 5 (Mina Oculta)", "R")
 
     return None
 
 
-def carregar_historico(conn):
-    with conn.cursor() as cur:
-        cur.execute("""
-            SELECT rodada_id, color, roll
-            FROM blaze_historico
-            WHERE status = 'complete'
-              AND color IN (0, 1, 2)
-              AND roll IS NOT NULL
-            ORDER BY id ASC;
-        """)
-
-        rows = cur.fetchall()
-
-    rodadas = []
-    rolls = []
-    colors = []
-
-    for rodada_id, color, roll in rows:
-        try:
-            color = int(color)
-            roll = int(roll)
-
-        except Exception:
-            continue
-
-        sigla = COR_SIGLA.get(
-            CORES.get(color)
-        )
-
-        if sigla is None:
-            continue
-
-        rodadas.append(str(rodada_id))
-        rolls.append(roll)
-        colors.append(sigla)
-
-    return rodadas, rolls, colors
+def _resultado_do_sinal(cor_prevista, cor_resultado):
+    """R/P correto = WIN; qualquer outro resultado, inclusive W, = LOSS."""
+    return RESULTADO_WIN if cor_resultado == cor_prevista else RESULTADO_LOSS
 
 
-def liquidar_sinal_atual(
+def resolver_sinal_por_rodada(
     cur,
-    rodada_id,
+    sinal_id,
+    rodada_base,
+    estrategia,
+    cor_prevista,
+    base_db_id,
+    resultado_db_id,
+    rodada_resultado,
     cor_resultado,
-    now
+    now,
 ):
+    resultado = _resultado_do_sinal(cor_prevista, cor_resultado)
     cur.execute("""
-        SELECT
-            sinal_ativo,
-            cor_sinal,
-            rodada_base_sinal,
-            wins,
-            losses,
-            whites,
-            profit
-        FROM bot_estado
-        WHERE id = 1;
-    """)
+        UPDATE estrategia_sinais
+        SET rodada_resultado = %s,
+            cor_resultado = %s,
+            resultado = %s,
+            resolvido_em = %s
+        WHERE id = %s
+          AND resultado = 'PENDENTE';
+    """, (str(rodada_resultado), cor_resultado, resultado, now, sinal_id))
 
-    state = cur.fetchone()
-
-    if not state:
-        return 0, 0, 0, 0.00
-
-    (
-        sinal_ativo,
-        cor_sinal,
-        rodada_base_sinal,
-        wins,
-        losses,
-        whites,
-        profit,
-    ) = state
-
-    wins = wins or 0
-    losses = losses or 0
-    whites = whites or 0
-    profit = float(profit or 0)
-
-    # Não existe sinal ativo.
-    if not sinal_ativo or not cor_sinal:
-        return (
-            wins,
-            losses,
-            whites,
-            profit
-        )
-
-    # ============================================================
-    # RESULTADO DO SINAL
-    # ============================================================
-
-    if cor_resultado == "W":
-
-        whites += 1
-
-        # WHITE é considerado perda financeira.
-        profit -= APOSTA_BASE
-
-        resultado = "WHITE"
-
-    elif cor_resultado == cor_sinal:
-
-        wins += 1
-
-        profit += APOSTA_BASE
-
-        resultado = "WIN"
-
-    else:
-
-        losses += 1
-
-        profit -= APOSTA_BASE
-
-        resultado = "LOSS"
-
-    # ============================================================
-    # ATUALIZA O REGISTRO DA ESTRATÉGIA
-    # ============================================================
-
-    if rodada_base_sinal:
-
-        cur.execute("""
-            UPDATE estrategia_sinais
-            SET
-                rodada_resultado = %s,
-                cor_resultado = %s,
-                resultado = %s,
-                resolvido_em = %s
-            WHERE rodada_base = %s
-              AND resultado = 'PENDENTE';
-        """, (
-            str(rodada_id),
-            cor_resultado,
-            resultado,
-            now,
-            str(rodada_base_sinal),
-        ))
+    if cur.rowcount != 1:
+        return False
 
     print(
-        f"📊 SINAL RESOLVIDO | "
-        f"{sinal_ativo} | "
-        f"prev={cor_sinal} | "
-        f"resultado={cor_resultado} | "
-        f"{resultado}",
+        "📊 SINAL RESOLVIDO | "
+        f"id={sinal_id} | base={rodada_base} | resultado={rodada_resultado} | "
+        f"estrategia={estrategia} | prev={cor_prevista} | real={cor_resultado} | {resultado}",
         flush=True,
     )
-
-    return (
-        wins,
-        losses,
-        whites,
-        profit
-    )
+    return True
 
 
-def processar_novo_resultado(
-    rodada_id,
-    color,
-    roll
-):
+def reconciliar_sinais_pendentes(cur, now, limite=5000):
     """
-    Chamado pelo collector depois que a rodada foi salva
-    no Neon.
-
-    Fluxo:
-
-      1. Liquida o sinal da rodada anterior.
-      2. Carrega o histórico atualizado.
-      3. Remove a rodada atual do conjunto usado para
-         detectar o gatilho.
-      4. Procura uma nova estratégia.
-      5. Cria um sinal para a próxima rodada.
-      6. Atualiza bot_estado.
-
-    O motor continua trabalhando com apenas UM sinal ativo
-    por vez.
+    Reconcilia cada PENDENTE com a primeira rodada complete depois da base.
+    Não depende do callback ter sido chamado para cada rodada.
     """
+    cur.execute("""
+        SELECT s.id, s.rodada_base, s.estrategia, s.cor_prevista, b.id AS base_db_id
+        FROM estrategia_sinais s
+        LEFT JOIN blaze_historico b
+          ON b.rodada_id = s.rodada_base
+         AND b.status = 'complete'
+        WHERE s.resultado = 'PENDENTE'
+        ORDER BY s.id ASC
+        LIMIT %s;
+    """, (limite,))
+    pendentes = cur.fetchall()
 
+    resolvidos = 0
+    sem_resultado = 0
+    base_inexistente = 0
+
+    for sinal_id, rodada_base, estrategia, cor_prevista, base_db_id in pendentes:
+        if base_db_id is None:
+            base_inexistente += 1
+            continue
+
+        cur.execute("""
+            SELECT id, rodada_id, color, roll
+            FROM blaze_historico
+            WHERE status = 'complete'
+              AND id > %s
+              AND color IN (0, 1, 2)
+              AND roll IS NOT NULL
+            ORDER BY id ASC
+            LIMIT 1;
+        """, (base_db_id,))
+        row = cur.fetchone()
+        if not row:
+            sem_resultado += 1
+            continue
+
+        resultado_db_id, rodada_resultado, color_resultado, roll_resultado = row
+        cor_resultado = cor_para_sigla(color_resultado)
+        if cor_resultado is None:
+            sem_resultado += 1
+            continue
+
+        if resolver_sinal_por_rodada(
+            cur, sinal_id, rodada_base, estrategia, cor_prevista,
+            base_db_id, resultado_db_id, rodada_resultado, cor_resultado, now
+        ):
+            resolvidos += 1
+
+    if resolvidos:
+        print(
+            "🔄 RECONCILIAÇÃO | "
+            f"resolvidos={resolvidos} | sem_resultado={sem_resultado} | "
+            f"base_inexistente={base_inexistente}",
+            flush=True,
+        )
+
+    return {
+        "resolvidos": resolvidos,
+        "sem_resultado": sem_resultado,
+        "base_inexistente": base_inexistente,
+        "pendentes_lidos": len(pendentes),
+    }
+
+
+def reconciliar_rodada_atual(cur, rodada_id, now):
+    """Resolve somente sinais cujo resultado imediato é a rodada atual."""
+    cur.execute("""
+        SELECT id
+        FROM blaze_historico
+        WHERE rodada_id = %s
+          AND status = 'complete'
+        LIMIT 1;
+    """, (str(rodada_id),))
+    atual = cur.fetchone()
+    if not atual:
+        return 0
+    atual_id = int(atual[0])
+
+    cur.execute("""
+        SELECT s.id, s.rodada_base, s.estrategia, s.cor_prevista, b.id AS base_db_id
+        FROM estrategia_sinais s
+        JOIN blaze_historico b
+          ON b.rodada_id = s.rodada_base
+         AND b.status = 'complete'
+        WHERE s.resultado = 'PENDENTE'
+          AND b.id < %s
+        ORDER BY b.id DESC, s.id ASC;
+    """, (atual_id,))
+
+    resolvidos = 0
+    for sinal_id, rodada_base, estrategia, cor_prevista, base_db_id in cur.fetchall():
+        cur.execute("""
+            SELECT id, rodada_id, color, roll
+            FROM blaze_historico
+            WHERE status = 'complete'
+              AND id > %s
+              AND color IN (0, 1, 2)
+              AND roll IS NOT NULL
+            ORDER BY id ASC
+            LIMIT 1;
+        """, (base_db_id,))
+        row = cur.fetchone()
+        if not row:
+            continue
+
+        resultado_db_id, rodada_resultado, color_resultado, roll_resultado = row
+        if int(resultado_db_id) != atual_id:
+            continue
+
+        cor_resultado = cor_para_sigla(color_resultado)
+        if cor_resultado is None:
+            continue
+
+        if resolver_sinal_por_rodada(
+            cur, sinal_id, rodada_base, estrategia, cor_prevista,
+            base_db_id, resultado_db_id, rodada_resultado, cor_resultado, now
+        ):
+            resolvidos += 1
+    return resolvidos
+
+
+def recalcular_bot_estado(cur, rodada_atual=None, now=None):
+    """
+    bot_estado é resumo derivado de estrategia_sinais.
+    Dashboard operacional: somente WIN e LOSS.
+    WHITE, quando ocorre, está em LOSS e pode ser identificado apenas
+    internamente por cor_resultado='W'.
+    """
+    cur.execute("""
+        SELECT
+            COUNT(*) FILTER (WHERE resultado = 'WIN') AS wins,
+            COUNT(*) FILTER (WHERE resultado = 'LOSS') AS losses,
+            COUNT(*) FILTER (WHERE resultado = 'PENDENTE') AS pendentes,
+            COUNT(*) FILTER (
+                WHERE resultado = 'LOSS' AND cor_resultado = 'W'
+            ) AS whites_internos
+        FROM estrategia_sinais;
+    """)
+    wins, losses, pendentes, whites_internos = cur.fetchone()
+    wins = int(wins or 0)
+    losses = int(losses or 0)
+    pendentes = int(pendentes or 0)
+    whites_internos = int(whites_internos or 0)
+
+    cur.execute("""
+        SELECT estrategia, cor_prevista, rodada_base
+        FROM estrategia_sinais
+        WHERE resultado = 'PENDENTE'
+        ORDER BY id DESC
+        LIMIT 1;
+    """)
+    sinal = cur.fetchone()
+
+    if sinal:
+        estrategia_ativa, cor_sinal, rodada_base_sinal = sinal
+        sinal_ativo = estrategia_ativa
+    else:
+        estrategia_ativa = None
+        cor_sinal = None
+        rodada_base_sinal = None
+        sinal_ativo = None
+
+    # Cada WIN +1 e cada LOSS (inclusive WHITE) -1.
+    profit = (wins * APOSTA_BASE) - (losses * APOSTA_BASE)
+    now = now or datetime.now()
+
+    cur.execute("""
+        UPDATE bot_estado
+        SET wins = %s,
+            losses = %s,
+            whites = %s,
+            profit = %s,
+            sinal_ativo = %s,
+            cor_sinal = %s,
+            ultima_rodada_processada = %s,
+            rodada_base_sinal = %s,
+            motor_ativo = TRUE,
+            ultima_estrategia = %s,
+            atualizado_em = %s
+        WHERE id = 1;
+    """, (
+        wins, losses, whites_internos, profit,
+        sinal_ativo, cor_sinal,
+        str(rodada_atual) if rodada_atual is not None else None,
+        rodada_base_sinal, estrategia_ativa, now,
+    ))
+
+    return {
+        "wins": wins,
+        "losses": losses,
+        "pendentes": pendentes,
+        "whites_internos": whites_internos,
+        "profit": float(profit),
+        "sinal_ativo": sinal_ativo,
+        "cor_sinal": cor_sinal,
+        "rodada_base_sinal": rodada_base_sinal,
+        "estrategia": estrategia_ativa,
+    }
+
+
+def processar_novo_resultado(rodada_id, color, roll):
+    """
+    Chamado pelo collector depois que a rodada foi persistida.
+
+    O resultado de um sinal nunca é escolhido pela ordem dos callbacks.
+    Ele é encontrado pela sequência persistida em blaze_historico:
+    a primeira rodada complete com id maior que a rodada-base.
+    """
     if not init_engine_db():
         return None
 
     conn = get_db_connection()
-
     if not conn:
         return None
 
     try:
-        now = datetime.now()
-
-        # ========================================================
-        # NORMALIZA A COR DO RESULTADO
-        # ========================================================
-        cor_resultado = COR_SIGLA.get(
-            CORES.get(int(color))
-        )
+        rodada_id = str(rodada_id)
+        color = int(color)
+        roll = int(roll)
+        cor_resultado = cor_para_sigla(color)
 
         if cor_resultado is None:
+            print(f"⚠️ MOTOR: cor inválida na rodada {rodada_id}: {color}", flush=True)
             conn.close()
             return None
 
+        now = datetime.now()
+
         with conn.cursor() as cur:
+            # A rodada precisa estar persistida como complete.
+            cur.execute("""
+                SELECT id, rodada_id, color, roll
+                FROM blaze_historico
+                WHERE rodada_id = %s
+                  AND status = 'complete'
+                LIMIT 1;
+            """, (rodada_id,))
+            rodada_db = cur.fetchone()
+            if not rodada_db:
+                raise RuntimeError(f"Rodada {rodada_id} não encontrada como complete.")
+            rodada_db_id = int(rodada_db[0])
 
-            # ====================================================
-            # 1. LIQUIDA SINAL ANTERIOR
-            # ====================================================
-            (
-                wins,
-                losses,
-                whites,
-                profit
-            ) = liquidar_sinal_atual(
-                cur,
-                str(rodada_id),
-                cor_resultado,
-                now
-            )
+            # Verifica se o callback já foi processado.
+            cur.execute("SELECT ultima_rodada_processada FROM bot_estado WHERE id = 1;")
+            estado = cur.fetchone()
+            ultima_processada = str(estado[0]) if estado and estado[0] is not None else None
 
-            # ====================================================
-            # 2. CARREGA HISTÓRICO
-            # ====================================================
-            (
-                rodadas,
-                rolls,
-                colors
-            ) = carregar_historico(conn)
+            # 1) Reconciliação global: corrige sinais antigos deixados pendentes.
+            reconciliar_sinais_pendentes(cur, now)
 
-            if not rodadas:
+            # 2) Garante especificamente a resolução contra a rodada atual.
+            reconciliar_rodada_atual(cur, rodada_id, now)
+
+            # 3) Não duplica processamento da mesma rodada.
+            if ultima_processada == rodada_id:
+                resumo = recalcular_bot_estado(cur, rodada_id, now)
                 conn.commit()
-                conn.close()
-                return None
-
-            # ====================================================
-            # 3. REMOVE A RODADA ATUAL DO GATILHO
-            #
-            # A rodada recém-chegada NÃO pode ser utilizada
-            # como parte do histórico para gerar um sinal
-            # que deveria ter sido criado antes dela.
-            # ====================================================
-            idx_atual = None
-
-            for i in range(
-                len(rodadas) - 1,
-                -1,
-                -1
-            ):
-                if rodadas[i] == str(rodada_id):
-                    idx_atual = i
-                    break
-
-            if idx_atual is not None:
-
-                rolls_check = (
-                    rolls[:idx_atual]
-                    + rolls[idx_atual + 1:]
+                print(
+                    f"♻️ MOTOR | rodada {rodada_id} já processada; reconciliação executada.",
+                    flush=True,
                 )
+                return {
+                    "ativo": True,
+                    "estrategia": resumo["estrategia"],
+                    "cor": resumo["cor_sinal"],
+                    "wins": resumo["wins"],
+                    "losses": resumo["losses"],
+                    "pendentes": resumo["pendentes"],
+                    "profit": resumo["profit"],
+                    "reconciliado": True,
+                }
 
-                colors_check = (
-                    colors[:idx_atual]
-                    + colors[idx_atual + 1:]
-                )
-
-            else:
-
-                rolls_check = rolls[:-1]
-                colors_check = colors[:-1]
-
-            # ====================================================
-            # 4. PROCURA NOVO SINAL
-            # ====================================================
-            novo_sinal = get_active_signal(
-                rolls_check,
-                colors_check
+            # 4) O gatilho usa APENAS rodadas anteriores à atual.
+            _ids, _rodadas, rolls, colors = carregar_historico(
+                conn,
+                ate_id=rodada_db_id - 1,
             )
-
-            sinal_ativo = None
-            cor_sinal = None
-            rodada_base_sinal = None
+            novo_sinal = get_active_signal(rolls, colors)
             estrategia = None
+            cor_sinal = None
 
-            # ====================================================
-            # 5. CRIA NOVO SINAL
-            # ====================================================
             if novo_sinal:
-
                 estrategia, cor_sinal = novo_sinal
 
-                sinal_ativo = estrategia
-
-                rodada_base_sinal = str(
-                    rodada_id
-                )
-
+                # Uma base só pode gerar um sinal operacional.
                 cur.execute("""
-                    INSERT INTO estrategia_sinais
-                        (
-                            rodada_base,
-                            estrategia,
-                            cor_prevista,
-                            resultado
-                        )
-                    VALUES
-                        (
-                            %s,
-                            %s,
-                            %s,
-                            'PENDENTE'
-                        );
-                """, (
-                    str(rodada_id),
-                    estrategia,
-                    cor_sinal,
-                ))
+                    SELECT id, resultado
+                    FROM estrategia_sinais
+                    WHERE rodada_base = %s
+                    ORDER BY id DESC
+                    LIMIT 1;
+                """, (rodada_id,))
+                sinal_existente = cur.fetchone()
 
-                print("")
-                print("=" * 70)
-                print("🎯 NOVO SINAL — MOTOR OUSADO")
-                print("=" * 70)
-                print(
-                    f"Base       : {rodada_id}"
-                )
-                print(
-                    f"Estratégia : {estrategia}"
-                )
-                print(
-                    f"Previsão   : {cor_sinal}"
-                )
-                print(
-                    "Entrada    : PRÓXIMA RODADA"
-                )
-                print("=" * 70)
-                print("")
+                if sinal_existente:
+                    print(
+                        f"♻️ SINAL JÁ EXISTE | base={rodada_id} | "
+                        f"id={sinal_existente[0]} | status={sinal_existente[1]}",
+                        flush=True,
+                    )
+                else:
+                    cur.execute("""
+                        INSERT INTO estrategia_sinais
+                            (rodada_base, estrategia, cor_prevista, resultado)
+                        VALUES (%s, %s, %s, 'PENDENTE');
+                    """, (rodada_id, estrategia, cor_sinal))
 
+                    print("\n" + "=" * 72)
+                    print("🎯 NOVO SINAL")
+                    print("=" * 72)
+                    print(f"Base       : {rodada_id}")
+                    print(f"Estratégia : {estrategia}")
+                    print(f"Previsão   : {cor_sinal}")
+                    print("Entrada    : PRÓXIMA RODADA")
+                    print("=" * 72 + "\n")
             else:
-
                 print(
-                    f"🔎 MOTOR | rodada={rodada_id} | "
-                    f"nenhum gatilho encontrado",
+                    f"🔎 MOTOR | rodada={rodada_id} | nenhum gatilho encontrado",
                     flush=True,
                 )
 
-            # ====================================================
-            # 6. ATUALIZA ESTADO DO BOT
-            # ====================================================
-            cur.execute("""
-                UPDATE bot_estado
-                SET
-                    wins = %s,
-                    losses = %s,
-                    whites = %s,
-                    profit = %s,
-                    sinal_ativo = %s,
-                    cor_sinal = %s,
-                    ultima_rodada_processada = %s,
-                    rodada_base_sinal = %s,
-                    motor_ativo = TRUE,
-                    ultima_estrategia = %s,
-                    atualizado_em = %s
-                WHERE id = 1;
-            """, (
-                wins,
-                losses,
-                whites,
-                profit,
-                sinal_ativo,
-                cor_sinal,
-                str(rodada_id),
-                rodada_base_sinal,
-                estrategia,
-                now,
-            ))
+            # 5) Placar sempre recalculado da tabela de sinais.
+            resumo = recalcular_bot_estado(cur, rodada_id, now)
 
         conn.commit()
         conn.close()
 
         return {
             "ativo": True,
-            "estrategia": estrategia,
-            "cor": cor_sinal,
-            "wins": wins,
-            "losses": losses,
-            "whites": whites,
-            "profit": profit,
+            "estrategia": resumo["estrategia"],
+            "cor": resumo["cor_sinal"],
+            "wins": resumo["wins"],
+            "losses": resumo["losses"],
+            "pendentes": resumo["pendentes"],
+            "profit": resumo["profit"],
+            "reconciliado": True,
         }
 
     except Exception as e:
-
-        print(
-            f"❌ MOTOR: erro processando rodada "
-            f"{rodada_id}: {e}"
-        )
-
+        print(f"❌ MOTOR: erro processando rodada {rodada_id}: {e}", flush=True)
         try:
             conn.rollback()
             conn.close()
-
         except Exception:
             pass
+        return None
 
+
+def reconciliar_todos_sinais():
+    """Reconciliação manual completa após deploy/restart ou falha do motor."""
+    if not init_engine_db():
+        return None
+
+    conn = get_db_connection()
+    if not conn:
+        return None
+
+    try:
+        now = datetime.now()
+        with conn.cursor() as cur:
+            resultado = reconciliar_sinais_pendentes(cur, now, limite=50000)
+            resumo = recalcular_bot_estado(cur, now=now)
+        conn.commit()
+        conn.close()
+
+        print(
+            "🧾 AUDITORIA FINAL | "
+            f"resolvidos={resultado['resolvidos']} | "
+            f"pendentes={resumo['pendentes']} | "
+            f"W={resumo['wins']} | L={resumo['losses']} | "
+            f"profit={resumo['profit']:.2f}",
+            flush=True,
+        )
+        return {**resultado, **resumo}
+
+    except Exception as e:
+        print(f"❌ AUDITORIA: erro reconciliando sinais: {e}", flush=True)
+        try:
+            conn.rollback()
+            conn.close()
+        except Exception:
+            pass
         return None
 
 
 def obter_status_motor():
     conn = get_db_connection()
-
     if not conn:
         return {
-            "ativo": False,
-            "sinal": None,
-            "cor": None,
-            "estrategia": None,
+            "ativo": False, "sinal": None, "cor": None, "estrategia": None,
+            "wins": 0, "losses": 0, "pendentes": 0, "profit": 0.0,
         }
 
     try:
-
         with conn.cursor() as cur:
-
-            cur.execute("""
-                SELECT
-                    motor_ativo,
-                    sinal_ativo,
-                    cor_sinal,
-                    ultima_estrategia,
-                    wins,
-                    losses,
-                    whites,
-                    profit
-                FROM bot_estado
-                WHERE id = 1;
-            """)
-
-            row = cur.fetchone()
-
+            resumo = recalcular_bot_estado(cur, now=datetime.now())
+        conn.commit()
         conn.close()
-
-        if not row:
-            return {
-                "ativo": True,
-                "sinal": None,
-                "cor": None,
-                "estrategia": None,
-            }
-
         return {
-            "ativo": bool(row[0]),
-            "sinal": row[1],
-            "cor": row[2],
-            "estrategia": row[3],
-            "wins": row[4] or 0,
-            "losses": row[5] or 0,
-            "whites": row[6] or 0,
-            "profit": float(row[7] or 0),
+            "ativo": True,
+            "sinal": resumo["sinal_ativo"],
+            "cor": resumo["cor_sinal"],
+            "estrategia": resumo["estrategia"],
+            "wins": resumo["wins"],
+            "losses": resumo["losses"],
+            "pendentes": resumo["pendentes"],
+            "profit": resumo["profit"],
         }
-
     except Exception as e:
-
-        print(
-            f"❌ MOTOR: erro consultando status: {e}"
-        )
-
+        print(f"❌ MOTOR: erro consultando status: {e}", flush=True)
         try:
             conn.close()
         except Exception:
             pass
-
         return {
-            "ativo": False,
-            "sinal": None,
-            "cor": None,
-            "estrategia": None,
+            "ativo": False, "sinal": None, "cor": None, "estrategia": None,
+            "wins": 0, "losses": 0, "pendentes": 0, "profit": 0.0,
         }
 
 
 if __name__ == "__main__":
-
     if init_engine_db():
-
-        print("")
-        print("=" * 70)
-        print("✅ MOTOR OUSADO INICIALIZADO")
-        print("=" * 70)
-
+        print("✅ Motor inicializado.")
         print("🟢 Estratégias ativas:")
-        print("")
         print("   1. PRR → R")
         print("   2. RRPP → R")
         print("   3. RRP → P")
-        print("   4. VI → PP → P")
-        print("   5. VI → VI → R")
+        print("   4. VI → VI → R")
+        print("   5. VI → PP → P")
         print("   6. VI → VI → VI → R")
         print("   7. ⚪ WHITE + 13 → R")
         print("   8. EST 3 (Franco-Atirador)")
         print("   9. EST 5 (Mina Oculta)")
-        print("")
-        print("⚡ Prioridade:")
-        print("   PRR → R")
-        print("   RRPP → R")
-        print("   RRP → P")
-        print("   VI → PP → P")
-        print("   VI → VI → R")
-        print("   VI → VI → VI → R")
-        print("   WHITE + 13 → R")
-        print("   EST 3")
-        print("   EST 5")
-        print("")
-        print("💰 Aposta base:", APOSTA_BASE)
-        print("⚪ WHITE financeiro: LOSS")
-        print("=" * 70)
+        print("\n🔄 Executando reconciliação inicial...")
+        reconciliar_todos_sinais()
