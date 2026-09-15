@@ -16,8 +16,9 @@ RESULTADO_LOSS = "LOSS"
 # V8.5 — SEIS REGRAS DEFINIDAS PELO ESTUDO
 #
 # O contexto tem 4 rodadas observadas. A entrada é na PRÓXIMA.
-# Branco continua sendo uma cor do contexto, mas se aparecer na
-# rodada de entrada ele é LOSS operacional.
+# A regra gera uma previsão original, mas a cor efetivamente apostada
+# é SEMPRE invertida: R -> P e P -> R.
+# Branco na rodada de entrada é LOSS operacional.
 # ================================================================
 
 REGRAS_V85 = {
@@ -172,6 +173,15 @@ def obter_cor(cor_texto, color):
     return mapear_cor_texto(cor_texto) or cor_para_sigla(color)
 
 
+def inverter_cor(cor):
+    """Inverte somente VERMELHO/PRETO. BRANCO não é uma entrada válida."""
+    if cor == "R":
+        return "P"
+    if cor == "P":
+        return "R"
+    return cor
+
+
 def carregar_historico(conn, ate_id=None):
     with conn.cursor() as cur:
         query = """
@@ -287,7 +297,7 @@ def resolver_sinal_por_rodada(
         "📊 SINAL RESOLVIDO | "
         f"id={sinal_id} | base={rodada_base} | "
         f"resultado={rodada_resultado} | estratégia={estrategia} | "
-        f"prev={cor_prevista} | real={cor_resultado} | {resultado}",
+        f"entrada={cor_prevista} | real={cor_resultado} | {resultado}",
         flush=True,
     )
     return True
@@ -475,10 +485,16 @@ def _resolver_pendente_da_rodada_atual(cur, atual_id, now):
 
 
 def _criar_sinal_para_rodada_atual(cur, rodada_id, rodada_db_id):
-    """Detecta somente com histórico <= rodada atual; a entrada será a próxima."""
+    """Detecta a regra e registra a cor INVERTIDA como entrada efetiva."""
     historico = carregar_historico_por_cursor(cur, ate_id=rodada_db_id)
-    cor_prevista, estrategia = detectar_estrategia(historico)
+    cor_original, estrategia = detectar_estrategia(historico)
     if not estrategia:
+        return None
+
+    # V8.5 INVERTIDA: a regra continua exatamente a mesma, mas a cor
+    # efetivamente apostada é o oposto da previsão original.
+    cor_entrada = inverter_cor(cor_original)
+    if cor_entrada not in {"R", "P"}:
         return None
 
     cur.execute("""
@@ -496,17 +512,18 @@ def _criar_sinal_para_rodada_atual(cur, rodada_id, rodada_db_id):
         INSERT INTO estrategia_sinais
             (rodada_base, estrategia, cor_prevista, resultado)
         VALUES (%s, %s, %s, 'PENDENTE');
-    """, (str(rodada_id), estrategia, cor_prevista))
+    """, (str(rodada_id), estrategia, cor_entrada))
 
     print("\n" + "=" * 72)
-    print("🎯 NOVO SINAL V8.5")
+    print("🎯 NOVO SINAL V8.5 — INVERSÃO ATIVA")
     print("=" * 72)
     print(f"Base       : {rodada_id}")
     print(f"Estratégia : {estrategia}")
-    print(f"Previsão   : {cor_prevista}")
+    print(f"Regra diz  : {cor_original}")
+    print(f"Entrada    : {cor_entrada} (INVERTIDA)")
     print("Entrada    : PRÓXIMA RODADA")
     print("=" * 72 + "\n")
-    return estrategia, cor_prevista
+    return estrategia, cor_entrada
 
 
 def carregar_historico_por_cursor(cur, ate_id=None):
@@ -728,9 +745,9 @@ def obter_status_motor():
 
 if __name__ == "__main__":
     if init_engine_db():
-        print("✅ Motor V8.5 inicializado.")
+        print("✅ Motor V8.5 inicializado — INVERSÃO ATIVA.")
         print("🟢 Estratégias ativas:")
         for i, (ctx, (pred, name)) in enumerate(REGRAS_V85.items(), 1):
-            print(f"   {i}. {' → '.join(ctx)} → {pred} | {name}")
+            print(f"   {i}. {' → '.join(ctx)} → {pred} | entrada invertida: {inverter_cor(pred)} | {name}")
         print("\n🔄 Executando reconciliação inicial...")
         reconciliar_todos_sinais()
