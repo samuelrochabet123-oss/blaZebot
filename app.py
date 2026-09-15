@@ -1,7 +1,7 @@
 # ================================================================
 # BLAZE BOT — DASHBOARD WEB + COLLECTOR + MOTOR ESTATÍSTICO
 #
-# VERSÃO: V8.5 — SEIS REGRAS COM BRANCO
+# VERSÃO: V8.5 — SEIS REGRAS COM BRANCO + INVERSÃO
 #
 # Estratégias ativas, todas definidas em strategy_engine.py:
 #   1) VERMELHO -> BRANCO -> PRETO -> VERMELHO -> PRETO
@@ -11,7 +11,8 @@
 #   5) PRETO -> BRANCO -> VERMELHO -> VERMELHO -> PRETO
 #   6) VERMELHO -> BRANCO -> VERMELHO -> VERMELHO -> VERMELHO
 #
-# A última cor de cada sequência é a previsão para a PRÓXIMA rodada.
+# A última cor de cada sequência é a previsão original; a entrada do bot é
+# a cor INVERTIDA (R↔P).
 #
 # CORREÇÕES IMPORTANTES:
 #
@@ -25,6 +26,7 @@
 # 8. PAUSAR não para o collector.
 # 9. Proteção contra repetição da mesma rodada-base.
 # 10. As seis regras V8.5 são exclusivas e sem motor paralelo.
+# 11. A cor exibida como entrada já é a cor invertida da regra.
 # ================================================================
 
 
@@ -1494,6 +1496,7 @@ body {
             <div class="eyebrow">
 
                 🎯 SINAL ATUAL
+                • ENTRADA INVERTIDA
                 • PRÓXIMA RODADA
 
             </div>
@@ -1705,7 +1708,7 @@ body {
             </div>
 
             <div>
-                Previsão
+                Entrada (invertida)
             </div>
 
             <div>
@@ -1875,6 +1878,7 @@ body {
 
         Blaze Bot V8.5 • coleta contínua •
         seis regras com branco •
+        INVERSÃO R↔P •
         WHITE = LOSS •
         proteção contra resolução antecipada
 
