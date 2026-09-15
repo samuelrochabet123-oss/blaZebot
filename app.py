@@ -1,28 +1,30 @@
 # ================================================================
 # BLAZE BOT — DASHBOARD WEB + COLLECTOR + MOTOR ESTATÍSTICO
 #
-# VERSÃO:
-# - Remove estratégia antiga 2x Preto -> Vermelho
-# - Novas estratégias:
+# VERSÃO: V8.5 — SEIS REGRAS COM BRANCO
 #
-#   1) VI -> VI -> R
-#   2) VI -> PP -> P
-#   3) VI -> VI -> VI -> R
+# Estratégias ativas, todas definidas em strategy_engine.py:
+#   1) VERMELHO -> BRANCO -> PRETO -> VERMELHO -> PRETO
+#   2) PRETO -> BRANCO -> VERMELHO -> PRETO -> VERMELHO
+#   3) VERMELHO -> BRANCO -> VERMELHO -> PRETO -> PRETO
+#   4) PRETO -> BRANCO -> PRETO -> PRETO -> PRETO
+#   5) PRETO -> BRANCO -> VERMELHO -> VERMELHO -> PRETO
+#   6) VERMELHO -> BRANCO -> VERMELHO -> VERMELHO -> VERMELHO
 #
-# - Regra adicional W + 13
+# A última cor de cada sequência é a previsão para a PRÓXIMA rodada.
 #
 # CORREÇÕES IMPORTANTES:
 #
 # 1. O sinal é baseado em uma rodada específica.
 # 2. O resultado só pode ser uma rodada POSTERIOR ao sinal_base_id.
 # 3. A própria rodada que gerou o sinal NUNCA pode resolver o sinal.
-# 4. Branco NÃO entra no placar.
-# 5. Branco NÃO é contabilizado como WIN/LOSS.
+# 4. Branco na rodada de entrada é LOSS operacional.
+# 5. Dashboard não exibe WHITE como categoria de resultado.
 # 6. O collector continua coletando mesmo com o motor parado.
 # 7. INICIAR cria uma nova sessão estatística.
 # 8. PAUSAR não para o collector.
 # 9. Proteção contra repetição da mesma rodada-base.
-# 10. Estratégias têm prioridade definida.
+# 10. As seis regras V8.5 são exclusivas e sem motor paralelo.
 # ================================================================
 
 
@@ -379,207 +381,12 @@ def obter_cor(cor_texto, color):
 
 
 # ================================================================
-# MOTOR DE ESTRATÉGIAS
+# V8.5 — ESTRATÉGIAS
+#
+# A lógica das seis regras fica exclusivamente em strategy_engine.py.
+# O app.py não possui um segundo motor de padrões, evitando conflito
+# ou geração duplicada de sinais.
 # ================================================================
-
-def detectar_estrategia(hist):
-
-    """
-    Recebe histórico em ordem cronológica.
-
-    Exemplo:
-
-        R P P R
-
-    hist = [
-        {
-            "id": ...,
-            "rodada_id": ...,
-            "cor": "R",
-            "roll": ...
-        },
-        ...
-    ]
-
-    Retorna:
-
-        (cor_prevista, nome_estrategia)
-
-    ou:
-
-        (None, None)
-    """
-
-    if not hist:
-        return None, None
-
-
-    # ============================================================
-    # ESTRATÉGIA 1
-    #
-    # VI -> VI -> R
-    #
-    # Aqui VI é tratado como VERMELHO.
-    #
-    # Portanto:
-    #
-    # R
-    # R
-    # ↓
-    # previsão R
-    #
-    # ============================================================
-
-    if len(hist) >= 2:
-
-        a = hist[-2]["cor"]
-        b = hist[-1]["cor"]
-
-        if a == "R" and b == "R":
-
-            return (
-                "R",
-                "VI → VI → R"
-            )
-
-
-    # ============================================================
-    # ESTRATÉGIA 2
-    #
-    # VI -> PP -> P
-    #
-    # Interpretação:
-    #
-    # R + P + P
-    #       ↓
-    # previsão P
-    #
-    # ============================================================
-
-    if len(hist) >= 3:
-
-        a = hist[-3]["cor"]
-        b = hist[-2]["cor"]
-        c = hist[-1]["cor"]
-
-        if (
-            a == "R"
-            and b == "P"
-            and c == "P"
-        ):
-
-            return (
-                "P",
-                "VI → PP → P"
-            )
-
-
-    # ============================================================
-    # ESTRATÉGIA 3
-    #
-    # VI -> VI -> VI -> R
-    #
-    # Interpretação:
-    #
-    # R + R + R
-    #         ↓
-    # previsão R
-    #
-    # OBS:
-    #
-    # Essa regra é mais longa e pode ficar escondida pela
-    # estratégia VI -> VI -> R.
-    #
-    # Por isso ela é testada ANTES da regra de 2 VI.
-    #
-    # ============================================================
-
-    if len(hist) >= 3:
-
-        a = hist[-3]["cor"]
-        b = hist[-2]["cor"]
-        c = hist[-1]["cor"]
-
-        if (
-            a == "R"
-            and b == "R"
-            and c == "R"
-        ):
-
-            return (
-                "R",
-                "VI → VI → VI → R"
-            )
-
-
-    # ============================================================
-    # W + 13
-    #
-    # Regra configurável.
-    #
-    # Interpretação adotada neste código:
-    #
-    # se a última rodada foi BRANCO e o roll da rodada branca
-    # foi 0, procuramos o próximo evento específico relacionado
-    # ao roll 13.
-    #
-    # IMPORTANTE:
-    #
-    # Como "W +13" não veio formalmente definido no código
-    # original, não transformamos isso em uma aposta automática
-    # sem uma definição objetiva da direção.
-    #
-    # Neste momento ela é registrada como gatilho apenas quando
-    # houver uma regra explícita de previsão abaixo.
-    #
-    # ============================================================
-
-    if len(hist) >= 1:
-
-        ultima = hist[-1]
-
-        if ultima["cor"] == "W":
-
-            # ----------------------------------------------------
-            # PLACEHOLDER CONTROLADO
-            #
-            # Para evitar criar uma previsão arbitrária,
-            # NÃO gera sinal automaticamente.
-            #
-            # Se o estudo W+13 significar, por exemplo:
-            #
-            # W -> próximo roll 13 -> PRETO
-            #
-            # essa regra pode ser ativada aqui.
-            # ----------------------------------------------------
-
-            pass
-
-
-    return None, None
-
-
-# ================================================================
-# CONVERTE ROW DO BANCO PARA ESTRUTURA DO MOTOR
-# ================================================================
-
-def row_para_hist(row):
-
-    return {
-
-        "id": row[0],
-
-        "rodada_id": row[1],
-
-        "cor": obter_cor(
-            row[2],
-            row[3]
-        ),
-
-        "roll": row[4]
-    }
-
-
 
 # ================================================================
 # INFORMAÇÕES DAS CORES PARA O DASHBOARD
@@ -609,17 +416,14 @@ def cor_info(color, cor_texto=None):
 def estrategia_curta(nome):
     if not nome:
         return "—"
+
     mapa = {
-        "PRR → R": "🥇 PRR → R",
-        "RRPP → R": "🥈 RRPP → R",
-        "RRP → P": "🥉 RRP → P",
-        "VI → VI → VI → R": "VI → VI → VI → R",
-        "VI → VI → R": "VI → VI → R",
-        "VI → PP → P": "VI → PP → P",
-        "⚪ WHITE + 13 → R": "⚪ WHITE + 13 → R",
-        "W + 13": "⚪ W + 13",
-        "EST 3 (Franco-Atirador)": "EST 3 (Franco-Atirador)",
-        "EST 5 (Mina Oculta)": "EST 5 (Mina Oculta)",
+        "V8.5 R1 | R-W-P-R -> P": "R1 • R-W-P-R → P",
+        "V8.5 R2 | P-W-R-P -> R": "R2 • P-W-R-P → R",
+        "V8.5 R3 | R-W-R-P -> P": "R3 • R-W-R-P → P",
+        "V8.5 R4 | P-W-P-P -> P": "R4 • P-W-P-P → P",
+        "V8.5 R5 | P-W-R-R -> P": "R5 • P-W-R-R → P",
+        "V8.5 R6 | R-W-R-R -> R": "R6 • R-W-R-R → R",
     }
     return mapa.get(nome, nome)
 
@@ -2069,8 +1873,8 @@ body {
 
     <div class="footer">
 
-        Blaze Bot • coleta contínua •
-        motor estatístico independente •
+        Blaze Bot V8.5 • coleta contínua •
+        seis regras com branco •
         WHITE = LOSS •
         proteção contra resolução antecipada
 
