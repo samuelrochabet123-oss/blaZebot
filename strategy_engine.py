@@ -3,7 +3,7 @@ from datetime import datetime
 import psycopg2
 
 # ================================================================
-# V8.0 GOLDEN PATTERNS (Sem inversão, Aposta Fixa)
+# V8.1 GOLDEN PATTERNS + HIGH-FREQ ROLL PATTERNS
 # ================================================================
 
 APOSTA_BASE = 1.00
@@ -17,10 +17,20 @@ RESULTADO_PENDENTE = "PENDENTE"
 RESULTADO_WIN = "WIN"
 RESULTADO_LOSS = "LOSS"
 
-# Apenas as Regras de Ouro V8.0 (1 e 4) estão ativas
-REGRAS_V85 = {
-    ("R", "W", "P", "R"): ("P", "V8.5 R1 | R-W-P-R -> P"),
-    ("P", "W", "P", "P"): ("P", "V8.5 R4 | P-W-P-P -> P"),
+# 1. REGRAS DE OURO ORIGINAIS (Apenas Cores)
+REGRAS_CORES = {
+    ("R", "W", "P", "R"): ("P", "V8.0 R1 | R-W-P-R -> P"),
+    ("P", "W", "P", "P"): ("P", "V8.0 R4 | P-W-P-P -> P"),
+}
+
+# 2. NOVAS REGRAS DE ALTA FREQUÊNCIA (Cor + Roll Cat)
+# H = High (8 a 14) | L = Low (0 a 7)
+REGRAS_ROLL = {
+    ("VL", "BL", "PH", "VL"): ("P", "V14.1 | VL-BL-PH-VL -> P"),
+    ("VL", "PH", "BL", "VL"): ("P", "V14.2 | VL-PH-BL-VL -> P"),
+    ("PH", "BL", "PH", "PH"): ("P", "V14.3 | PH-BL-PH-PH -> P"),
+    ("PH", "VL", "BL", "VL"): ("R", "V14.4 | PH-VL-BL-VL -> R"),
+    ("VL", "PH", "PH", "BL"): ("P", "V14.5 | VL-PH-PH-BL -> P"),
 }
 
 def get_db_connection():
@@ -102,12 +112,27 @@ def carregar_historico_por_cursor(cur, ate_id=None):
         historico.append({"id": int(db_id), "rodada_id": str(rodada_id), "cor": cor, "roll": roll})
     return historico
 
+def get_cat(cor, roll):
+    """Cria a categoria combinando Cor e Faixa de Roll (H = >=8, L = <8)"""
+    cat = "H" if roll >= 8 else "L"
+    return cor + cat
+
 def detectar_estrategia(hist):
     if not hist or len(hist) < 4: return None, None
-    contexto = tuple(item["cor"] for item in hist[-4:])
-    regra = REGRAS_V85.get(contexto)
-    if regra is None: return None, None
-    return regra[0], regra[1]
+    
+    # 1. Tenta as Regras de Ouro (Apenas Cores)
+    contexto_cor = tuple(item["cor"] for item in hist[-4:])
+    regra_cor = REGRAS_CORES.get(contexto_cor)
+    if regra_cor:
+        return regra_cor[0], regra_cor[1]
+
+    # 2. Tenta as Novas Regras de Alta Frequência (Cor + Roll)
+    contexto_roll = tuple(get_cat(item["cor"], item["roll"]) for item in hist[-4:])
+    regra_roll = REGRAS_ROLL.get(contexto_roll)
+    if regra_roll:
+        return regra_roll[0], regra_roll[1]
+
+    return None, None
 
 def inverter_cor(cor):
     if cor == "R": return "P"
@@ -142,7 +167,7 @@ def _criar_tentativa(cur, rodada_base_id, rodada_base, ciclo_id, tentativa, estr
     cur.execute("INSERT INTO estrategia_sinais (rodada_base, estrategia, cor_prevista, resultado, tentativa, ciclo_id, cor_regra, cor_entrada, valor_aposta) VALUES (%s, %s, %s, 'PENDENTE', %s, %s, %s, %s, %s);", (str(rodada_base), estrategia, cor_entrada, int(tentativa), str(ciclo_id), cor_regra, cor_entrada, APOSTA_BASE))
     cur.execute("UPDATE bot_estado SET ciclo_ativo = TRUE, ciclo_id = %s, tentativa_atual = %s, ciclo_cor_regra = %s, ciclo_cor_entrada = %s, ciclo_estrategia = %s, sinal_ativo = %s, cor_sinal = %s, rodada_base_sinal = %s, ultima_estrategia = %s, atualizado_em = %s WHERE id = 1;", (str(ciclo_id), int(tentativa), cor_regra, cor_entrada, estrategia, estrategia, cor_entrada, str(rodada_base), estrategia, now))
     print("\n" + "=" * 72)
-    print(f"🎯 NOVA ENTRADA V8.0 GOLDEN PATTERN | TENTATIVA {tentativa}/{MAX_TENTATIVAS}")
+    print(f"🎯 NOVA ENTRADA V8.1 HIGH-FREQ | TENTATIVA {tentativa}/{MAX_TENTATIVAS}")
     print("=" * 72)
     print(f"Base              : {rodada_base}")
     print(f"Estratégia        : {estrategia}")
@@ -157,8 +182,10 @@ def _criar_primeiro_ciclo(cur, rodada_id, rodada_db_id, now):
     historico = carregar_historico_por_cursor(cur, ate_id=rodada_db_id)
     cor_regra, estrategia = detectar_estrategia(historico)
     if not estrategia: return False
+    
     cur.execute("SELECT id FROM estrategia_sinais WHERE rodada_base = %s ORDER BY id DESC LIMIT 1;", (str(rodada_id),))
     if cur.fetchone(): return False
+    
     ciclo_id = f"{rodada_id}-{int(datetime.now().timestamp() * 1000)}"
     cor_entrada = inverter_cor(cor_regra) if INVERSAO_ATIVA else cor_regra
     _criar_tentativa(cur, rodada_db_id, rodada_id, ciclo_id, 1, estrategia, cor_regra, cor_entrada, now)
@@ -255,14 +282,14 @@ def processar_novo_resultado(rodada_id, color, roll):
                 if motor_ativo and not ciclo["ativo"]:
                     _criar_primeiro_ciclo(cur, rodada_id, rodada_db_id, now)
             else:
-                print(f"⏸️ MOTOR V8.0 PAUSADO | rodada={rodada_id} | coleta registrada, nenhuma nova previsão criada", flush=True)
+                print(f"⏸️ MOTOR V8.1 PAUSADO | rodada={rodada_id} | coleta registrada, nenhuma nova previsão criada", flush=True)
             reconciliar_sinais_pendentes(cur, now, limite=5000)
             resumo = recalcular_bot_estado(cur, rodada_id, now)
         conn.commit()
         conn.close()
         return {"ativo": motor_ativo, "estrategia": resumo["estrategia"], "cor": resumo["cor_sinal"], "wins": resumo["wins"], "losses": resumo["losses"], "pendentes": resumo["pendentes"], "profit": resumo["profit"]}
     except Exception as e:
-        print(f"❌ MOTOR V8.0: erro processando rodada {rodada_id}: {e}", flush=True)
+        print(f"❌ MOTOR V8.1: erro processando rodada {rodada_id}: {e}", flush=True)
         try: conn.rollback(); conn.close()
         except: pass
         return None
@@ -278,10 +305,10 @@ def reconciliar_todos_sinais():
             resumo = recalcular_bot_estado(cur, now=now)
         conn.commit()
         conn.close()
-        print(f"🧾 AUDITORIA V8.0 | resolvidos={resolvidos} | pendentes={resumo['pendentes']} | W={resumo['wins']} | L={resumo['losses']} | profit={resumo['profit']:.2f}", flush=True)
+        print(f"🧾 AUDITORIA V8.1 | resolvidos={resolvidos} | pendentes={resumo['pendentes']} | W={resumo['wins']} | L={resumo['losses']} | profit={resumo['profit']:.2f}", flush=True)
         return {"resolvidos": resolvidos, **resumo}
     except Exception as e:
-        print(f"❌ AUDITORIA V8.0: erro: {e}", flush=True)
+        print(f"❌ AUDITORIA V8.1: erro: {e}", flush=True)
         try: conn.rollback(); conn.close()
         except: pass
         return None
