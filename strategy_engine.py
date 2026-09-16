@@ -4,14 +4,14 @@ from datetime import datetime
 import psycopg2
 
 # ================================================================
-# V8.5 + MG3
-# Seis regras V8.5, previsão invertida e gerenciamento de ciclo
-# com até 3 tentativas, SEM dobrar a aposta.
+# V8.5 + MG1 (FLAT BETTING)
+# Regras de Ouro V8.0 (Apenas Regra 1 e Regra 4), sem inversão e 
+# gerenciamento de ciclo com 1 tentativa (APOSTA FIXA).
 # ================================================================
 
 APOSTA_BASE = 1.00
-MAX_TENTATIVAS = 3
-INVERSAO_ATIVA = True
+MAX_TENTATIVAS = 1  # Alterado de 3 para 1 (Sem Martingale)
+INVERSAO_ATIVA = False  # Alterado de True para False (Jogar na cor real da regra)
 
 CORES = {0: "BRANCO", 1: "VERMELHO", 2: "PRETO"}
 COR_SIGLA = {"BRANCO": "W", "VERMELHO": "R", "PRETO": "P"}
@@ -21,13 +21,15 @@ RESULTADO_WIN = "WIN"
 RESULTADO_LOSS = "LOSS"
 
 # Contexto de 4 rodadas; entrada na próxima.
+# Apenas as Regras 1 e 4 estão ativas, pois foram as validadas 
+# estatisticamente no Backtester V8.0 com >65% de acerto.
 REGRAS_V85 = {
     ("R", "W", "P", "R"): ("P", "V8.5 R1 | R-W-P-R -> P"),
-    ("P", "W", "R", "P"): ("R", "V8.5 R2 | P-W-R-P -> R"),
-    ("R", "W", "R", "P"): ("P", "V8.5 R3 | R-W-R-P -> P"),
+    # ("P", "W", "R", "P"): ("R", "V8.5 R2 | P-W-R-P -> R"), # Regra 2 desativada
+    # ("R", "W", "R", "P"): ("P", "V8.5 R3 | R-W-R-P -> P"), # Regra 3 desativada
     ("P", "W", "P", "P"): ("P", "V8.5 R4 | P-W-P-P -> P"),
-    ("P", "W", "R", "R"): ("P", "V8.5 R5 | P-W-R-R -> P"),
-    ("R", "W", "R", "R"): ("R", "V8.5 R6 | R-W-R-R -> R"),
+    # ("P", "W", "R", "R"): ("P", "V8.5 R5 | P-W-R-R -> P"), # Regra 5 desativada
+    # ("R", "W", "R", "R"): ("R", "V8.5 R6 | R-W-R-R -> R"), # Regra 6 desativada
 }
 
 
@@ -99,10 +101,8 @@ def init_engine_db():
             for name, definition in columns:
                 cur.execute(f"ALTER TABLE bot_estado ADD COLUMN IF NOT EXISTS {name} {definition};")
 
-            # Migra instalações antigas em que sinal_ativo foi criado como BOOLEAN.
             cur.execute("""
-                DO $$
-                BEGIN
+                DO $$                 BEGIN
                     IF EXISTS (
                         SELECT 1
                         FROM information_schema.columns
@@ -159,7 +159,6 @@ def init_engine_db():
             cur.execute("CREATE INDEX IF NOT EXISTS idx_estrategia_sinais_criado_em ON estrategia_sinais(criado_em);")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_estrategia_sinais_ciclo ON estrategia_sinais(ciclo_id);")
 
-            # Compatibilidade: registros antigos que usavam WHITE como resultado.
             cur.execute("""
                 UPDATE estrategia_sinais
                 SET resultado = 'LOSS'
@@ -272,7 +271,6 @@ def get_active_signal(rolls, colors):
 
 
 def _resultado_do_sinal(cor_entrada, cor_resultado):
-    # Branco na rodada apostada é LOSS operacional.
     return RESULTADO_WIN if cor_resultado == cor_entrada else RESULTADO_LOSS
 
 
@@ -384,15 +382,15 @@ def _criar_tentativa(cur, rodada_base_id, rodada_base, ciclo_id, tentativa,
         estrategia, cor_entrada, str(rodada_base), estrategia, now,
     ))
     print("\n" + "=" * 72)
-    print(f"🎯 NOVA ENTRADA V8.5 | CICLO {tentativa}/{MAX_TENTATIVAS}")
+    print(f"🎯 NOVA ENTRADA V8.0 GOLDEN PATTERN | TENTATIVA {tentativa}/{MAX_TENTATIVAS}")
     print("=" * 72)
     print(f"Base              : {rodada_base}")
     print(f"Estratégia        : {estrategia}")
     print(f"Previsão da regra : {cor_regra}")
-    print(f"Entrada invertida  : {cor_entrada}")
-    print(f"Tentativa          : {tentativa}/{MAX_TENTATIVAS}")
-    print(f"Valor              : {APOSTA_BASE:.2f} (fixo; sem dobrar)")
-    print("Entrada            : PRÓXIMA RODADA")
+    print(f"Entrada Real      : {cor_entrada}")
+    print(f"Tentativa         : {tentativa}/{MAX_TENTATIVAS} (Flat Betting)")
+    print(f"Valor             : {APOSTA_BASE:.2f} (fixo; sem dobrar)")
+    print("Entrada           : PRÓXIMA RODADA")
     print("=" * 72 + "\n")
 
 
@@ -402,7 +400,6 @@ def _criar_primeiro_ciclo(cur, rodada_id, rodada_db_id, now):
     if not estrategia:
         return False
 
-    # Uma única criação por rodada-base.
     cur.execute("""
         SELECT id FROM estrategia_sinais
         WHERE rodada_base = %s
@@ -421,10 +418,6 @@ def _criar_primeiro_ciclo(cur, rodada_id, rodada_db_id, now):
 
 
 def _resolver_atual_e_avancar_ciclo(cur, atual_id, now):
-    """Resolve a tentativa cuja primeira rodada posterior é atual_id.
-    Se perder e ainda houver tentativa disponível, agenda a próxima para
-    a rodada seguinte, mantendo a mesma cor e o mesmo valor.
-    """
     cur.execute("""
         SELECT s.id, s.rodada_base, s.estrategia, s.cor_prevista,
                s.tentativa, s.ciclo_id, s.cor_regra, s.cor_entrada,
@@ -459,27 +452,24 @@ def _resolver_atual_e_avancar_ciclo(cur, atual_id, now):
         resultado = _resultado_do_sinal(cor_prevista, cor_resultado)
         ciclo = _obter_ciclo(cur)
 
-        # Só manipula o ciclo se o sinal pertence ao ciclo atualmente ativo.
         if ciclo["ativo"] and ciclo["id"] == ciclo_id:
             if resultado == RESULTADO_WIN:
                 _finalizar_ciclo(cur, now, f"WIN na tentativa {tentativa}/{MAX_TENTATIVAS}")
             elif int(tentativa) < MAX_TENTATIVAS:
                 proxima_tentativa = int(tentativa) + 1
-                # Próxima tentativa será na próxima rodada; a rodada atual
-                # apenas resolveu a tentativa anterior.
                 _criar_tentativa(
                     cur, atual_id, rodada_resultado, ciclo_id, proxima_tentativa,
                     estrategia, cor_regra, cor_entrada, now,
                 )
                 print(
-                    f"🔁 MG3 | LOSS na tentativa {tentativa}; "
+                    f"🔁 TENTATIVA EXTRA | LOSS na tentativa {tentativa}; "
                     f"agendada tentativa {proxima_tentativa}/{MAX_TENTATIVAS} "
                     f"para a próxima rodada | entrada={cor_entrada} | "
                     f"valor={APOSTA_BASE:.2f}",
                     flush=True,
                 )
             else:
-                _finalizar_ciclo(cur, now, "3 LOSSES consecutivos; ciclo abandonado")
+                _finalizar_ciclo(cur, now, "LOSS - Ciclo encerrado (Aposta Fixa)")
 
 
 def reconciliar_sinais_pendentes(cur, now, limite=5000):
@@ -636,10 +626,6 @@ def processar_novo_resultado(rodada_id, color, roll):
             motor_ativo = bool(estado[0]) if estado else False
             ultima_processada = str(estado[1]) if estado and estado[1] is not None else None
 
-            # Tratamos primeiro a rodada atual para que um LOSS possa
-            # imediatamente avançar o ciclo MG3 para a próxima rodada.
-            # Depois fazemos reconciliação ampla apenas do que ficou para trás.
-
             if ultima_processada == rodada_id:
                 resumo = recalcular_bot_estado(cur, rodada_id, now)
                 conn.commit()
@@ -661,25 +647,19 @@ def processar_novo_resultado(rodada_id, color, roll):
 
             ciclo_antes = _obter_ciclo(cur)
 
-            # Um ciclo já iniciado continua sendo resolvido mesmo se o
-            # operador apertar PAUSAR. PAUSAR impede apenas novos ciclos.
             if motor_ativo or ciclo_antes["ativo"]:
                 _resolver_atual_e_avancar_ciclo(cur, rodada_db_id, now)
 
-                # Só abre um novo ciclo quando o motor está ativo e o ciclo
-                # anterior terminou (WIN ou 3 LOSSES).
                 ciclo = _obter_ciclo(cur)
                 if motor_ativo and not ciclo["ativo"]:
                     _criar_primeiro_ciclo(cur, rodada_id, rodada_db_id, now)
             else:
                 print(
-                    f"⏸️ MOTOR V8.5 PAUSADO | rodada={rodada_id} | "
+                    f"⏸️ MOTOR V8.0 PAUSADO | rodada={rodada_id} | "
                     "coleta registrada, nenhuma nova previsão criada",
                     flush=True,
                 )
 
-            # Reconcilia registros antigos que não correspondam à rodada
-            # atual. Isso não interfere no ciclo atual, que já foi tratado acima.
             reconciliar_sinais_pendentes(cur, now, limite=5000)
 
             resumo = recalcular_bot_estado(cur, rodada_id, now)
@@ -696,7 +676,7 @@ def processar_novo_resultado(rodada_id, color, roll):
             "profit": resumo["profit"],
         }
     except Exception as e:
-        print(f"❌ MOTOR V8.5 MG3: erro processando rodada {rodada_id}: {e}", flush=True)
+        print(f"❌ MOTOR V8.0: erro processando rodada {rodada_id}: {e}", flush=True)
         try:
             conn.rollback()
             conn.close()
@@ -719,14 +699,14 @@ def reconciliar_todos_sinais():
         conn.commit()
         conn.close()
         print(
-            "🧾 AUDITORIA V8.5 MG3 | "
+            "🧾 AUDITORIA V8.0 | "
             f"resolvidos={resolvidos} | pendentes={resumo['pendentes']} | "
             f"W={resumo['wins']} | L={resumo['losses']} | "
             f"profit={resumo['profit']:.2f}", flush=True,
         )
         return {"resolvidos": resolvidos, **resumo}
     except Exception as e:
-        print(f"❌ AUDITORIA V8.5 MG3: erro: {e}", flush=True)
+        print(f"❌ AUDITORIA V8.0: erro: {e}", flush=True)
         try:
             conn.rollback()
             conn.close()
