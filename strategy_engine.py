@@ -3,7 +3,15 @@ from datetime import datetime
 
 import psycopg2
 
+# ================================================================
+# V8.5 + MG3
+# Seis regras V8.5, previsão invertida e gerenciamento de ciclo
+# com até 3 tentativas, SEM dobrar a aposta.
+# ================================================================
+
 APOSTA_BASE = 1.00
+MAX_TENTATIVAS = 3
+INVERSAO_ATIVA = True
 
 CORES = {0: "BRANCO", 1: "VERMELHO", 2: "PRETO"}
 COR_SIGLA = {"BRANCO": "W", "VERMELHO": "R", "PRETO": "P"}
@@ -12,15 +20,7 @@ RESULTADO_PENDENTE = "PENDENTE"
 RESULTADO_WIN = "WIN"
 RESULTADO_LOSS = "LOSS"
 
-# ================================================================
-# V8.5 — SEIS REGRAS DEFINIDAS PELO ESTUDO
-#
-# O contexto tem 4 rodadas observadas. A entrada é na PRÓXIMA.
-# A regra gera uma previsão original, mas a cor efetivamente apostada
-# é SEMPRE invertida: R -> P e P -> R.
-# Branco na rodada de entrada é LOSS operacional.
-# ================================================================
-
+# Contexto de 4 rodadas; entrada na próxima.
 REGRAS_V85 = {
     ("R", "W", "P", "R"): ("P", "V8.5 R1 | R-W-P-R -> P"),
     ("P", "W", "R", "P"): ("R", "V8.5 R2 | P-W-R-P -> R"),
@@ -36,7 +36,6 @@ def get_db_connection():
     if not database_url:
         print("❌ MOTOR: DATABASE_URL não configurada.", flush=True)
         return None
-
     try:
         if "sslmode=" not in database_url:
             separator = "&" if "?" in database_url else "?"
@@ -51,7 +50,6 @@ def init_engine_db():
     conn = get_db_connection()
     if not conn:
         return False
-
     try:
         with conn.cursor() as cur:
             cur.execute("""
@@ -68,6 +66,12 @@ def init_engine_db():
                     motor_ativo BOOLEAN DEFAULT FALSE,
                     ultima_estrategia VARCHAR(150),
                     inicio_sessao TIMESTAMP,
+                    ciclo_ativo BOOLEAN DEFAULT FALSE,
+                    ciclo_id VARCHAR(120),
+                    tentativa_atual INTEGER DEFAULT 0,
+                    ciclo_cor_regra VARCHAR(5),
+                    ciclo_cor_entrada VARCHAR(5),
+                    ciclo_estrategia VARCHAR(150),
                     atualizado_em TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 );
             """)
@@ -84,16 +88,41 @@ def init_engine_db():
                 ("motor_ativo", "BOOLEAN DEFAULT FALSE"),
                 ("ultima_estrategia", "VARCHAR(150)"),
                 ("inicio_sessao", "TIMESTAMP"),
+                ("ciclo_ativo", "BOOLEAN DEFAULT FALSE"),
+                ("ciclo_id", "VARCHAR(120)"),
+                ("tentativa_atual", "INTEGER DEFAULT 0"),
+                ("ciclo_cor_regra", "VARCHAR(5)"),
+                ("ciclo_cor_entrada", "VARCHAR(5)"),
+                ("ciclo_estrategia", "VARCHAR(150)"),
                 ("atualizado_em", "TIMESTAMP DEFAULT CURRENT_TIMESTAMP"),
             ]
             for name, definition in columns:
-                cur.execute(
-                    f"ALTER TABLE bot_estado ADD COLUMN IF NOT EXISTS {name} {definition};"
-                )
+                cur.execute(f"ALTER TABLE bot_estado ADD COLUMN IF NOT EXISTS {name} {definition};")
+
+            # Migra instalações antigas em que sinal_ativo foi criado como BOOLEAN.
+            cur.execute("""
+                DO $$
+                BEGIN
+                    IF EXISTS (
+                        SELECT 1
+                        FROM information_schema.columns
+                        WHERE table_name = 'bot_estado'
+                          AND column_name = 'sinal_ativo'
+                          AND data_type = 'boolean'
+                    ) THEN
+                        ALTER TABLE bot_estado
+                        ALTER COLUMN sinal_ativo TYPE VARCHAR(150)
+                        USING CASE
+                            WHEN sinal_ativo THEN 'ATIVO'
+                            ELSE NULL
+                        END;
+                    END IF;
+                END $$;
+            """)
 
             cur.execute("""
-                INSERT INTO bot_estado (id, wins, losses, whites, profit, motor_ativo)
-                VALUES (1, 0, 0, 0, 0.00, FALSE)
+                INSERT INTO bot_estado (id, wins, losses, whites, profit, motor_ativo, ciclo_ativo, tentativa_atual)
+                VALUES (1, 0, 0, 0, 0.00, FALSE, FALSE, 0)
                 ON CONFLICT (id) DO NOTHING;
             """)
 
@@ -107,28 +136,30 @@ def init_engine_db():
                     cor_resultado VARCHAR(5),
                     resultado VARCHAR(20),
                     criado_em TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    resolvido_em TIMESTAMP
+                    resolvido_em TIMESTAMP,
+                    tentativa INTEGER DEFAULT 1,
+                    ciclo_id VARCHAR(120),
+                    cor_regra VARCHAR(5),
+                    cor_entrada VARCHAR(5),
+                    valor_aposta NUMERIC(12,2) DEFAULT 1.00
                 );
             """)
+            for name, definition in [
+                ("tentativa", "INTEGER DEFAULT 1"),
+                ("ciclo_id", "VARCHAR(120)"),
+                ("cor_regra", "VARCHAR(5)"),
+                ("cor_entrada", "VARCHAR(5)"),
+                ("valor_aposta", "NUMERIC(12,2) DEFAULT 1.00"),
+            ]:
+                cur.execute(f"ALTER TABLE estrategia_sinais ADD COLUMN IF NOT EXISTS {name} {definition};")
 
-            cur.execute(
-                "CREATE INDEX IF NOT EXISTS idx_estrategia_sinais_base "
-                "ON estrategia_sinais(rodada_base);"
-            )
-            cur.execute(
-                "CREATE INDEX IF NOT EXISTS idx_estrategia_sinais_estrategia "
-                "ON estrategia_sinais(estrategia);"
-            )
-            cur.execute(
-                "CREATE INDEX IF NOT EXISTS idx_estrategia_sinais_resultado "
-                "ON estrategia_sinais(resultado);"
-            )
-            cur.execute(
-                "CREATE INDEX IF NOT EXISTS idx_estrategia_sinais_criado_em "
-                "ON estrategia_sinais(criado_em);"
-            )
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_estrategia_sinais_base ON estrategia_sinais(rodada_base);")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_estrategia_sinais_estrategia ON estrategia_sinais(estrategia);")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_estrategia_sinais_resultado ON estrategia_sinais(resultado);")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_estrategia_sinais_criado_em ON estrategia_sinais(criado_em);")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_estrategia_sinais_ciclo ON estrategia_sinais(ciclo_id);")
 
-            # Migração operacional: WHITE antigo passa a ser LOSS.
+            # Compatibilidade: registros antigos que usavam WHITE como resultado.
             cur.execute("""
                 UPDATE estrategia_sinais
                 SET resultado = 'LOSS'
@@ -138,7 +169,6 @@ def init_engine_db():
         conn.commit()
         conn.close()
         return True
-
     except Exception as e:
         print(f"❌ MOTOR: erro inicializando banco: {e}", flush=True)
         try:
@@ -171,359 +201,6 @@ def mapear_cor_texto(cor):
 
 def obter_cor(cor_texto, color):
     return mapear_cor_texto(cor_texto) or cor_para_sigla(color)
-
-
-def inverter_cor(cor):
-    """Inverte somente VERMELHO/PRETO. BRANCO não é uma entrada válida."""
-    if cor == "R":
-        return "P"
-    if cor == "P":
-        return "R"
-    return cor
-
-
-def carregar_historico(conn, ate_id=None):
-    with conn.cursor() as cur:
-        query = """
-            SELECT id, rodada_id, color, cor, roll
-            FROM blaze_historico
-            WHERE status = 'complete'
-              AND color IN (0, 1, 2)
-              AND roll IS NOT NULL
-        """
-        params = []
-        if ate_id is not None:
-            query += " AND id <= %s"
-            params.append(ate_id)
-        query += " ORDER BY id ASC;"
-        cur.execute(query, params)
-        rows = cur.fetchall()
-
-    historico = []
-    for db_id, rodada_id, color, cor_texto, roll in rows:
-        cor = obter_cor(cor_texto, color)
-        if cor is None:
-            continue
-        try:
-            roll = int(roll)
-        except (TypeError, ValueError):
-            continue
-        historico.append({
-            "id": int(db_id),
-            "rodada_id": str(rodada_id),
-            "cor": cor,
-            "roll": roll,
-        })
-    return historico
-
-
-def detectar_estrategia(hist):
-    """Retorna (cor_prevista, nome_estrategia) para a última janela de 4 cores."""
-    if not hist or len(hist) < 4:
-        return None, None
-
-    contexto = tuple(item["cor"] for item in hist[-4:])
-    regra = REGRAS_V85.get(contexto)
-    if regra is None:
-        return None, None
-
-    cor_prevista, nome = regra
-    return cor_prevista, nome
-
-
-def get_active_signal(rolls, colors):
-    """Compatibilidade: recebe listas e retorna (estratégia, previsão)."""
-    if not colors or len(colors) < 4:
-        return None
-    contexto = tuple(list(colors)[-4:])
-    regra = REGRAS_V85.get(contexto)
-    if regra is None:
-        return None
-    cor_prevista, nome = regra
-    return nome, cor_prevista
-
-
-def _resultado_do_sinal(cor_prevista, cor_resultado):
-    # WHITE é LOSS operacional. Só a cor prevista exata é WIN.
-    return RESULTADO_WIN if cor_resultado == cor_prevista else RESULTADO_LOSS
-
-
-def _proxima_rodada_complete(cur, base_db_id):
-    cur.execute("""
-        SELECT id, rodada_id, color, cor, roll
-        FROM blaze_historico
-        WHERE status = 'complete'
-          AND id > %s
-          AND color IN (0, 1, 2)
-          AND roll IS NOT NULL
-        ORDER BY id ASC
-        LIMIT 1;
-    """, (base_db_id,))
-    return cur.fetchone()
-
-
-def resolver_sinal_por_rodada(
-    cur,
-    sinal_id,
-    rodada_base,
-    estrategia,
-    cor_prevista,
-    rodada_resultado,
-    cor_resultado,
-    now,
-):
-    resultado = _resultado_do_sinal(cor_prevista, cor_resultado)
-
-    cur.execute("""
-        UPDATE estrategia_sinais
-        SET rodada_resultado = %s,
-            cor_resultado = %s,
-            resultado = %s,
-            resolvido_em = %s
-        WHERE id = %s
-          AND resultado = 'PENDENTE';
-    """, (
-        str(rodada_resultado),
-        cor_resultado,
-        resultado,
-        now,
-        sinal_id,
-    ))
-
-    if cur.rowcount != 1:
-        return False
-
-    print(
-        "📊 SINAL RESOLVIDO | "
-        f"id={sinal_id} | base={rodada_base} | "
-        f"resultado={rodada_resultado} | estratégia={estrategia} | "
-        f"entrada={cor_prevista} | real={cor_resultado} | {resultado}",
-        flush=True,
-    )
-    return True
-
-
-def reconciliar_sinais_pendentes(cur, now, limite=5000):
-    """Resolve cada pendente pela primeira rodada complete posterior à sua base."""
-    cur.execute("""
-        SELECT s.id, s.rodada_base, s.estrategia, s.cor_prevista,
-               b.id AS base_db_id
-        FROM estrategia_sinais s
-        JOIN blaze_historico b
-          ON b.rodada_id = s.rodada_base
-         AND b.status = 'complete'
-        WHERE s.resultado = 'PENDENTE'
-        ORDER BY s.id ASC
-        LIMIT %s;
-    """, (limite,))
-
-    pendentes = cur.fetchall()
-    resolvidos = 0
-
-    for sinal_id, rodada_base, estrategia, cor_prevista, base_db_id in pendentes:
-        row = _proxima_rodada_complete(cur, int(base_db_id))
-        if not row:
-            continue
-
-        _resultado_db_id, rodada_resultado, color_resultado, cor_texto, _roll = row
-        cor_resultado = obter_cor(cor_texto, color_resultado)
-        if cor_resultado is None:
-            continue
-
-        if resolver_sinal_por_rodada(
-            cur,
-            sinal_id,
-            rodada_base,
-            estrategia,
-            cor_prevista,
-            rodada_resultado,
-            cor_resultado,
-            now,
-        ):
-            resolvidos += 1
-
-    return resolvidos
-
-
-def recalcular_bot_estado(cur, rodada_atual=None, now=None):
-    """Mantém bot_estado como resumo global; o dashboard calcula a sessão."""
-    cur.execute("""
-        SELECT
-            COUNT(*) FILTER (WHERE resultado = 'WIN') AS wins,
-            COUNT(*) FILTER (WHERE resultado = 'LOSS') AS losses,
-            COUNT(*) FILTER (WHERE resultado = 'PENDENTE') AS pendentes,
-            COUNT(*) FILTER (
-                WHERE resultado = 'LOSS' AND cor_resultado = 'W'
-            ) AS whites_internos
-        FROM estrategia_sinais;
-    """)
-    wins, losses, pendentes, whites_internos = cur.fetchone()
-    wins = int(wins or 0)
-    losses = int(losses or 0)
-    pendentes = int(pendentes or 0)
-    whites_internos = int(whites_internos or 0)
-
-    cur.execute("SELECT motor_ativo, inicio_sessao FROM bot_estado WHERE id = 1;")
-    state = cur.fetchone()
-    motor_ativo = bool(state[0]) if state else False
-    inicio_sessao = state[1] if state else None
-
-    # Só a sessão atual pode ter sinal ativo exibido no estado operacional.
-    sinal = None
-    if motor_ativo and inicio_sessao:
-        cur.execute("""
-            SELECT estrategia, cor_prevista, rodada_base
-            FROM estrategia_sinais
-            WHERE resultado = 'PENDENTE'
-              AND criado_em >= %s
-            ORDER BY id DESC
-            LIMIT 1;
-        """, (inicio_sessao,))
-        sinal = cur.fetchone()
-
-    if sinal:
-        estrategia_ativa, cor_sinal, rodada_base_sinal = sinal
-        sinal_ativo = estrategia_ativa
-    else:
-        estrategia_ativa = None
-        cor_sinal = None
-        rodada_base_sinal = None
-        sinal_ativo = None
-
-    profit = (wins - losses) * APOSTA_BASE
-    now = now or datetime.now()
-
-    cur.execute("""
-        UPDATE bot_estado
-        SET wins = %s,
-            losses = %s,
-            whites = %s,
-            profit = %s,
-            sinal_ativo = %s,
-            cor_sinal = %s,
-            ultima_rodada_processada = COALESCE(%s, ultima_rodada_processada),
-            rodada_base_sinal = %s,
-            ultima_estrategia = %s,
-            atualizado_em = %s
-        WHERE id = 1;
-    """, (
-        wins,
-        losses,
-        whites_internos,
-        profit,
-        sinal_ativo,
-        cor_sinal,
-        str(rodada_atual) if rodada_atual is not None else None,
-        rodada_base_sinal,
-        estrategia_ativa,
-        now,
-    ))
-
-    return {
-        "wins": wins,
-        "losses": losses,
-        "pendentes": pendentes,
-        "whites_internos": whites_internos,
-        "profit": float(profit),
-        "sinal_ativo": sinal_ativo,
-        "cor_sinal": cor_sinal,
-        "rodada_base_sinal": rodada_base_sinal,
-        "estrategia": estrategia_ativa,
-        "motor_ativo": motor_ativo,
-    }
-
-
-def _rodada_persistida(cur, rodada_id):
-    cur.execute("""
-        SELECT id, color, cor, roll
-        FROM blaze_historico
-        WHERE rodada_id = %s
-          AND status = 'complete'
-        LIMIT 1;
-    """, (str(rodada_id),))
-    return cur.fetchone()
-
-
-def _resolver_pendente_da_rodada_atual(cur, atual_id, now):
-    """Resolve pendentes cuja primeira rodada posterior é exatamente atual_id."""
-    cur.execute("""
-        SELECT s.id, s.rodada_base, s.estrategia, s.cor_prevista, b.id AS base_db_id
-        FROM estrategia_sinais s
-        JOIN blaze_historico b
-          ON b.rodada_id = s.rodada_base
-         AND b.status = 'complete'
-        WHERE s.resultado = 'PENDENTE'
-          AND b.id < %s
-        ORDER BY s.id ASC;
-    """, (atual_id,))
-
-    resolvidos = 0
-    for sinal_id, rodada_base, estrategia, cor_prevista, base_db_id in cur.fetchall():
-        row = _proxima_rodada_complete(cur, int(base_db_id))
-        if not row:
-            continue
-        resultado_db_id, rodada_resultado, color_resultado, cor_texto, _roll = row
-        if int(resultado_db_id) != int(atual_id):
-            continue
-
-        cor_resultado = obter_cor(cor_texto, color_resultado)
-        if cor_resultado is None:
-            continue
-
-        if resolver_sinal_por_rodada(
-            cur,
-            sinal_id,
-            rodada_base,
-            estrategia,
-            cor_prevista,
-            rodada_resultado,
-            cor_resultado,
-            now,
-        ):
-            resolvidos += 1
-    return resolvidos
-
-
-def _criar_sinal_para_rodada_atual(cur, rodada_id, rodada_db_id):
-    """Detecta a regra e registra a cor INVERTIDA como entrada efetiva."""
-    historico = carregar_historico_por_cursor(cur, ate_id=rodada_db_id)
-    cor_original, estrategia = detectar_estrategia(historico)
-    if not estrategia:
-        return None
-
-    # V8.5 INVERTIDA: a regra continua exatamente a mesma, mas a cor
-    # efetivamente apostada é o oposto da previsão original.
-    cor_entrada = inverter_cor(cor_original)
-    if cor_entrada not in {"R", "P"}:
-        return None
-
-    cur.execute("""
-        SELECT id, resultado
-        FROM estrategia_sinais
-        WHERE rodada_base = %s
-        ORDER BY id DESC
-        LIMIT 1;
-    """, (str(rodada_id),))
-    existente = cur.fetchone()
-    if existente:
-        return None
-
-    cur.execute("""
-        INSERT INTO estrategia_sinais
-            (rodada_base, estrategia, cor_prevista, resultado)
-        VALUES (%s, %s, %s, 'PENDENTE');
-    """, (str(rodada_id), estrategia, cor_entrada))
-
-    print("\n" + "=" * 72)
-    print("🎯 NOVO SINAL V8.5 — INVERSÃO ATIVA")
-    print("=" * 72)
-    print(f"Base       : {rodada_id}")
-    print(f"Estratégia : {estrategia}")
-    print(f"Regra diz  : {cor_original}")
-    print(f"Entrada    : {cor_entrada} (INVERTIDA)")
-    print("Entrada    : PRÓXIMA RODADA")
-    print("=" * 72 + "\n")
-    return estrategia, cor_entrada
 
 
 def carregar_historico_por_cursor(cur, ate_id=None):
@@ -559,11 +236,377 @@ def carregar_historico_por_cursor(cur, ate_id=None):
     return historico
 
 
+def carregar_historico(conn, ate_id=None):
+    with conn.cursor() as cur:
+        return carregar_historico_por_cursor(cur, ate_id=ate_id)
+
+
+def detectar_estrategia(hist):
+    if not hist or len(hist) < 4:
+        return None, None
+    contexto = tuple(item["cor"] for item in hist[-4:])
+    regra = REGRAS_V85.get(contexto)
+    if regra is None:
+        return None, None
+    cor_regra, nome = regra
+    return cor_regra, nome
+
+
+def inverter_cor(cor):
+    if cor == "R":
+        return "P"
+    if cor == "P":
+        return "R"
+    return cor
+
+
+def get_active_signal(rolls, colors):
+    if not colors or len(colors) < 4:
+        return None
+    contexto = tuple(list(colors)[-4:])
+    regra = REGRAS_V85.get(contexto)
+    if regra is None:
+        return None
+    cor_regra, nome = regra
+    return nome, inverter_cor(cor_regra) if INVERSAO_ATIVA else cor_regra
+
+
+def _resultado_do_sinal(cor_entrada, cor_resultado):
+    # Branco na rodada apostada é LOSS operacional.
+    return RESULTADO_WIN if cor_resultado == cor_entrada else RESULTADO_LOSS
+
+
+def _proxima_rodada_complete(cur, base_db_id):
+    cur.execute("""
+        SELECT id, rodada_id, color, cor, roll
+        FROM blaze_historico
+        WHERE status = 'complete'
+          AND id > %s
+          AND color IN (0, 1, 2)
+          AND roll IS NOT NULL
+        ORDER BY id ASC
+        LIMIT 1;
+    """, (base_db_id,))
+    return cur.fetchone()
+
+
+def resolver_sinal_por_rodada(cur, sinal_id, rodada_base, estrategia, cor_entrada,
+                               rodada_resultado, cor_resultado, now):
+    resultado = _resultado_do_sinal(cor_entrada, cor_resultado)
+    cur.execute("""
+        UPDATE estrategia_sinais
+        SET rodada_resultado = %s,
+            cor_resultado = %s,
+            resultado = %s,
+            resolvido_em = %s
+        WHERE id = %s
+          AND resultado = 'PENDENTE';
+    """, (str(rodada_resultado), cor_resultado, resultado, now, sinal_id))
+    if cur.rowcount != 1:
+        return False
+    print(
+        "📊 SINAL RESOLVIDO | "
+        f"id={sinal_id} | base={rodada_base} | resultado={rodada_resultado} | "
+        f"estratégia={estrategia} | entrada={cor_entrada} | real={cor_resultado} | {resultado}",
+        flush=True,
+    )
+    return True
+
+
+def _obter_ciclo(cur):
+    cur.execute("""
+        SELECT ciclo_ativo, ciclo_id, tentativa_atual, ciclo_cor_regra,
+               ciclo_cor_entrada, ciclo_estrategia
+        FROM bot_estado
+        WHERE id = 1;
+    """)
+    row = cur.fetchone()
+    if not row:
+        return {
+            "ativo": False, "id": None, "tentativa": 0,
+            "cor_regra": None, "cor_entrada": None, "estrategia": None,
+        }
+    return {
+        "ativo": bool(row[0]),
+        "id": row[1],
+        "tentativa": int(row[2] or 0),
+        "cor_regra": row[3],
+        "cor_entrada": row[4],
+        "estrategia": row[5],
+    }
+
+
+def _finalizar_ciclo(cur, now, motivo):
+    cur.execute("""
+        UPDATE bot_estado
+        SET ciclo_ativo = FALSE,
+            ciclo_id = NULL,
+            tentativa_atual = 0,
+            ciclo_cor_regra = NULL,
+            ciclo_cor_entrada = NULL,
+            ciclo_estrategia = NULL,
+            sinal_ativo = NULL,
+            cor_sinal = NULL,
+            rodada_base_sinal = NULL,
+            atualizado_em = %s
+        WHERE id = 1;
+    """, (now,))
+    print(f"🏁 CICLO ENCERRADO | {motivo}", flush=True)
+
+
+def _criar_tentativa(cur, rodada_base_id, rodada_base, ciclo_id, tentativa,
+                     estrategia, cor_regra, cor_entrada, now):
+    cur.execute("""
+        INSERT INTO estrategia_sinais
+            (rodada_base, estrategia, cor_prevista, resultado, tentativa,
+             ciclo_id, cor_regra, cor_entrada, valor_aposta)
+        VALUES (%s, %s, %s, 'PENDENTE', %s, %s, %s, %s, %s);
+    """, (
+        str(rodada_base), estrategia, cor_entrada, int(tentativa), str(ciclo_id),
+        cor_regra, cor_entrada, APOSTA_BASE,
+    ))
+    cur.execute("""
+        UPDATE bot_estado
+        SET ciclo_ativo = TRUE,
+            ciclo_id = %s,
+            tentativa_atual = %s,
+            ciclo_cor_regra = %s,
+            ciclo_cor_entrada = %s,
+            ciclo_estrategia = %s,
+            sinal_ativo = %s,
+            cor_sinal = %s,
+            rodada_base_sinal = %s,
+            ultima_estrategia = %s,
+            atualizado_em = %s
+        WHERE id = 1;
+    """, (
+        str(ciclo_id), int(tentativa), cor_regra, cor_entrada, estrategia,
+        estrategia, cor_entrada, str(rodada_base), estrategia, now,
+    ))
+    print("\n" + "=" * 72)
+    print(f"🎯 NOVA ENTRADA V8.5 | CICLO {tentativa}/{MAX_TENTATIVAS}")
+    print("=" * 72)
+    print(f"Base              : {rodada_base}")
+    print(f"Estratégia        : {estrategia}")
+    print(f"Previsão da regra : {cor_regra}")
+    print(f"Entrada invertida  : {cor_entrada}")
+    print(f"Tentativa          : {tentativa}/{MAX_TENTATIVAS}")
+    print(f"Valor              : {APOSTA_BASE:.2f} (fixo; sem dobrar)")
+    print("Entrada            : PRÓXIMA RODADA")
+    print("=" * 72 + "\n")
+
+
+def _criar_primeiro_ciclo(cur, rodada_id, rodada_db_id, now):
+    historico = carregar_historico_por_cursor(cur, ate_id=rodada_db_id)
+    cor_regra, estrategia = detectar_estrategia(historico)
+    if not estrategia:
+        return False
+
+    # Uma única criação por rodada-base.
+    cur.execute("""
+        SELECT id FROM estrategia_sinais
+        WHERE rodada_base = %s
+        ORDER BY id DESC LIMIT 1;
+    """, (str(rodada_id),))
+    if cur.fetchone():
+        return False
+
+    ciclo_id = f"{rodada_id}-{int(datetime.now().timestamp() * 1000)}"
+    cor_entrada = inverter_cor(cor_regra) if INVERSAO_ATIVA else cor_regra
+    _criar_tentativa(
+        cur, rodada_db_id, rodada_id, ciclo_id, 1,
+        estrategia, cor_regra, cor_entrada, now,
+    )
+    return True
+
+
+def _resolver_atual_e_avancar_ciclo(cur, atual_id, now):
+    """Resolve a tentativa cuja primeira rodada posterior é atual_id.
+    Se perder e ainda houver tentativa disponível, agenda a próxima para
+    a rodada seguinte, mantendo a mesma cor e o mesmo valor.
+    """
+    cur.execute("""
+        SELECT s.id, s.rodada_base, s.estrategia, s.cor_prevista,
+               s.tentativa, s.ciclo_id, s.cor_regra, s.cor_entrada,
+               b.id AS base_db_id
+        FROM estrategia_sinais s
+        JOIN blaze_historico b
+          ON b.rodada_id = s.rodada_base
+         AND b.status = 'complete'
+        WHERE s.resultado = 'PENDENTE'
+          AND b.id < %s
+        ORDER BY s.id ASC;
+    """, (atual_id,))
+
+    for row in cur.fetchall():
+        (sinal_id, rodada_base, estrategia, cor_prevista, tentativa,
+         ciclo_id, cor_regra, cor_entrada, base_db_id) = row
+        rodada = _proxima_rodada_complete(cur, int(base_db_id))
+        if not rodada or int(rodada[0]) != int(atual_id):
+            continue
+
+        _, rodada_resultado, color_resultado, cor_texto, _roll = rodada
+        cor_resultado = obter_cor(cor_texto, color_resultado)
+        if cor_resultado is None:
+            continue
+
+        if not resolver_sinal_por_rodada(
+            cur, sinal_id, rodada_base, estrategia, cor_prevista,
+            rodada_resultado, cor_resultado, now,
+        ):
+            continue
+
+        resultado = _resultado_do_sinal(cor_prevista, cor_resultado)
+        ciclo = _obter_ciclo(cur)
+
+        # Só manipula o ciclo se o sinal pertence ao ciclo atualmente ativo.
+        if ciclo["ativo"] and ciclo["id"] == ciclo_id:
+            if resultado == RESULTADO_WIN:
+                _finalizar_ciclo(cur, now, f"WIN na tentativa {tentativa}/{MAX_TENTATIVAS}")
+            elif int(tentativa) < MAX_TENTATIVAS:
+                proxima_tentativa = int(tentativa) + 1
+                # Próxima tentativa será na próxima rodada; a rodada atual
+                # apenas resolveu a tentativa anterior.
+                _criar_tentativa(
+                    cur, atual_id, rodada_resultado, ciclo_id, proxima_tentativa,
+                    estrategia, cor_regra, cor_entrada, now,
+                )
+                print(
+                    f"🔁 MG3 | LOSS na tentativa {tentativa}; "
+                    f"agendada tentativa {proxima_tentativa}/{MAX_TENTATIVAS} "
+                    f"para a próxima rodada | entrada={cor_entrada} | "
+                    f"valor={APOSTA_BASE:.2f}",
+                    flush=True,
+                )
+            else:
+                _finalizar_ciclo(cur, now, "3 LOSSES consecutivos; ciclo abandonado")
+
+
+def reconciliar_sinais_pendentes(cur, now, limite=5000):
+    cur.execute("""
+        SELECT s.id, s.rodada_base, s.estrategia, s.cor_prevista,
+               b.id AS base_db_id
+        FROM estrategia_sinais s
+        JOIN blaze_historico b
+          ON b.rodada_id = s.rodada_base
+         AND b.status = 'complete'
+        WHERE s.resultado = 'PENDENTE'
+        ORDER BY s.id ASC
+        LIMIT %s;
+    """, (limite,))
+    pendentes = cur.fetchall()
+    resolvidos = 0
+    for sinal_id, rodada_base, estrategia, cor_prevista, base_db_id in pendentes:
+        row = _proxima_rodada_complete(cur, int(base_db_id))
+        if not row:
+            continue
+        _, rodada_resultado, color_resultado, cor_texto, _roll = row
+        cor_resultado = obter_cor(cor_texto, color_resultado)
+        if cor_resultado is None:
+            continue
+        if resolver_sinal_por_rodada(
+            cur, sinal_id, rodada_base, estrategia, cor_prevista,
+            rodada_resultado, cor_resultado, now,
+        ):
+            resolvidos += 1
+    return resolvidos
+
+
+def recalcular_bot_estado(cur, rodada_atual=None, now=None):
+    cur.execute("""
+        SELECT
+            COUNT(*) FILTER (WHERE resultado = 'WIN') AS wins,
+            COUNT(*) FILTER (WHERE resultado = 'LOSS') AS losses,
+            COUNT(*) FILTER (WHERE resultado = 'PENDENTE') AS pendentes,
+            COUNT(*) FILTER (WHERE resultado = 'LOSS' AND cor_resultado = 'W') AS whites_internos,
+            COALESCE(SUM(CASE WHEN resultado = 'WIN' THEN valor_aposta
+                              WHEN resultado = 'LOSS' THEN -valor_aposta
+                              ELSE 0 END), 0) AS profit
+        FROM estrategia_sinais;
+    """)
+    wins, losses, pendentes, whites_internos, profit = cur.fetchone()
+    wins = int(wins or 0)
+    losses = int(losses or 0)
+    pendentes = int(pendentes or 0)
+    whites_internos = int(whites_internos or 0)
+    profit = float(profit or 0.0)
+
+    cur.execute("SELECT motor_ativo, inicio_sessao FROM bot_estado WHERE id = 1;")
+    state = cur.fetchone()
+    motor_ativo = bool(state[0]) if state else False
+    inicio_sessao = state[1] if state else None
+    ciclo = _obter_ciclo(cur)
+
+    rodada_base_sinal = None
+    if ciclo["ativo"] and ciclo["id"]:
+        cur.execute("""
+            SELECT rodada_base
+            FROM estrategia_sinais
+            WHERE ciclo_id = %s
+              AND resultado = 'PENDENTE'
+            ORDER BY id DESC
+            LIMIT 1;
+        """, (str(ciclo["id"]),))
+        base_row = cur.fetchone()
+        rodada_base_sinal = base_row[0] if base_row else None
+
+    now = now or datetime.now()
+    cur.execute("""
+        UPDATE bot_estado
+        SET wins = %s,
+            losses = %s,
+            whites = %s,
+            profit = %s,
+            sinal_ativo = %s,
+            cor_sinal = %s,
+            ultima_rodada_processada = COALESCE(%s, ultima_rodada_processada),
+            rodada_base_sinal = %s,
+            ultima_estrategia = %s,
+            atualizado_em = %s
+        WHERE id = 1;
+    """, (
+        wins, losses, whites_internos, profit,
+        ciclo["estrategia"] if ciclo["ativo"] else None,
+        ciclo["cor_entrada"] if ciclo["ativo"] else None,
+        str(rodada_atual) if rodada_atual is not None else None,
+        rodada_base_sinal,
+        ciclo["estrategia"] if ciclo["ativo"] else None,
+        now,
+    ))
+
+    return {
+        "wins": wins,
+        "losses": losses,
+        "pendentes": pendentes,
+        "whites_internos": whites_internos,
+        "profit": profit,
+        "sinal_ativo": ciclo["estrategia"] if ciclo["ativo"] else None,
+        "cor_sinal": ciclo["cor_entrada"] if ciclo["ativo"] else None,
+        "rodada_base_sinal": None,
+        "estrategia": ciclo["estrategia"] if ciclo["ativo"] else None,
+        "motor_ativo": motor_ativo,
+        "ciclo_ativo": ciclo["ativo"],
+        "ciclo_id": ciclo["id"],
+        "tentativa_atual": ciclo["tentativa"],
+        "ciclo_cor_regra": ciclo["cor_regra"],
+        "ciclo_cor_entrada": ciclo["cor_entrada"],
+    }
+
+
+def _rodada_persistida(cur, rodada_id):
+    cur.execute("""
+        SELECT id, color, cor, roll
+        FROM blaze_historico
+        WHERE rodada_id = %s
+          AND status = 'complete'
+        LIMIT 1;
+    """, (str(rodada_id),))
+    return cur.fetchone()
+
+
 def processar_novo_resultado(rodada_id, color, roll):
-    """Processa uma rodada já persistida pelo collector."""
     if not init_engine_db():
         return None
-
     conn = get_db_connection()
     if not conn:
         return None
@@ -587,26 +630,19 @@ def processar_novo_resultado(rodada_id, color, roll):
 
             cur.execute("""
                 SELECT motor_ativo, ultima_rodada_processada
-                FROM bot_estado
-                WHERE id = 1;
+                FROM bot_estado WHERE id = 1;
             """)
             estado = cur.fetchone()
             motor_ativo = bool(estado[0]) if estado else False
             ultima_processada = str(estado[1]) if estado and estado[1] is not None else None
 
-            # 1) Sempre reconcilia pendências que já possuem resultado.
-            reconciliar_sinais_pendentes(cur, now)
-            _resolver_pendente_da_rodada_atual(cur, rodada_db_id, now)
+            # Tratamos primeiro a rodada atual para que um LOSS possa
+            # imediatamente avançar o ciclo MG3 para a próxima rodada.
+            # Depois fazemos reconciliação ampla apenas do que ficou para trás.
 
-            # 2) Callback duplicado: não cria outro sinal.
             if ultima_processada == rodada_id:
                 resumo = recalcular_bot_estado(cur, rodada_id, now)
                 conn.commit()
-                print(
-                    f"♻️ MOTOR V8.5 | rodada {rodada_id} já processada; "
-                    "reconciliação executada.",
-                    flush=True,
-                )
                 return {
                     "ativo": motor_ativo,
                     "estrategia": resumo["estrategia"],
@@ -617,18 +653,24 @@ def processar_novo_resultado(rodada_id, color, roll):
                     "profit": resumo["profit"],
                 }
 
-            # 3) Marca a rodada como processada mesmo com motor pausado.
             cur.execute("""
                 UPDATE bot_estado
-                SET ultima_rodada_processada = %s,
-                    atualizado_em = %s
+                SET ultima_rodada_processada = %s, atualizado_em = %s
                 WHERE id = 1;
             """, (rodada_id, now))
 
-            # 4) Se ativo, a rodada atual fecha o contexto de 4 e pode gerar
-            #    previsão para a PRÓXIMA. Não usamos nenhuma rodada futura.
-            if motor_ativo:
-                _criar_sinal_para_rodada_atual(cur, rodada_id, rodada_db_id)
+            ciclo_antes = _obter_ciclo(cur)
+
+            # Um ciclo já iniciado continua sendo resolvido mesmo se o
+            # operador apertar PAUSAR. PAUSAR impede apenas novos ciclos.
+            if motor_ativo or ciclo_antes["ativo"]:
+                _resolver_atual_e_avancar_ciclo(cur, rodada_db_id, now)
+
+                # Só abre um novo ciclo quando o motor está ativo e o ciclo
+                # anterior terminou (WIN ou 3 LOSSES).
+                ciclo = _obter_ciclo(cur)
+                if motor_ativo and not ciclo["ativo"]:
+                    _criar_primeiro_ciclo(cur, rodada_id, rodada_db_id, now)
             else:
                 print(
                     f"⏸️ MOTOR V8.5 PAUSADO | rodada={rodada_id} | "
@@ -636,11 +678,14 @@ def processar_novo_resultado(rodada_id, color, roll):
                     flush=True,
                 )
 
+            # Reconcilia registros antigos que não correspondam à rodada
+            # atual. Isso não interfere no ciclo atual, que já foi tratado acima.
+            reconciliar_sinais_pendentes(cur, now, limite=5000)
+
             resumo = recalcular_bot_estado(cur, rodada_id, now)
 
         conn.commit()
         conn.close()
-
         return {
             "ativo": motor_ativo,
             "estrategia": resumo["estrategia"],
@@ -650,9 +695,8 @@ def processar_novo_resultado(rodada_id, color, roll):
             "pendentes": resumo["pendentes"],
             "profit": resumo["profit"],
         }
-
     except Exception as e:
-        print(f"❌ MOTOR V8.5: erro processando rodada {rodada_id}: {e}", flush=True)
+        print(f"❌ MOTOR V8.5 MG3: erro processando rodada {rodada_id}: {e}", flush=True)
         try:
             conn.rollback()
             conn.close()
@@ -662,13 +706,11 @@ def processar_novo_resultado(rodada_id, color, roll):
 
 
 def reconciliar_todos_sinais():
-    """Reconciliação manual completa sem alterar o histórico das rodadas."""
     if not init_engine_db():
         return None
     conn = get_db_connection()
     if not conn:
         return None
-
     try:
         now = datetime.now()
         with conn.cursor() as cur:
@@ -677,15 +719,14 @@ def reconciliar_todos_sinais():
         conn.commit()
         conn.close()
         print(
-            "🧾 AUDITORIA V8.5 | "
+            "🧾 AUDITORIA V8.5 MG3 | "
             f"resolvidos={resolvidos} | pendentes={resumo['pendentes']} | "
             f"W={resumo['wins']} | L={resumo['losses']} | "
-            f"profit={resumo['profit']:.2f}",
-            flush=True,
+            f"profit={resumo['profit']:.2f}", flush=True,
         )
         return {"resolvidos": resolvidos, **resumo}
     except Exception as e:
-        print(f"❌ AUDITORIA V8.5: erro: {e}", flush=True)
+        print(f"❌ AUDITORIA V8.5 MG3: erro: {e}", flush=True)
         try:
             conn.rollback()
             conn.close()
@@ -698,19 +739,12 @@ def obter_status_motor():
     conn = get_db_connection()
     if not conn:
         return {
-            "ativo": False,
-            "sinal": None,
-            "cor": None,
-            "estrategia": None,
-            "wins": 0,
-            "losses": 0,
-            "pendentes": 0,
-            "profit": 0.0,
+            "ativo": False, "sinal": None, "cor": None, "estrategia": None,
+            "wins": 0, "losses": 0, "pendentes": 0, "profit": 0.0,
+            "ciclo_ativo": False, "tentativa_atual": 0,
         }
-
     try:
         with conn.cursor() as cur:
-            reconciliar_sinais_pendentes(cur, datetime.now(), limite=5000)
             resumo = recalcular_bot_estado(cur, now=datetime.now())
         conn.commit()
         conn.close()
@@ -723,6 +757,10 @@ def obter_status_motor():
             "losses": resumo["losses"],
             "pendentes": resumo["pendentes"],
             "profit": resumo["profit"],
+            "ciclo_ativo": resumo["ciclo_ativo"],
+            "tentativa_atual": resumo["tentativa_atual"],
+            "ciclo_cor_regra": resumo["ciclo_cor_regra"],
+            "ciclo_cor_entrada": resumo["ciclo_cor_entrada"],
         }
     except Exception as e:
         print(f"❌ MOTOR: erro consultando status: {e}", flush=True)
@@ -732,22 +770,7 @@ def obter_status_motor():
         except Exception:
             pass
         return {
-            "ativo": False,
-            "sinal": None,
-            "cor": None,
-            "estrategia": None,
-            "wins": 0,
-            "losses": 0,
-            "pendentes": 0,
-            "profit": 0.0,
+            "ativo": False, "sinal": None, "cor": None, "estrategia": None,
+            "wins": 0, "losses": 0, "pendentes": 0, "profit": 0.0,
+            "ciclo_ativo": False, "tentativa_atual": 0,
         }
-
-
-if __name__ == "__main__":
-    if init_engine_db():
-        print("✅ Motor V8.5 inicializado — INVERSÃO ATIVA.")
-        print("🟢 Estratégias ativas:")
-        for i, (ctx, (pred, name)) in enumerate(REGRAS_V85.items(), 1):
-            print(f"   {i}. {' → '.join(ctx)} → {pred} | entrada invertida: {inverter_cor(pred)} | {name}")
-        print("\n🔄 Executando reconciliação inicial...")
-        reconciliar_todos_sinais()
