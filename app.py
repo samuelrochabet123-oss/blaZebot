@@ -1,7 +1,7 @@
 # ================================================================
 # BLAZE BOT — DASHBOARD WEB + COLLECTOR + MOTOR ESTATÍSTICO
 #
-# VERSÃO: V8.5 — SEIS REGRAS COM BRANCO + INVERSÃO
+# VERSÃO: V8.5 MG3 — SEIS REGRAS + INVERSÃO + ATÉ 3 TENTATIVAS
 #
 # Estratégias ativas, todas definidas em strategy_engine.py:
 #   1) VERMELHO -> BRANCO -> PRETO -> VERMELHO -> PRETO
@@ -11,8 +11,7 @@
 #   5) PRETO -> BRANCO -> VERMELHO -> VERMELHO -> PRETO
 #   6) VERMELHO -> BRANCO -> VERMELHO -> VERMELHO -> VERMELHO
 #
-# A última cor de cada sequência é a previsão original; a entrada do bot é
-# a cor INVERTIDA (R↔P).
+# A última cor de cada sequência é a previsão para a PRÓXIMA rodada.
 #
 # CORREÇÕES IMPORTANTES:
 #
@@ -26,7 +25,8 @@
 # 8. PAUSAR não para o collector.
 # 9. Proteção contra repetição da mesma rodada-base.
 # 10. As seis regras V8.5 são exclusivas e sem motor paralelo.
-# 11. A cor exibida como entrada já é a cor invertida da regra.
+# 11. A previsão da regra é invertida antes da entrada real.
+# 12. MG3: máximo de 3 tentativas, mesmo valor em todas, sem dobrar.
 # ================================================================
 
 
@@ -174,7 +174,7 @@ def init_web_db():
 
                     motor_ativo BOOLEAN DEFAULT FALSE,
 
-                    sinal_ativo BOOLEAN DEFAULT FALSE,
+                    sinal_ativo VARCHAR(150),
 
                     cor_sinal VARCHAR(5),
 
@@ -195,7 +195,19 @@ def init_web_db():
 
                     ultima_rodada_sinal VARCHAR(100),
 
-                    sinal_base_id INTEGER
+                    sinal_base_id INTEGER,
+
+                    ciclo_ativo BOOLEAN DEFAULT FALSE,
+
+                    ciclo_id VARCHAR(120),
+
+                    tentativa_atual INTEGER DEFAULT 0,
+
+                    ciclo_cor_regra VARCHAR(5),
+
+                    ciclo_cor_entrada VARCHAR(5),
+
+                    ciclo_estrategia VARCHAR(150)
                 );
             """)
 
@@ -216,6 +228,53 @@ def init_web_db():
             cur.execute("""
                 ALTER TABLE bot_estado
                 ADD COLUMN IF NOT EXISTS sinal_base_id INTEGER;
+            """)
+
+            cur.execute("""
+                ALTER TABLE bot_estado
+                ADD COLUMN IF NOT EXISTS ciclo_ativo BOOLEAN DEFAULT FALSE;
+            """)
+
+            cur.execute("""
+                ALTER TABLE bot_estado
+                ADD COLUMN IF NOT EXISTS ciclo_id VARCHAR(120);
+            """)
+
+            cur.execute("""
+                ALTER TABLE bot_estado
+                ADD COLUMN IF NOT EXISTS tentativa_atual INTEGER DEFAULT 0;
+            """)
+
+            cur.execute("""
+                ALTER TABLE bot_estado
+                ADD COLUMN IF NOT EXISTS ciclo_cor_regra VARCHAR(5);
+            """)
+
+            cur.execute("""
+                ALTER TABLE bot_estado
+                ADD COLUMN IF NOT EXISTS ciclo_cor_entrada VARCHAR(5);
+            """)
+
+            cur.execute("""
+                ALTER TABLE bot_estado
+                ADD COLUMN IF NOT EXISTS ciclo_estrategia VARCHAR(150);
+            """)
+
+            # Compatibilidade com versões que criaram sinal_ativo como BOOLEAN.
+            cur.execute("""
+                DO $$
+                BEGIN
+                    IF EXISTS (
+                        SELECT 1 FROM information_schema.columns
+                        WHERE table_name='bot_estado'
+                          AND column_name='sinal_ativo'
+                          AND data_type='boolean'
+                    ) THEN
+                        ALTER TABLE bot_estado
+                        ALTER COLUMN sinal_ativo TYPE VARCHAR(150)
+                        USING CASE WHEN sinal_ativo THEN 'ATIVO' ELSE NULL END;
+                    END IF;
+                END $$;
             """)
 
             cur.execute("""
@@ -254,8 +313,34 @@ def init_web_db():
                     resultado VARCHAR(20),
 
                     criado_em TIMESTAMP
-                        DEFAULT CURRENT_TIMESTAMP
+                        DEFAULT CURRENT_TIMESTAMP,
+
+                    tentativa INTEGER DEFAULT 1,
+
+                    ciclo_id VARCHAR(120),
+
+                    cor_regra VARCHAR(5),
+
+                    cor_entrada VARCHAR(5),
+
+                    valor_aposta NUMERIC(12,2) DEFAULT 1.00
                 );
+            """)
+
+            for name, definition in [
+                ("tentativa", "INTEGER DEFAULT 1"),
+                ("ciclo_id", "VARCHAR(120)"),
+                ("cor_regra", "VARCHAR(5)"),
+                ("cor_entrada", "VARCHAR(5)"),
+                ("valor_aposta", "NUMERIC(12,2) DEFAULT 1.00"),
+            ]:
+                cur.execute(
+                    f"ALTER TABLE estrategia_sinais ADD COLUMN IF NOT EXISTS {name} {definition};"
+                )
+
+            cur.execute("""
+                CREATE INDEX IF NOT EXISTS idx_estrategia_sinais_ciclo
+                ON estrategia_sinais(ciclo_id);
             """)
 
             # ----------------------------------------------------
@@ -450,6 +535,10 @@ def consultar_dashboard():
             "losses": 0,
             "pendentes": 0,
             "profit": 0.0,
+            "ciclo_ativo": False,
+            "tentativa": 0,
+            "cor_regra": None,
+            "cor_entrada": None,
         },
         "historico_sinais": [],
     }
@@ -479,7 +568,8 @@ def consultar_dashboard():
             # --------------------------------------------------------
             cur.execute("""
                 SELECT motor_ativo, sinal_ativo, cor_sinal,
-                       ultima_estrategia, inicio_sessao
+                       ultima_estrategia, inicio_sessao, ciclo_ativo,
+                       tentativa_atual, ciclo_cor_regra, ciclo_cor_entrada, ciclo_estrategia
                 FROM bot_estado
                 WHERE id = 1;
             """)
@@ -487,6 +577,11 @@ def consultar_dashboard():
 
             inicio_sessao = estado[4] if estado else None
             motor_ativo = bool(estado[0]) if estado else False
+            ciclo_ativo = bool(estado[5]) if estado else False
+            tentativa_atual = int(estado[6] or 0) if estado else 0
+            ciclo_cor_regra = estado[7] if estado else None
+            ciclo_cor_entrada = estado[8] if estado else None
+            ciclo_estrategia = estado[9] if estado else None
 
             # --------------------------------------------------------
             # PLACAR DA SESSÃO
@@ -520,9 +615,10 @@ def consultar_dashboard():
             # SINAL ATIVO — SOMENTE DA SESSÃO ATUAL
             # --------------------------------------------------------
             sinal = None
-            if inicio_sessao and motor_ativo:
+            if inicio_sessao and motor_ativo and ciclo_ativo:
                 cur.execute("""
-                    SELECT estrategia, cor_prevista
+                    SELECT estrategia, cor_prevista, cor_regra, cor_entrada,
+                           tentativa, valor_aposta
                     FROM estrategia_sinais
                     WHERE criado_em >= %s
                       AND resultado = 'PENDENTE'
@@ -532,11 +628,16 @@ def consultar_dashboard():
                 sinal = cur.fetchone()
 
             if sinal:
-                estrategia_ativa, cor_sinal = sinal
+                estrategia_ativa, cor_sinal, cor_regra_sinal, cor_entrada_sinal, tentativa_sinal, valor_sinal = sinal
                 vazio["motor"] = {
                     "ativo": motor_ativo,
                     "sinal": True,
                     "cor": cor_sinal,
+                    "cor_regra": cor_regra_sinal or ciclo_cor_regra,
+                    "cor_entrada": cor_entrada_sinal or ciclo_cor_entrada,
+                    "tentativa": int(tentativa_sinal or tentativa_atual),
+                    "valor_aposta": float(valor_sinal or 1.0),
+                    "ciclo_ativo": True,
                     "estrategia": estrategia_curta(estrategia_ativa),
                     "wins": wins,
                     "losses": losses,
@@ -547,8 +648,13 @@ def consultar_dashboard():
                 vazio["motor"] = {
                     "ativo": motor_ativo,
                     "sinal": False,
-                    "cor": None,
-                    "estrategia": None,
+                    "cor": ciclo_cor_entrada if ciclo_ativo else None,
+                    "cor_regra": ciclo_cor_regra if ciclo_ativo else None,
+                    "cor_entrada": ciclo_cor_entrada if ciclo_ativo else None,
+                    "tentativa": tentativa_atual if ciclo_ativo else 0,
+                    "valor_aposta": 1.0,
+                    "ciclo_ativo": ciclo_ativo,
+                    "estrategia": estrategia_curta(ciclo_estrategia) if ciclo_ativo else None,
                     "wins": wins,
                     "losses": losses,
                     "pendentes": pendentes,
@@ -587,7 +693,8 @@ def consultar_dashboard():
             if inicio_sessao:
                 cur.execute("""
                     SELECT estrategia, cor_prevista, rodada_base,
-                           rodada_resultado, cor_resultado, resultado, criado_em
+                           rodada_resultado, cor_resultado, resultado, criado_em,
+                           tentativa, ciclo_id, cor_regra, cor_entrada, valor_aposta
                     FROM estrategia_sinais
                     WHERE criado_em >= %s
                     ORDER BY id DESC
@@ -602,6 +709,11 @@ def consultar_dashboard():
                     cor_resultado,
                     resultado,
                     criado,
+                    tentativa,
+                    ciclo_id,
+                    cor_regra,
+                    cor_entrada,
+                    valor_aposta,
                 ) in cur.fetchall():
                     # Compatibilidade com registros antigos que ainda possam
                     # ter WHITE escrito no campo resultado.
@@ -617,6 +729,11 @@ def consultar_dashboard():
                         "cor_resultado": cor_resultado,
                         "resultado": resultado,
                         "criado_em": criado,
+                        "tentativa": int(tentativa or 1),
+                        "ciclo_id": ciclo_id,
+                        "cor_regra": cor_regra,
+                        "cor_entrada": cor_entrada or prevista,
+                        "valor_aposta": float(valor_aposta or 1.0),
                     })
 
         conn.close()
@@ -1496,7 +1613,6 @@ body {
             <div class="eyebrow">
 
                 🎯 SINAL ATUAL
-                • ENTRADA INVERTIDA
                 • PRÓXIMA RODADA
 
             </div>
@@ -1527,12 +1643,20 @@ body {
 
             </div>
 
+            <div class="entry">
+
+                Tentativa {{ status.motor.tentativa }}/3
+                • Valor fixo: R$ {{ '%.2f'|format(status.motor.valor_aposta or 1.0) }}
+                • Sem dobrar
+
+            </div>
+
 
             <div class="entry">
 
-                O sinal será resolvido
-                somente pela próxima rodada
-                posterior à base.
+                A entrada usa a cor invertida da regra.
+                Se perder, tenta novamente até 3 vezes,
+                sempre com o mesmo valor.
 
             </div>
 
@@ -1708,7 +1832,7 @@ body {
             </div>
 
             <div>
-                Entrada (invertida)
+                Entrada
             </div>
 
             <div>
@@ -1741,19 +1865,23 @@ body {
 
                     <div>
 
-                        {% if s.prevista == 'R' %}
+                        {% if s.cor_entrada == 'R' %}
 
                             <span class="red">
                                 🔴 R
                             </span>
-
-                        {% elif s.prevista == 'P' %}
-
+                        {% elif s.cor_entrada == 'P' %}
                             <span class="black">
                                 ⚫ P
                             </span>
-
                         {% endif %}
+
+                        <div style="font-size:11px;color:#8993a1;margin-top:4px;">
+                            {% if s.cor_regra %}
+                                Regra: {{ s.cor_regra }} → Entrada: {{ s.cor_entrada }}
+                            {% endif %}
+                            • Tent. {{ s.tentativa }}/3
+                        </div>
 
                     </div>
 
@@ -1878,7 +2006,6 @@ body {
 
         Blaze Bot V8.5 • coleta contínua •
         seis regras com branco •
-        INVERSÃO R↔P •
         WHITE = LOSS •
         proteção contra resolução antecipada
 
@@ -1928,10 +2055,6 @@ def controle_motor():
                 cur.execute("""
                     UPDATE bot_estado
                     SET motor_ativo = FALSE,
-                        sinal_ativo = NULL,
-                        cor_sinal = NULL,
-                        ultima_estrategia = NULL,
-                        rodada_base_sinal = NULL,
                         atualizado_em = CURRENT_TIMESTAMP
                     WHERE id = 1;
                 """)
@@ -1941,6 +2064,12 @@ def controle_motor():
                     UPDATE bot_estado
                     SET motor_ativo = TRUE,
                         inicio_sessao = CURRENT_TIMESTAMP,
+                        ciclo_ativo = FALSE,
+                        ciclo_id = NULL,
+                        tentativa_atual = 0,
+                        ciclo_cor_regra = NULL,
+                        ciclo_cor_entrada = NULL,
+                        ciclo_estrategia = NULL,
                         sinal_ativo = NULL,
                         cor_sinal = NULL,
                         ultima_estrategia = NULL,
