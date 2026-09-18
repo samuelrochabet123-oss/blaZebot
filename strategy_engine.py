@@ -1,9 +1,9 @@
 import os
-from datetime import datetime
+from datetime import datetime, timedelta
 import psycopg2
 
 # ================================================================
-# V8.3 GOLDEN PATTERNS + ROLL + STREAK SNIPPER
+# V46.0 HIT & RUN (INVERSÃO PÓS-BRANCO + FILTRO DE HORÁRIO)
 # ================================================================
 
 APOSTA_BASE = 1.00
@@ -17,21 +17,24 @@ RESULTADO_PENDENTE = "PENDENTE"
 RESULTADO_WIN = "WIN"
 RESULTADO_LOSS = "LOSS"
 
-# 1. REGRAS DE OURO ORIGINAIS (Apenas Cores - 62% a 69% acerto)
-REGRAS_CORES = {
-    ("R", "W", "P", "R"): ("P", "V8.0 R1 | R-W-P-R -> P"),
-    ("P", "W", "P", "P"): ("P", "V8.0 R4 | P-W-P-P -> P"),
-}
+# ================================================================
+# FILTRO DE HORÁRIO (HIT & RUN - 13h às 14h Horário de Brasília)
+# ================================================================
+HORARIOS_PERMITIDOS_BRT = [13, 14]
 
-# 2. REGRAS DE ROLL (Cor + Número Alto/Baixo - 60% a 68% acerto)
-# H = High (8 a 14) | L = Low (0 a 7)
-REGRAS_ROLL = {
-    ("VL", "BL", "PH", "VL"): ("P", "V14.1 | VL-BL-PH-VL -> P"),
-    ("VL", "PH", "BL", "VL"): ("P", "V14.2 | VL-PH-BL-VL -> P"),
-    ("PH", "BL", "PH", "PH"): ("P", "V14.3 | PH-BL-PH-PH -> P"),
-    ("PH", "VL", "BL", "VL"): ("R", "V14.4 | PH-VL-BL-VL -> R"),
-    ("VL", "PH", "PH", "BL"): ("P", "V14.5 | VL-PH-PH-BL -> P"),
-}
+def is_horario_permitido():
+    # O servidor do Render roda em UTC (3 horas à frente de Brasília)
+    # Pegamos o horário atual e subtraímos 3 horas para saber a hora no Brasil
+    hora_brasilia = datetime.utcnow() - timedelta(hours=3)
+    hora_atual = hora_brasilia.hour
+    
+    if hora_atual in HORARIOS_PERMITIDOS_BRT:
+        return True
+    return False
+
+# ================================================================
+# BANCO DE DADOS E CONFIGURAÇÕES
+# ================================================================
 
 def get_db_connection():
     database_url = os.getenv("DATABASE_URL")
@@ -112,32 +115,20 @@ def carregar_historico_por_cursor(cur, ate_id=None):
         historico.append({"id": int(db_id), "rodada_id": str(rodada_id), "cor": cor, "roll": roll})
     return historico
 
-def get_cat(cor, roll):
-    cat = "H" if roll >= 8 else "L"
-    return cor + cat
-
 def detectar_estrategia(hist):
-    if not hist or len(hist) < 4: return None, None
+    if not hist or len(hist) < 2: return None, None
     
-    # 1. Tenta as Regras de Ouro (Apenas Cores)
-    contexto_cor = tuple(item["cor"] for item in hist[-4:])
-    regra_cor = REGRAS_CORES.get(contexto_cor)
-    if regra_cor:
-        return regra_cor[0], regra_cor[1]
+    # 1. CHECA O FILTRO DE HORÁRIO (Se não for 13h ou 14h em Brasília, ignora)
+    if not is_horario_permitido():
+        return None, None
 
-    # 2. Tenta as Regras de Roll (Cor + Número)
-    contexto_roll = tuple(get_cat(item["cor"], item["roll"]) for item in hist[-4:])
-    regra_roll = REGRAS_ROLL.get(contexto_roll)
-    if regra_roll:
-        return regra_roll[0], regra_roll[1]
-
-    # 3. Tenta o Streak Snipper (Inversão após 6 cores iguais)
-    if len(hist) >= 6:
-        ultimas_6 = [item["cor"] for item in hist[-6:]]
-        if len(set(ultimas_6)) == 1 and ultimas_6[0] in ["R", "P"]:
-            cor_atual = ultimas_6[0]
-            cor_inversa = "P" if cor_atual == "R" else "R"
-            return cor_inversa, f"V24.0 STREAK SNIPPER | 6x {cor_atual} -> {cor_inversa}"
+    # 2. ESTRATÉGIA V46 (Se a última rodada foi Branco, aposta na inversão da cor anterior)
+    cor_atual = hist[-1]["cor"]
+    cor_anterior = hist[-2]["cor"]
+    
+    if cor_atual == "W" and cor_anterior in ["R", "P"]:
+        cor_entrada = "P" if cor_anterior == "R" else "R"
+        return cor_entrada, "V46.0 HIT & RUN | B -> Inversão (Janela 13h-14h BRT)"
 
     return None, None
 
@@ -174,7 +165,7 @@ def _criar_tentativa(cur, rodada_base_id, rodada_base, ciclo_id, tentativa, estr
     cur.execute("INSERT INTO estrategia_sinais (rodada_base, estrategia, cor_prevista, resultado, tentativa, ciclo_id, cor_regra, cor_entrada, valor_aposta) VALUES (%s, %s, %s, 'PENDENTE', %s, %s, %s, %s, %s);", (str(rodada_base), estrategia, cor_entrada, int(tentativa), str(ciclo_id), cor_regra, cor_entrada, APOSTA_BASE))
     cur.execute("UPDATE bot_estado SET ciclo_ativo = TRUE, ciclo_id = %s, tentativa_atual = %s, ciclo_cor_regra = %s, ciclo_cor_entrada = %s, ciclo_estrategia = %s, sinal_ativo = %s, cor_sinal = %s, rodada_base_sinal = %s, ultima_estrategia = %s, atualizado_em = %s WHERE id = 1;", (str(ciclo_id), int(tentativa), cor_regra, cor_entrada, estrategia, estrategia, cor_entrada, str(rodada_base), estrategia, now))
     print("\n" + "=" * 72)
-    print(f"🎯 NOVA ENTRADA V8.3 | TENTATIVA {tentativa}/{MAX_TENTATIVAS}")
+    print(f"🎯 NOVA ENTRADA V46.0 HIT & RUN | TENTATIVA {tentativa}/{MAX_TENTATIVAS}")
     print("=" * 72)
     print(f"Base              : {rodada_base}")
     print(f"Estratégia        : {estrategia}")
@@ -289,14 +280,14 @@ def processar_novo_resultado(rodada_id, color, roll):
                 if motor_ativo and not ciclo["ativo"]:
                     _criar_primeiro_ciclo(cur, rodada_id, rodada_db_id, now)
             else:
-                print(f"⏸️ MOTOR V8.3 PAUSADO | rodada={rodada_id} | coleta registrada, nenhuma nova previsão criada", flush=True)
+                print(f"⏸️ MOTOR V46.0 PAUSADO | rodada={rodada_id} | coleta registrada, nenhuma nova previsão criada", flush=True)
             reconciliar_sinais_pendentes(cur, now, limite=5000)
             resumo = recalcular_bot_estado(cur, rodada_id, now)
         conn.commit()
         conn.close()
         return {"ativo": motor_ativo, "estrategia": resumo["estrategia"], "cor": resumo["cor_sinal"], "wins": resumo["wins"], "losses": resumo["losses"], "pendentes": resumo["pendentes"], "profit": resumo["profit"]}
     except Exception as e:
-        print(f"❌ MOTOR V8.3: erro processando rodada {rodada_id}: {e}", flush=True)
+        print(f"❌ MOTOR V46.0: erro processando rodada {rodada_id}: {e}", flush=True)
         try: conn.rollback(); conn.close()
         except: pass
         return None
@@ -312,10 +303,10 @@ def reconciliar_todos_sinais():
             resumo = recalcular_bot_estado(cur, now=now)
         conn.commit()
         conn.close()
-        print(f"🧾 AUDITORIA V8.3 | resolvidos={resolvidos} | pendentes={resumo['pendentes']} | W={resumo['wins']} | L={resumo['losses']} | profit={resumo['profit']:.2f}", flush=True)
+        print(f"🧾 AUDITORIA V46.0 | resolvidos={resolvidos} | pendentes={resumo['pendentes']} | W={resumo['wins']} | L={resumo['losses']} | profit={resumo['profit']:.2f}", flush=True)
         return {"resolvidos": resolvidos, **resumo}
     except Exception as e:
-        print(f"❌ AUDITORIA V8.3: erro: {e}", flush=True)
+        print(f"❌ AUDITORIA V46.0: erro: {e}", flush=True)
         try: conn.rollback(); conn.close()
         except: pass
         return None
