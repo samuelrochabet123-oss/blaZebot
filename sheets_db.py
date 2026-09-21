@@ -2,6 +2,11 @@
 # sheets_db.py — BANCO DE DADOS EM GOOGLE PLANILHAS
 # Substituto do PostgreSQL/Neon. Cada tabela = 1 aba.
 # IMPORTANTE: IDs de linha são timestamps (ms) — ordem cronológica.
+#
+# Variáveis de ambiente:
+#   GOOGLE_SHEETS_ID         -> ID da planilha (da URL)
+#   GOOGLE_CREDENTIALS_JSON  -> CONTEÚDO do JSON da conta de serviço
+#   (alternativa) GOOGLE_CREDENTIALS -> caminho do Secret File
 # ================================================================
 
 import json
@@ -16,7 +21,7 @@ from google.oauth2.service_account import Credentials
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 
 PLANILHA_ID = os.getenv("GOOGLE_SHEETS_ID", "").strip()
-ARQUIVO_CREDENCIAIS = os.getenv("GOOGLE_CREDENTIALS", "credenciais.json")
+ARQUIVO_CREDENCIAIS = "credenciais.json"
 
 FMT = "%Y-%m-%d %H:%M:%S"
 CACHE_TTL = 5  # segundos — protege a cota da API
@@ -86,20 +91,74 @@ def agora():
 
 
 # ================================================================
-# CONEXÃO
+# CONEXÃO E CREDENCIAIS
 # ================================================================
 
 def credenciais_disponiveis():
-    if os.getenv("GOOGLE_CREDENTIALS_JSON"):
+    if (os.getenv("GOOGLE_CREDENTIALS_JSON") or "").strip():
+        return True
+    if (os.getenv("GOOGLE_CREDENTIALS") or "").strip():
         return True
     return os.path.exists(ARQUIVO_CREDENCIAIS)
 
 def _credenciais():
-    conteudo = os.getenv("GOOGLE_CREDENTIALS_JSON")
+    conteudo = (os.getenv("GOOGLE_CREDENTIALS_JSON") or "").strip()
+    caminho_env = (os.getenv("GOOGLE_CREDENTIALS") or "").strip()
+
+    # ── Diagnóstico (não expõe segredos) ──
+    print("─── DIAGNÓSTICO CREDENCIAIS ───", flush=True)
+    print(f"GOOGLE_CREDENTIALS_JSON definida: {bool(conteudo)}", flush=True)
     if conteudo:
-        info = json.loads(conteudo)
-        return Credentials.from_service_account_info(info, scopes=SCOPES)
-    return Credentials.from_service_account_file(ARQUIVO_CREDENCIAIS, scopes=SCOPES)
+        print(f"  tamanho: {len(conteudo)} caracteres", flush=True)
+        print(f"  primeiros caracteres: {conteudo[:15]!r}", flush=True)
+    print(f"GOOGLE_CREDENTIALS: {caminho_env or '(nao definida)'}", flush=True)
+    if caminho_env:
+        print(f"  arquivo existe: {os.path.exists(caminho_env)}", flush=True)
+    print(f"credenciais.json local existe: {os.path.exists(ARQUIVO_CREDENCIAIS)}", flush=True)
+    print("────────────────────────────────", flush=True)
+
+    def abrir_arquivo(caminho):
+        try:
+            return Credentials.from_service_account_file(caminho, scopes=SCOPES)
+        except json.JSONDecodeError:
+            raise RuntimeError(
+                f"O arquivo '{caminho}' existe mas NAO contem um JSON valido. "
+                "Verifique o conteudo do Secret File no Render."
+            )
+
+    # 1) Conteudo JSON colado direto na variavel
+    if conteudo:
+        if conteudo.startswith("{"):
+            try:
+                info = json.loads(conteudo)
+            except json.JSONDecodeError as e:
+                raise RuntimeError(
+                    f"GOOGLE_CREDENTIALS_JSON contem um JSON invalido ou truncado: {e}. "
+                    "Abra o arquivo baixado do Google Cloud no Bloco de Notas, "
+                    "selecione TUDO (Ctrl+A) e cole novamente."
+                )
+            return Credentials.from_service_account_info(info, scopes=SCOPES)
+        # Veio um caminho em vez do conteudo
+        if os.path.exists(conteudo):
+            return abrir_arquivo(conteudo)
+        raise RuntimeError(
+            f"GOOGLE_CREDENTIALS_JSON nao e um JSON (comeca com {conteudo[:15]!r}) "
+            "e tambem nao e um caminho existente. Ou cole o CONTEUDO do arquivo "
+            "(deve comecar com { ), ou configure o Secret File."
+        )
+
+    # 2) Caminho via GOOGLE_CREDENTIALS (Secret File do Render)
+    if caminho_env and os.path.exists(caminho_env):
+        return abrir_arquivo(caminho_env)
+
+    # 3) Arquivo local (para testes fora do Render)
+    if os.path.exists(ARQUIVO_CREDENCIAIS):
+        return abrir_arquivo(ARQUIVO_CREDENCIAIS)
+
+    raise RuntimeError(
+        "Nenhuma credencial Google encontrada. Use GOOGLE_CREDENTIALS_JSON "
+        "(conteudo do JSON) ou Secret File + GOOGLE_CREDENTIALS=/etc/secrets/credenciais.json"
+    )
 
 def _conectar():
     global _planilha
@@ -347,103 +406,4 @@ def _normalizar_sinal(r):
 
 def sinais_todos():
     out = [_normalizar_sinal(r) for r in registros(SINAIS)]
-    out.sort(key=lambda s: s["id"] or 0)
-    return out
-
-def sinais_pendentes(limite=None):
-    pend = [s for s in sinais_todos() if txt(s["resultado"]).upper() == "PENDENTE"]
-    return pend[:limite] if limite else pend
-
-def existe_sinal_base(rodada_base):
-    rb = str(rodada_base)
-    return any(s["rodada_base"] == rb for s in sinais_todos())
-
-def inserir_sinal(dados):
-    with _lock:
-        reg = {
-            "id": str(int(time.time() * 1000)), "rodada_base": "",
-            "estrategia": "", "cor_prevista": "", "rodada_resultado": "",
-            "cor_resultado": "", "resultado": "PENDENTE",
-            "criado_em": agora(), "resolvido_em": "", "tentativa": 1,
-            "ciclo_id": "", "cor_regra": "", "cor_entrada": "",
-            "valor_aposta": 1.0,
-        }
-        reg.update(dados)
-        _aba(SINAIS).append_row(_linha(SINAIS, reg), value_input_option="RAW")
-        _invalidar(SINAIS)
-        return reg["id"]
-
-def resolver_sinal(sinal_id, campos):
-    """Resolve somente se ainda estiver PENDENTE. Retorna False caso contrário."""
-    with _lock:
-        aba = _aba(SINAIS)
-        dados = aba.get_all_records(numericise_ignore=["all"], default_blank="")
-        for i, r in enumerate(dados):
-            if txt(r.get("id")) == str(sinal_id):
-                if txt(r.get("resultado")).upper() != "PENDENTE":
-                    return False
-                reg = dict(r)
-                reg.update(campos)
-                aba.update(values=[_linha(SINAIS, reg)],
-                           range_name=f"A{i + 2}", value_input_option="RAW")
-                _invalidar(SINAIS)
-                return True
-        return False
-
-def sinal_pendente_do_ciclo(ciclo_id):
-    cid = str(ciclo_id)
-    pend = [s for s in sinais_pendentes() if s["ciclo_id"] == cid]
-    return pend[-1] if pend else None
-
-def estatisticas():
-    wins = losses = pendentes = whites_internos = 0
-    profit = 0.0
-    for s in sinais_todos():
-        res = txt(s["resultado"]).upper()
-        if res == "WIN":
-            wins += 1
-            profit += s["valor_aposta"] or 0.0
-        elif res == "LOSS":
-            losses += 1
-            profit -= s["valor_aposta"] or 0.0
-            if s["cor_resultado"] == "W":
-                whites_internos += 1
-        elif res == "PENDENTE":
-            pendentes += 1
-    return {"wins": wins, "losses": losses, "pendentes": pendentes,
-            "whites_internos": whites_internos, "profit": profit}
-
-def lucro_dia():
-    hoje = (datetime.utcnow() - timedelta(hours=3)).date()
-    total = 0
-    for s in sinais_todos():
-        d = parse_dt(s.get("criado_em"))
-        if not d or (d - timedelta(hours=3)).date() != hoje:
-            continue
-        res = txt(s["resultado"]).upper()
-        if res == "WIN":
-            total += 1
-        elif res == "LOSS":
-            total -= 1
-    return total
-
-
-# ================================================================
-# COR NORMALIZADA (R / P / W)
-# ================================================================
-
-def cor_de(cor_texto, color):
-    t = txt(cor_texto).upper().strip()
-    if "VERMELHO" in t or t in {"R", "RED", "V", "VI"}:
-        return "R"
-    if "PRETO" in t or t in {"P", "BLACK", "B"}:
-        return "P"
-    if "BRANCO" in t or t in {"W", "WHITE"}:
-        return "W"
-    if color == 0:
-        return "W"
-    if color == 1:
-        return "R"
-    if color == 2:
-        return "P"
-    return None
+    out.sort(key=lambda s: s["id
