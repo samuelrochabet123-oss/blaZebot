@@ -1,23 +1,7 @@
 # ================================================================
 # BLAZE BOT — DASHBOARD WEB + COLLECTOR + MOTOR ESTATÍSTICO
 #
-# VERSÃO: V8.0 GOLDEN PATTERNS — GOOGLE PLANILHAS EDITION
-#
-# Estratégia ativa, definida em strategy_engine.py:
-#   V49.0 HIT & RUN | BRANCO -> INVERSÃO
-#
-# CORREÇÕES IMPORTANTES:
-#
-# 1. O sinal é baseado em uma rodada específica.
-# 2. O resultado só pode ser uma rodada POSTERIOR ao sinal.
-# 3. A própria rodada que gerou o sinal NUNCA pode resolver o sinal.
-# 4. Branco na rodada de entrada é LOSS operacional.
-# 5. Dashboard não exibe WHITE como categoria de resultado.
-# 6. O collector continua coletando mesmo com o motor parado.
-# 7. INICIAR cria uma nova sessão estatística.
-# 8. PAUSAR não para o collector.
-# 9. Proteção contra repetição da mesma rodada-base.
-# 10. FLAT BETTING: 1 tentativa, sem dobrar (sem Martingale).
+# VERSÃO: V8.0 — GOOGLE PLANILHAS EDITION
 #
 # BANCO DE DADOS: Google Planilhas (sheets_db.py)
 # Variáveis de ambiente:
@@ -52,77 +36,6 @@ def init_web_db():
             "Verifique GOOGLE_SHEETS_ID e as credenciais.",
             flush=True
         )
-
-
-# ================================================================
-# NORMALIZAÇÃO DAS CORES
-#
-# PADRÃO INTERNO:
-#
-# R = VERMELHO
-# P = PRETO
-# W = BRANCO
-# ================================================================
-
-def mapear_cor_letra(cor_str):
-
-    if not cor_str:
-        return None
-
-    cor = str(cor_str).upper().strip()
-
-    if (
-        "VERMELHO" in cor
-        or cor == "RED"
-        or cor == "R"
-        or cor == "V"
-        or cor == "VI"
-    ):
-        return "R"
-
-    if (
-        "PRETO" in cor
-        or cor == "BLACK"
-        or cor == "P"
-        or cor == "B"
-    ):
-        return "P"
-
-    if (
-        "BRANCO" in cor
-        or cor == "WHITE"
-        or cor == "W"
-    ):
-        return "W"
-
-    return None
-
-
-def mapear_cor_numerica(color):
-
-    try:
-        color = int(color)
-    except Exception:
-        return None
-
-    if color == 0:
-        return "W"
-    if color == 1:
-        return "R"
-    if color == 2:
-        return "P"
-
-    return None
-
-
-def obter_cor(cor_texto, color):
-
-    cor = mapear_cor_letra(cor_texto)
-
-    if cor:
-        return cor
-
-    return mapear_cor_numerica(color)
 
 
 # ================================================================
