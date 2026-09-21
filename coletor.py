@@ -1,25 +1,11 @@
 # ================================================================
 # BLAZE DOUBLE — COLLECTOR V2.1 — GOOGLE PLANILHAS EDITION
 # ================================================================
-# Objetivo:
-#   Coletar resultados do Double da Blaze via Socket.IO e
-#   persistir em Google Planilhas (sheets_db.py).
+# Coleta resultados do Double da Blaze via Socket.IO e
+# persiste em Google Planilhas (sheets_db.py).
 #
-# IMPORTANTE:
-#   - Não usa a API REST /roulette_games/recent/1
-#   - Usa Socket.IO /replication/
-#   - Mantém o subscribe original:
-#
-#       {
-#           "id": "subscribe",
-#           "payload": {
-#               "room": "double_room_1"
-#           }
-#       }
-#
-#   - GOOGLE_SHEETS_ID e GOOGLE_CREDENTIALS_JSON vêm
-#     exclusivamente do ambiente (Render).
-#   - Não colocar credenciais diretamente neste arquivo.
+# GOOGLE_SHEETS_ID e credenciais vêm do ambiente (Render).
+# NÃO colocar credenciais diretamente neste arquivo.
 # ================================================================
 
 import os
@@ -153,10 +139,6 @@ def salvar_resultado(payload):
             # ============================================================
             # MOTOR DAS ESTRATÉGIAS
             # ============================================================
-            # O resultado já foi confirmado na planilha. Agora o motor:
-            # 1) liquida eventual sinal anterior;
-            # 2) analisa o histórico sem o resultado recém-chegado;
-            # 3) cria o sinal para a próxima rodada, se houver gatilho.
             try:
                 processar_novo_resultado(
                     rodada_id=str(rodada_id),
@@ -221,8 +203,6 @@ def on_connect():
     print(f"Room     : {ROOM}")
     print("=" * 70)
 
-    # IMPORTANTE:
-    # Este é EXATAMENTE o subscribe do V2.1 que funcionava no Colab.
     try:
         payload = {
             "id": "subscribe",
@@ -450,7 +430,7 @@ def main():
 
     if not db.credenciais_disponiveis():
         print("❌ Credenciais Google não encontradas "
-              "(GOOGLE_CREDENTIALS_JSON ou credenciais.json).")
+              "(GOOGLE_CREDENTIALS_JSON ou GOOGLE_CREDENTIALS).")
         sys.exit(1)
 
     print("✅ GOOGLE_SHEETS_ID encontrada no ambiente.")
