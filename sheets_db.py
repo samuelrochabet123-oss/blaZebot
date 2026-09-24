@@ -14,6 +14,7 @@ import os
 import threading
 import time
 from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 
 import gspread
 from google.oauth2.service_account import Credentials
@@ -87,7 +88,9 @@ def parse_dt(v):
             return None
 
 def agora():
-    return datetime.utcnow().strftime(FMT)
+    # Horário usado pelo bot para sessão e placar.
+    # Render pode operar em UTC; aqui usamos São Paulo explicitamente.
+    return datetime.now(ZoneInfo("America/Sao_Paulo")).strftime(FMT)
 
 
 # ================================================================
@@ -473,17 +476,21 @@ def estatisticas():
             "whites_internos": whites_internos, "profit": profit}
 
 def lucro_dia():
-    hoje = (datetime.utcnow() - timedelta(hours=3)).date()
+    hoje = datetime.now(ZoneInfo("America/Sao_Paulo")).date()
     total = 0
+
     for s in sinais_todos():
         d = parse_dt(s.get("criado_em"))
-        if not d or (d - timedelta(hours=3)).date() != hoje:
+        if not d or d.date() != hoje:
             continue
+
         res = txt(s["resultado"]).upper()
+
         if res == "WIN":
             total += 1
         elif res == "LOSS":
             total -= 1
+
     return total
 
 
