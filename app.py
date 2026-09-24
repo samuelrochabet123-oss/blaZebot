@@ -697,9 +697,9 @@ def status():
 def iniciar_background_collector():
     try:
         try:
-            from collector import iniciar_coletor_em_thread
-        except ImportError:
             from coletor import iniciar_coletor_em_thread
+        except ImportError:
+            from collector import iniciar_coletor_em_thread
         print("🚀 Iniciando Collector em background...", flush=True)
         iniciar_coletor_em_thread()
     except Exception as e:
