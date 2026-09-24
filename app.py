@@ -64,13 +64,12 @@ def cor_info(color, cor_texto=None):
 
 
 def estrategia_curta(nome):
-    if not nome:
-        return "—"
+  if not nome:
+    return "—"
 
-    mapa = {
-        "V49.0 HIT & RUN | B -> Inversão": "H&R • B → Inversão",
-    }
-    return mapa.get(nome, nome)
+  if "Z-Score Unificado" in nome:
+    return "Z-Score Consolidado"
+  return nome
 
 
 # ================================================================
