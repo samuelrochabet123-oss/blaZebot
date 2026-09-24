@@ -15,6 +15,7 @@ import threading
 import time
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
+from zoneinfo import ZoneInfo
 
 import gspread
 from google.oauth2.service_account import Credentials
@@ -41,7 +42,7 @@ CABECALHOS = {
              "tentativa_atual", "ciclo_cor_regra", "ciclo_cor_entrada", "ciclo_estrategia"],
     SINAIS: ["id", "rodada_base", "estrategia", "cor_prevista", "rodada_resultado",
              "cor_resultado", "resultado", "criado_em", "resolvido_em", "tentativa",
-             "ciclo_id", "cor_regra", "cor_entrada", "valor_aposta"],
+             "ciclo_id", "cor_regra", "cor_entrada", "valor_aposta", "alvo_offset"],
     COLLECTOR: ["id", "conectado", "ultima_rodada", "ultimo_resultado_em",
                 "total_ticks", "total_resultados", "total_duplicados",
                 "total_erros_db", "atualizado_em"],
@@ -184,9 +185,13 @@ def _aba(nome):
             aba = planilha.add_worksheet(
                 title=nome, rows=5000, cols=len(CABECALHOS[nome]) + 5
             )
-        if not aba.row_values(1):
-            aba.update(values=[CABECALHOS[nome]], range_name="A1",
-                       value_input_option="RAW")
+        cab_atual = aba.row_values(1)
+        if not cab_atual:
+            aba.update(values=[CABECALHOS[nome]], range_name="A1", value_input_option="RAW")
+        else:
+            faltantes = [c for c in CABECALHOS[nome] if c not in cab_atual]
+            if faltantes:
+                aba.update(values=[cab_atual + faltantes], range_name="A1", value_input_option="RAW")
         _abas[nome] = aba
         return aba
 
@@ -405,6 +410,7 @@ def _normalizar_sinal(r):
         "cor_regra": txt(r.get("cor_regra")) or None,
         "cor_entrada": txt(r.get("cor_entrada")) or None,
         "valor_aposta": to_float(r.get("valor_aposta"), 1.0),
+        "alvo_offset": to_int(r.get("alvo_offset"), 1),
     }
 
 def sinais_todos():
@@ -428,7 +434,7 @@ def inserir_sinal(dados):
             "cor_resultado": "", "resultado": "PENDENTE",
             "criado_em": agora(), "resolvido_em": "", "tentativa": 1,
             "ciclo_id": "", "cor_regra": "", "cor_entrada": "",
-            "valor_aposta": 1.0,
+            "valor_aposta": 1.0, "alvo_offset": 1,
         }
         reg.update(dados)
         _aba(SINAIS).append_row(_linha(SINAIS, reg), value_input_option="RAW")
