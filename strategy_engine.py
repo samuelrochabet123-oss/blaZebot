@@ -112,22 +112,82 @@ def _criar_sinal(g, now):
 
 
 def _resolver_pendentes(atual_id, now):
-    hist=db.carregar_historico(); pos={h["id"]:i for i,h in enumerate(hist)}; por={h["rodada_id"]:h for h in hist}
-    estado=db.ler_estado(); inicio=db.txt(estado.get("inicio_sessao")); count=0
-    for s in db.sinais_pendentes():
-        if inicio and s.get("criado_em") and s["criado_em"]<inicio: continue
-        base=por.get(str(s["rodada_base"]));
-        if not base: continue
-        idx=pos.get(base["id"]); off=max(1,int(s.get("alvo_offset") or 1)); alvo_idx=(idx+off) if idx is not None else None
-        if alvo_idx is None or alvo_idx>=len(hist): continue
-        alvo=hist[alvo_idx]
-        if int(alvo["id"])!=int(atual_id): continue
-        real=alvo["cor"]; prevista=s["cor_prevista"]
-        resultado=RESULTADO_WIN if real==prevista else RESULTADO_LOSS
-        if not db.resolver_sinal(s["id"],{"rodada_resultado":str(alvo["rodada_id"]),"cor_resultado":real,"resultado":resultado,"resolvido_em":now}): continue
-        count+=1
-        emoji="✅" if resultado==RESULTADO_WIN else "❌"
-        enviar_telegram(f"{emoji} *RESULTADO — {resultado}*\n\n🧠 Estratégia: *{s['estrategia']}*\n🎯 Entrada: *{_nome(prevista)}*\n🎲 Resultado: *{_nome(real)}*\n🔢 Rodada: *{alvo['rodada_id']}*")
+    """Resolve sinais cujo alvo é a rodada atual. Branco = LOSS."""
+    hist = db.carregar_historico()
+    pos = {h["id"]: i for i, h in enumerate(hist)}
+    por = {str(h["rodada_id"]): h for h in hist}
+    estado = db.ler_estado()
+    inicio = db.txt(estado.get("inicio_sessao"))
+    count = 0
+
+    print(f"🔎 Verificando sinais pendentes | rodada atual={atual_id}", flush=True)
+
+    pendentes = db.sinais_pendentes()
+    print(f"📋 Sinais pendentes encontrados: {len(pendentes)}", flush=True)
+
+    for s in pendentes:
+        try:
+            if inicio and s.get("criado_em") and s["criado_em"] < inicio:
+                continue
+
+            base = por.get(str(s["rodada_base"]))
+            if not base:
+                print(f"⚠️ Base não encontrada | sinal={s['id']} | base={s['rodada_base']}", flush=True)
+                continue
+
+            idx = pos.get(base["id"])
+            off = max(1, int(s.get("alvo_offset") or 1))
+            alvo_idx = (idx + off) if idx is not None else None
+
+            if alvo_idx is None or alvo_idx >= len(hist):
+                continue
+
+            alvo = hist[alvo_idx]
+            if str(alvo["id"]) != str(atual_id):
+                continue
+
+            real = db.cor_de(alvo.get("cor"), alvo.get("color")) or "?"
+            prevista = db.cor_de(s.get("cor_prevista"), None) or s.get("cor_prevista")
+
+            # REGRA DEFINITIVA: somente a cor prevista gera WIN.
+            # Branco após sinal R/P é LOSS.
+            resultado = RESULTADO_WIN if real == prevista else RESULTADO_LOSS
+
+            print(
+                f"🎯 RESOLVENDO | estratégia={s['estrategia']} | "
+                f"entrada={_nome(prevista)} | resultado_real={_nome(real)} | "
+                f"rodada={alvo['rodada_id']} | {resultado}",
+                flush=True,
+            )
+
+            ok = db.resolver_sinal(
+                s["id"],
+                {
+                    "rodada_resultado": str(alvo["rodada_id"]),
+                    "cor_resultado": real,
+                    "resultado": resultado,
+                    "resolvido_em": now,
+                },
+            )
+            if not ok:
+                print(f"⚠️ Sinal não foi atualizado | id={s['id']}", flush=True)
+                continue
+
+            count += 1
+            emoji = "✅" if resultado == RESULTADO_WIN else "❌"
+            enviar_telegram(
+                f"{emoji} *RESULTADO — {resultado}*\n\n"
+                f"🧠 Estratégia: *{s['estrategia']}*\n"
+                f"🎯 Entrada: *{_nome(prevista)}*\n"
+                f"🎲 Resultado: *{_nome(real)}*\n"
+                f"🔢 Rodada: *{alvo['rodada_id']}*"
+            )
+        except Exception as e:
+            print(f"❌ Erro resolvendo sinal {s.get('id')}: {e}", flush=True)
+            # Não derruba o motor; o sinal continua PENDENTE e será tentado
+            # novamente na próxima rodada.
+
+    print(f"📊 Sinais resolvidos nesta rodada: {count}", flush=True)
     return count
 
 
@@ -145,12 +205,23 @@ def processar_novo_resultado(rodada_id,color,roll):
         rid=str(rodada_id); rodada=db.buscar_rodada(rid)
         if not rodada: return None
         now=db.agora(); estado=db.ler_estado(); motor=db.to_bool(estado.get("motor_ativo")); ultimo=db.txt(estado.get("ultima_rodada_processada"))
-        if ultimo==rid: return None
-        db.atualizar_estado({"ultima_rodada_processada":rid,"atualizado_em":now})
+        if ultimo==rid:
+            # Mesmo que a rodada já tenha sido marcada, ainda tentamos
+            # resolver pendências para não perder WIN/LOSS por falha transitória.
+            if motor:
+                _resolver_pendentes(rodada["id"], now)
+            return None
+
         if motor:
+            # Primeiro resolve sinais anteriores. Se o Google Sheets tiver
+            # uma falha temporária, o sinal permanece PENDENTE e será tentado
+            # novamente na próxima rodada.
             _resolver_pendentes(rodada["id"],now)
             hist=db.carregar_historico(ate_id=rodada["id"])
             for g in detectar_todas(hist): _criar_sinal(g,now)
+
+        # Só marca a rodada como processada depois do ciclo do motor.
+        db.atualizar_estado({"ultima_rodada_processada":rid,"atualizado_em":now})
         est=_estado(now)
         return {"ativo":motor,"estrategia":db.txt(db.ler_estado().get("ultima_estrategia")) or None,"cor":db.txt(db.ler_estado().get("cor_sinal")) or None,"wins":est["wins"],"losses":est["losses"],"profit":est["profit"]}
     except Exception as e:
