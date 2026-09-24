@@ -112,7 +112,12 @@ def _criar_sinal(g, now):
 
 
 def _resolver_pendentes(atual_id, now):
-    """Resolve sinais cujo alvo é a rodada atual. Branco = LOSS."""
+    """Resolve qualquer sinal pendente cujo alvo já esteja no histórico.
+
+    Não exige mais que o alvo seja exatamente a rodada atual. Isso permite
+    recuperar sinais cujo alvo passou enquanto o Render/Google Sheets estava
+    indisponível. Branco continua sendo LOSS para qualquer previsão R/P.
+    """
     hist = db.carregar_historico()
     pos = {h["id"]: i for i, h in enumerate(hist)}
     por = {str(h["rodada_id"]): h for h in hist}
@@ -132,22 +137,44 @@ def _resolver_pendentes(atual_id, now):
 
             base = por.get(str(s["rodada_base"]))
             if not base:
-                print(f"⚠️ Base não encontrada | sinal={s['id']} | base={s['rodada_base']}", flush=True)
+                print(
+                    f"⚠️ Base não encontrada | sinal={s['id']} | "
+                    f"base={s['rodada_base']}", flush=True
+                )
                 continue
 
             idx = pos.get(base["id"])
-            off = max(1, int(s.get("alvo_offset") or 1))
-            alvo_idx = (idx + off) if idx is not None else None
+            if idx is None:
+                continue
 
-            if alvo_idx is None or alvo_idx >= len(hist):
+            off = max(1, int(s.get("alvo_offset") or 1))
+            alvo_idx = idx + off
+
+            # O alvo ainda não chegou.
+            if alvo_idx >= len(hist):
                 continue
 
             alvo = hist[alvo_idx]
-            if str(alvo["id"]) != str(atual_id):
+
+            # Se o alvo já existe no histórico, resolve mesmo que ele seja
+            # anterior à rodada atual. Isso recupera sinais perdidos após
+            # reinício/desconexão do Render.
+            real = db.cor_de(alvo.get("cor"), alvo.get("color"))
+            prevista = db.cor_de(s.get("cor_prevista"), None) or s.get("cor_prevista")
+
+            if real not in ("R", "P", "W"):
+                print(
+                    f"⚠️ Cor inválida no alvo | sinal={s['id']} | "
+                    f"rodada={alvo['rodada_id']} | cor={real}", flush=True
+                )
                 continue
 
-            real = db.cor_de(alvo.get("cor"), alvo.get("color")) or "?"
-            prevista = db.cor_de(s.get("cor_prevista"), None) or s.get("cor_prevista")
+            if prevista not in ("R", "P"):
+                print(
+                    f"⚠️ Previsão inválida | sinal={s['id']} | "
+                    f"prevista={prevista}", flush=True
+                )
+                continue
 
             # REGRA DEFINITIVA: somente a cor prevista gera WIN.
             # Branco após sinal R/P é LOSS.
@@ -156,7 +183,8 @@ def _resolver_pendentes(atual_id, now):
             print(
                 f"🎯 RESOLVENDO | estratégia={s['estrategia']} | "
                 f"entrada={_nome(prevista)} | resultado_real={_nome(real)} | "
-                f"rodada={alvo['rodada_id']} | {resultado}",
+                f"rodada={alvo['rodada_id']} | {resultado}"
+                + (" | RECUPERADO" if str(alvo["id"]) != str(atual_id) else ""),
                 flush=True,
             )
 
@@ -184,12 +212,10 @@ def _resolver_pendentes(atual_id, now):
             )
         except Exception as e:
             print(f"❌ Erro resolvendo sinal {s.get('id')}: {e}", flush=True)
-            # Não derruba o motor; o sinal continua PENDENTE e será tentado
-            # novamente na próxima rodada.
+            # O sinal permanece PENDENTE e será tentado novamente.
 
     print(f"📊 Sinais resolvidos nesta rodada: {count}", flush=True)
     return count
-
 
 def _estado(now):
     est=db.estatisticas(); estado=db.ler_estado(); pend=db.sinais_pendentes()
