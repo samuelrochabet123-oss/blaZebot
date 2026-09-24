@@ -8,6 +8,7 @@ import json
 import os
 from google.oauth2.service_account import Credentials
 import gspread
+import requests
 
 # Configuração de credenciais para ambiente de servidor (Render)
 scopes = [
@@ -33,6 +34,22 @@ META_DIARIA = 3
 STOP_LOSS = -3
 
 
+# ================================================================
+# TELEGRAM
+# ================================================================
+def enviar_telegram(mensagem):
+  token = os.getenv("TELEGRAM_TOKEN")
+  chat_id = os.getenv("TELEGRAM_CHAT_ID")
+  if not token or not chat_id:
+    return
+  url = f"https://api.telegram.org/bot{token}/sendMessage"
+  data = {"chat_id": chat_id, "text": mensagem, "parse_mode": "Markdown"}
+  try:
+    requests.post(url, data=data, timeout=5)
+  except Exception:
+    pass
+
+
 def init_engine_db():
   """Função exigida pelo app.py para inicializar o motor e validar a conexão."""
   if not gc:
@@ -44,7 +61,7 @@ def init_engine_db():
 
 def processar_novo_resultado(resultado):
   """Função exigida pelo collector para processar novas entradas em tempo real."""
-  # Aqui você pode adicionar lógica adicional de análise por rodada, se necessário.
+  # Aqui você pode integrar a lógica de disparo de sinais do Markov e alertas do Telegram por rodada.
   pass
 
 
