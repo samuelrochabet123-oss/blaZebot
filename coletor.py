@@ -1,5 +1,5 @@
 # ================================================================
-# BLAZE DOUBLE — COLLECTOR V2.1 — GOOGLE PLANILHAS EDITION
+# BLAZE DOUBLE — COLLECTOR V3.0 — QUEBRA_ALT + GOOGLE PLANILHAS
 # ================================================================
 # Coleta resultados do Double da Blaze via Socket.IO e
 # persiste em Google Planilhas (sheets_db.py).
@@ -424,9 +424,9 @@ def main():
 
     print("")
     print("=" * 70)
-    print("BLAZE DOUBLE — RENDER TEST V2.1 — GOOGLE PLANILHAS")
+    print("BLAZE DOUBLE — RENDER V3.0 — QUEBRA_ALT + GOOGLE PLANILHAS")
     print("=" * 70)
-    print("Teste do protocolo Socket.IO original do Colab")
+    print("Collector ao vivo + motor QUEBRA_ALT + Telegram")
     print("=" * 70)
 
     if not os.environ.get("GOOGLE_SHEETS_ID"):
