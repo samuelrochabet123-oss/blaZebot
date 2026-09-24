@@ -27,16 +27,50 @@ _iniciado = False
 # TELEGRAM
 # ================================================================
 def enviar_telegram(mensagem):
-  token = os.getenv("TELEGRAM_TOKEN")
-  chat_id = os.getenv("TELEGRAM_CHAT_ID")
+  """
+  Envia mensagem para o Telegram e confirma a resposta da API.
+  Erros não são mais ignorados silenciosamente.
+  """
+  token = os.getenv("TELEGRAM_TOKEN", "").strip()
+  chat_id = os.getenv("TELEGRAM_CHAT_ID", "").strip()
+
   if not token or not chat_id:
-    return
+    print(
+        "⚠️ Telegram não configurado: defina TELEGRAM_TOKEN e TELEGRAM_CHAT_ID.",
+        flush=True,
+    )
+    return False
+
   url = f"https://api.telegram.org/bot{token}/sendMessage"
-  data = {"chat_id": chat_id, "text": mensagem, "parse_mode": "Markdown"}
+  data = {
+      "chat_id": chat_id,
+      "text": mensagem,
+      "parse_mode": "Markdown",
+      "disable_web_page_preview": True,
+  }
+
   try:
-    requests.post(url, data=data, timeout=5)
-  except Exception:
-    pass
+    resposta = requests.post(url, data=data, timeout=10)
+    resposta.raise_for_status()
+
+    try:
+      retorno = resposta.json()
+    except ValueError:
+      retorno = {}
+
+    if not retorno.get("ok", False):
+      print(f"❌ Telegram API recusou a mensagem: {retorno}", flush=True)
+      return False
+
+    print("📨 Telegram: mensagem enviada com sucesso.", flush=True)
+    return True
+
+  except requests.RequestException as e:
+    print(f"❌ Erro HTTP ao enviar Telegram: {e}", flush=True)
+    return False
+  except Exception as e:
+    print(f"❌ Erro inesperado ao enviar Telegram: {e}", flush=True)
+    return False
 
 
 # ================================================================
@@ -47,7 +81,19 @@ def init_engine_db():
   ok = db.init_db()
   _iniciado = ok
   if ok:
-    print("✅ strategy_engine (Markov) inicializado com sucesso.")
+    print("✅ strategy_engine (Markov) inicializado com sucesso.", flush=True)
+    telegram_ok = bool(
+        os.getenv("TELEGRAM_TOKEN", "").strip()
+        and os.getenv("TELEGRAM_CHAT_ID", "").strip()
+    )
+    if telegram_ok:
+      print("✅ Telegram configurado (token/chat_id presentes).", flush=True)
+    else:
+      print(
+          "⚠️ Telegram NÃO configurado. "
+          "Defina TELEGRAM_TOKEN e TELEGRAM_CHAT_ID.",
+          flush=True,
+      )
   return ok
 
 
@@ -213,9 +259,11 @@ def _resolver_atual_e_avancar_ciclo(atual_id, now):
       continue
 
     cor_resultado = proxima["cor"]
-    if cor_resultado is None or cor_resultado == "W":
-      continue  # Ignora Branco na resolução se necessário ou trata como loss
+    if cor_resultado is None:
+      continue
 
+    # BRANCO participa do histórico, mas não é empate.
+    # Se a entrada era R/P e saiu W, o resultado é LOSS.
     resultado = (
         RESULTADO_WIN
         if cor_resultado == sinal["cor_prevista"]
@@ -233,9 +281,28 @@ def _resolver_atual_e_avancar_ciclo(atual_id, now):
     if not ok:
       continue
 
+    nome_entrada = "VERMELHO" if sinal["cor_prevista"] == "R" else "PRETO"
+    nome_resultado = {
+        "R": "VERMELHO",
+        "P": "PRETO",
+        "W": "BRANCO",
+    }.get(cor_resultado, cor_resultado)
+
     if resultado == RESULTADO_WIN:
+      enviar_telegram(
+          f"✅ *RESULTADO DO SINAL — WIN*\\n\\n"
+          f"🎯 Entrada: *{nome_entrada}*\\n"
+          f"🎲 Resultado: *{nome_resultado}*\\n"
+          f"🔢 Rodada: *{proxima['rodada_id']}*"
+      )
       _finalizar_ciclo(now, "WIN de Markov")
     else:
+      enviar_telegram(
+          f"❌ *RESULTADO DO SINAL — LOSS*\\n\\n"
+          f"🎯 Entrada: *{nome_entrada}*\\n"
+          f"🎲 Resultado: *{nome_resultado}*\\n"
+          f"🔢 Rodada: *{proxima['rodada_id']}*"
+      )
       _finalizar_ciclo(now, "LOSS de Markov")
 
 
