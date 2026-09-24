@@ -140,13 +140,18 @@ def salvar_resultado(payload):
             # MOTOR DAS ESTRATÉGIAS
             # ============================================================
             try:
+                print(
+                    f"🧠 Acionando motor | rodada={rodada_id} | "
+                    f"cor={nome_cor(color)} | roll={roll}",
+                    flush=True,
+                )
                 processar_novo_resultado(
                     rodada_id=str(rodada_id),
                     color=color,
                     roll=roll,
                 )
             except Exception as e:
-                print(f"⚠️ Erro no motor das estratégias: {e}")
+                print(f"⚠️ Erro no motor das estratégias: {e}", flush=True)
 
             return True
 
@@ -426,18 +431,18 @@ def main():
 
     if not os.environ.get("GOOGLE_SHEETS_ID"):
         print("❌ GOOGLE_SHEETS_ID não encontrada.")
-        sys.exit(1)
+        return
 
     if not db.credenciais_disponiveis():
         print("❌ Credenciais Google não encontradas "
               "(GOOGLE_CREDENTIALS_JSON ou GOOGLE_CREDENTIALS).")
-        sys.exit(1)
+        return
 
     print("✅ GOOGLE_SHEETS_ID encontrada no ambiente.")
 
     if not init_db():
         print("❌ Planilha não inicializada.")
-        sys.exit(1)
+        return
 
     # Signals só podem ser registrados na thread principal.
     if threading.current_thread() is threading.main_thread():
