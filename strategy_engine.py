@@ -1,5 +1,5 @@
 # =====================================================================
-# MOTOR DE MARKOV (ADAPTADO PARA O RENDER / PRODUÇÃO)
+# MOTOR DE MARKOV E PROCESSAMENTO (STRATEGY_ENGINE.PY)
 # =====================================================================
 
 from collections import defaultdict
@@ -22,8 +22,10 @@ if creds_json:
   creds = Credentials.from_service_account_info(creds_dict, scopes=scopes)
   gc = gspread.authorize(creds)
 else:
-  # Fallback para arquivo local caso precise testar na sua máquina
-  gc = gspread.service_account(filename="credenciais.json")
+  try:
+    gc = gspread.service_account(filename="credenciais.json")
+  except:
+    gc = None
 
 sheet_id = "1NuFeub0RD99vvTF2uon_t9NZENMCkLmbF_CZASMxv_Q"
 
@@ -31,7 +33,24 @@ META_DIARIA = 3
 STOP_LOSS = -3
 
 
+def init_engine_db():
+  """Função exigida pelo app.py para inicializar o motor e validar a conexão."""
+  if not gc:
+    raise Exception(
+        "Google Sheets Client não inicializado. Verifique as credenciais."
+    )
+  print("✅ strategy_engine inicializado com sucesso.")
+
+
+def processar_novo_resultado(resultado):
+  """Função exigida pelo collector para processar novas entradas em tempo real."""
+  # Aqui você pode adicionar lógica adicional de análise por rodada, se necessário.
+  pass
+
+
 def carregar_historico_markov():
+  if not gc:
+    return []
   aba = gc.open_by_key(sheet_id).worksheet("blaze_historico")
   registros = aba.get_all_records(numericise_ignore=["all"], default_blank="")
 
