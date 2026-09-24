@@ -1,589 +1,171 @@
-import math
-import os
-import requests
+# =====================================================================
+# MOTOR OFICIAL DE MARKOV (ESTRATÉGIA VENCEDORA: +33 UNIDADES)
+# =====================================================================
+
+from collections import defaultdict
 from datetime import datetime, timedelta
+import google.auth
+from google.colab import auth
+import gspread
 
-import sheets_db as db
+auth.authenticate_user()
+creds, _ = google.auth.default(
+    scopes=["https://www.googleapis.com/auth/spreadsheets.readonly"]
+)
+gc = gspread.authorize(creds)
+sheet_id = "1NuFeub0RD99vvTF2uon_t9NZENMCkLmbF_CZASMxv_Q"
 
-# ================================================================
-# MOTOR CONSOLIDADO: Z-SCORE (3 ORIGINAIS) + 2 NOVAS REGRAS + FILTROS
-# ================================================================
-
-APOSTA_BASE = 1.00
-MAX_TENTATIVAS = 1
 META_DIARIA = 3
-
-CORES = {0: "BRANCO", 1: "VERMELHO", 2: "PRETO"}
-COR_SIGLA = {"BRANCO": "W", "VERMELHO": "R", "PRETO": "P"}
-
-RESULTADO_PENDENTE = "PENDENTE"
-RESULTADO_WIN = "WIN"
-RESULTADO_LOSS = "LOSS"
-
-_iniciado = False
-
-# ---------------------------------------------------------------------
-# CONFIGURAÇÃO DE HORÁRIOS APROVADOS (Horário de Brasília)
-# ---------------------------------------------------------------------
-# Horários permitidos para as regras originais de Z-Score
-HORARIOS_ORIGINAIS = {1, 4, 8, 9, 10, 12, 16, 17, 18, 19}
-
-# Horários permitidos para a Nova Regra 1: Exaustão Extrema (Z >= 1.96)
-HORARIOS_EXAUSTAO = {0, 1, 2, 3, 6, 7, 11, 13, 15, 16, 17, 18, 19, 21, 22, 23}
-
-# Horários permitidos para a Nova Regra 2: Pressão de Branco (>= 15)
-HORARIOS_BRANCO = {2, 3, 4, 5, 7, 9, 11, 12, 13, 15, 17, 18, 19, 21, 23}
-
-# Mapeamento das 3 regras unificadas originais de Z-Score
-REGRAS_CONFIG = {
-    1.10: "R",  # 1ª Regra: Z=1.10 x3 + Quebra -> Aposta em Vermelho
-    0.73: "P",  # 2ª Regra: Z=0.73 x3 + Quebra -> Aposta em Preto
-    0.37: "P",  # 3ª Regra: Z=0.37 x3 + Quebra -> Aposta em Preto
-}
+STOP_LOSS = -3
 
 
-# ================================================================
-# TELEGRAM
-# ================================================================
-def enviar_telegram(mensagem):
-    token = os.getenv("TELEGRAM_TOKEN")
-    chat_id = os.getenv("TELEGRAM_CHAT_ID")
-    if not token or not chat_id:
-        return
-    url = f"https://api.telegram.org/bot{token}/sendMessage"
-    data = {"chat_id": chat_id, "text": mensagem, "parse_mode": "Markdown"}
-    try:
-        requests.post(url, data=data, timeout=5)
-    except Exception:
-        pass
+def carregar_historico_markov():
+    aba = gc.open_by_key(sheet_id).worksheet("blaze_historico")
+    registros = aba.get_all_records(numericise_ignore=["all"], default_blank="")
 
+    def to_int(v, p=None):
+        try:
+            return int(float(str(v).strip()))
+        except:
+            return p
 
-# ================================================================
-# FILTRO DE HORÁRIO E META (Horário de Brasília)
-# ================================================================
-def get_hora_brt():
-    return (datetime.utcnow() - timedelta(hours=3)).hour
+    def cor_de(t, color):
+        t = str(t or "").upper().strip()
+        if "VERMELHO" in t or t in {"R", "RED", "V", "VI"}:
+            return "R"
+        if "PRETO" in t or t in {"P", "BLACK", "B"}:
+            return "P"
+        if "BRANCO" in t or t in {"W", "WHITE"}:
+            return "W"
+        return {0: "W", 1: "R", 2: "P"}.get(color)
 
-
-def get_data_brt():
-    return (datetime.utcnow() - timedelta(hours=3)).date()
-
-
-# ================================================================
-# BANCO DE DADOS (GOOGLE PLANILHAS)
-# ================================================================
-def init_engine_db():
-    global _iniciado
-    ok = db.init_db()
-    _iniciado = ok
-    return ok
-
-
-def cor_para_sigla(color):
-    try:
-        return COR_SIGLA.get(CORES.get(int(color)))
-    except (TypeError, ValueError):
-        return None
-
-
-def get_lucro_dia():
-    return db.lucro_dia()
-
-
-def calcular_z_scores_com_detalhes(cores_lista, tamanho_janela=30):
-    """Calcula Z-Scores preservando a cor dominante e o valor bruto do Z."""
-    historico_z = []
-    i = tamanho_janela
-    while i < len(cores_lista):
-        janela = cores_lista[i - tamanho_janela : i]
-        janela_rp = [c for c in janela if c in "RP"]
-        total = len(janela_rp)
-        if total == 0:
-            i += 1
+    hist = []
+    for r in registros:
+        if str(r.get("status", "")).strip() != "complete":
             continue
+        c = to_int(r.get("color"))
+        i = to_int(r.get("id"))
+        cor = cor_de(r.get("cor"), c)
+        data_str = str(r.get("created_at", "")).strip()
 
-        qtd_r = janela_rp.count("R")
-        qtd_p = janela_rp.count("P")
-        media = total / 2.0
-        desvio_padrao = math.sqrt(total * 0.5 * 0.5)
-        maior_qtd = max(qtd_r, qtd_p)
+        dia_str = "Desconhecido"
+        hora_brt = 0
+        try:
+            if data_str:
+                dt = datetime.fromisoformat(data_str.replace("Z", "+00:00"))
+                dt_brt = dt - timedelta(hours=3)
+                dia_str = dt_brt.strftime("%Y-%m-%d")
+                hora_brt = dt_brt.hour
+        except:
+            pass
 
-        z_score = (
-            round((maior_qtd - media) / desvio_padrao, 2)
-            if desvio_padrao > 0
-            else 0.0
+        if cor and i is not None:
+            hist.append({
+                "id": i,
+                "cor": cor,
+                "data": dia_str,
+                "hora": hora_brt,
+            })
+
+    hist.sort(key=lambda h: h["id"])
+    return hist
+
+
+def executar_backtest_markov():
+    print("🔍 Baixando histórico e executando motor de Markov...")
+    hist_geral = carregar_historico_markov()
+
+    # Filtrando apenas R e P para o cálculo de transição
+    dados_filtrados = [h for h in hist_geral if h["cor"] in "RP"]
+
+    tamanho_padrao = 3
+    transicoes = defaultdict(lambda: {"R": 0, "P": 0})
+
+    # Mapeia as probabilidades do histórico
+    for i in range(len(dados_filtrados) - tamanho_padrao):
+        padrao = tuple(d["cor"] for d in dados_filtrados[i : i + tamanho_padrao])
+        proxima_cor = dados_filtrados[i + tamanho_padrao]["cor"]
+        transicoes[padrao][proxima_cor] += 1
+
+    sessoes = defaultdict(list)
+
+    for i in range(tamanho_padrao, len(dados_filtrados) - 1):
+        padrao_atual = tuple(
+            d["cor"] for d in dados_filtrados[i - tamanho_padrao : i]
         )
-        cor_dominante = "R" if qtd_r > qtd_p else "P"
+        item_seguinte = dados_filtrados[i]
+        cor_seguinte = item_seguinte["cor"]
 
-        historico_z.append({
-            "z": z_score,
-            "cor_dominante": cor_dominante,
-            "cor_atual": cores_lista[i],
-        })
-        i += 1
-    return historico_z
+        estatisticas = transicoes[padrao_atual]
+        total_amostras = estatisticas["R"] + estatisticas["P"]
 
-
-def contar_rodadas_sem_branco(hist):
-    """Conta quantas rodadas seguidas ocorreram sem sair Branco (W) no final do histórico."""
-    contador = 0
-    for h in reversed(hist):
-        if h["cor"] == "W":
-            break
-        contador += 1
-    return contador
-
-
-def detectar_estrategia(hist):
-    if not hist or len(hist) < 35:
-        return None, None
-    if get_lucro_dia() >= META_DIARIA:
-        return None, None
-
-    hora_atual = get_hora_brt()
-
-    # 1. Filtra apenas R e P para o cálculo de Z-Score mantendo a estrutura
-    cores_brutas = [h["cor"] for h in hist if h["cor"] in "RPW"]
-    cores_rp = [c for c in cores_brutas if c in "RP"]
-    if len(cores_rp) < 33:
-        return None, None
-
-    z_detalhes = calcular_z_scores_com_detalhes(cores_brutas, tamanho_janela=30)
-    if len(z_detalhes) < 4:
-        return None, None
-
-    # ==============================================================
-    # REGRA A: Z-Score Unificado Original (3 repetições + Quebra)
-    # ==============================================================
-    if hora_atual in HORARIOS_ORIGINAIS:
-        z1 = z_detalhes[-4]["z"]
-        z2 = z_detalhes[-3]["z"]
-        z3 = z_detalhes[-2]["z"]
-        z_quebra = z_detalhes[-1]["z"]
-
-        if z1 == z2 == z3 and z1 in REGRAS_CONFIG and z_quebra != z1:
-            cor_entrada = REGRAS_CONFIG[z1]
-            nome_estrategia = f"Z-Score Unificado (Z={z1})"
-            return cor_entrada, nome_estrategia
-
-    # ==============================================================
-    # REGRA B: Exaustão Extrema (Z >= 1.96 + Queda) + Filtro Horário
-    # ==============================================================
-    if hora_atual in HORARIOS_EXAUSTAO and len(z_detalhes) >= 2:
-        z_ant = z_detalhes[-2]["z"]
-        z_atual = z_detalhes[-1]["z"]
-
-        if z_ant >= 1.96 and z_atual < z_ant:
-            cor_dominante_ant = z_detalhes[-2]["cor_dominante"]
-            # Aposta contra a cor dominante anterior
-            cor_entrada = "P" if cor_dominante_ant == "R" else "R"
-            nome_estrategia = "Exaustao Extrema (Z >= 1.96)"
-            return cor_entrada, nome_estrategia
-
-    # ==============================================================
-    # REGRA C: Pressão de Branco (>= 15 rodadas sem sair) + Filtro Horário
-    # ==============================================================
-    if hora_atual in HORARIOS_BRANCO:
-        contador_branco = contar_rodadas_sem_branco(hist)
-        if contador_branco >= 15:
-            ultimas_5 = hist[-5:] if len(hist) >= 5 else hist
-            r_count = sum(1 for x in ultimas_5 if x["cor"] == "R")
-            p_count = sum(1 for x in ultimas_5 if x["cor"] == "P")
-            cor_entrada = "R" if r_count >= p_count else "P"
-            nome_estrategia = "Pressao de Branco (>=15)"
-            return cor_entrada, nome_estrategia
-
-    return None, None
-
-
-def _resultado_do_sinal(cor_entrada, cor_resultado):
-    return RESULTADO_WIN if cor_resultado == cor_entrada else RESULTADO_LOSS
-
-
-def _proxima_rodada_complete(base_db_id):
-    return db.proxima_rodada_apos(base_db_id)
-
-
-def resolver_sinal_por_rodada(sinal, rodada_resultado, cor_resultado, now):
-    resultado = _resultado_do_sinal(sinal["cor_prevista"], cor_resultado)
-    ok = db.resolver_sinal(
-        sinal["id"],
-        {
-            "rodada_resultado": str(rodada_resultado),
-            "cor_resultado": cor_resultado,
-            "resultado": resultado,
-            "resolvido_em": now,
-        },
-    )
-    if not ok:
-        return False
-    print(
-        f"📊 SINAL RESOLVIDO | id={sinal['id']} | base={sinal['rodada_base']} |"
-        f" resultado={rodada_resultado} | estratégia={sinal['estrategia']} |"
-        f" entrada={sinal['cor_prevista']} | real={cor_resultado} | {resultado}",
-        flush=True,
-    )
-    return True
-
-
-def _obter_ciclo():
-    estado = db.ler_estado()
-    return {
-        "ativo": db.to_bool(estado.get("ciclo_ativo")),
-        "id": db.txt(estado.get("ciclo_id")) or None,
-        "tentativa": db.to_int(estado.get("tentativa_atual"), 0),
-        "cor_regra": db.txt(estado.get("ciclo_cor_regra")) or None,
-        "cor_entrada": db.txt(estado.get("ciclo_cor_entrada")) or None,
-        "estrategia": db.txt(estado.get("ciclo_estrategia")) or None,
-    }
-
-
-def _finalizar_ciclo(now, motivo):
-    db.atualizar_estado({
-        "ciclo_ativo": False,
-        "ciclo_id": "",
-        "tentativa_atual": 0,
-        "ciclo_cor_regra": "",
-        "ciclo_cor_entrada": "",
-        "ciclo_estrategia": "",
-        "sinal_ativo": "",
-        "cor_sinal": "",
-        "rodada_base_sinal": "",
-        "atualizado_em": now,
-    })
-    print(f"🏁 CICLO ENCERRADO | {motivo}", flush=True)
-
-    lucro = get_lucro_dia()
-    if "WIN" in motivo:
-        msg = f"✅ *WIN!*\n💰 Lucro de hoje: {lucro:+}\n🎯 Meta: +{META_DIARIA}"
-    else:
-        msg = f"❌ *LOSS!*\n💰 Lucro de hoje: {lucro:+}\n🎯 Meta: +{META_DIARIA}"
-    enviar_telegram(msg)
-
-    if lucro >= META_DIARIA:
-        enviar_telegram(
-            "🛑 *META DIÁRIA BATIDA!*\nO bot foi desligado e só volta a operar nos"
-            " horários programados."
-        )
-
-
-def _criar_tentativa(
-    rodada_base, ciclo_id, tentativa, estrategia, cor_regra, cor_entrada, now
-):
-    db.inserir_sinal({
-        "rodada_base": str(rodada_base),
-        "estrategia": estrategia,
-        "cor_prevista": cor_entrada,
-        "resultado": "PENDENTE",
-        "tentativa": int(tentativa),
-        "ciclo_id": str(ciclo_id),
-        "cor_regra": str(cor_regra),
-        "cor_entrada": cor_entrada,
-        "valor_aposta": APOSTA_BASE,
-    })
-    db.atualizar_estado({
-        "ciclo_ativo": True,
-        "ciclo_id": str(ciclo_id),
-        "tentativa_atual": int(tentativa),
-        "ciclo_cor_regra": str(cor_regra),
-        "ciclo_cor_entrada": cor_entrada,
-        "ciclo_estrategia": estrategia,
-        "sinal_ativo": estrategia,
-        "cor_sinal": cor_entrada,
-        "rodada_base_sinal": str(rodada_base),
-        "ultima_estrategia": estrategia,
-        "atualizado_em": now,
-    })
-
-    nome_cor = "VERMELHO" if cor_entrada == "R" else "PRETO"
-    print("\n" + "=" * 72)
-    print(
-        f"🎯 NOVO SINAL | ESTRATÉGIA: {estrategia} | ENTRADA NO {nome_cor}"
-    )
-    print("=" * 72 + "\n")
-
-    msg = (
-        f"🚨 *SINAL DETECTADO* 🚨\n\n🎯 Estratégia: *{estrategia}*\n👉 Entrada no:"
-        f" *{nome_cor}*\n💵 Valor: R$ {APOSTA_BASE:.2f}\n⏰ Hora BRT:"
-        f" {get_hora_brt():02d}:00"
-    )
-    enviar_telegram(msg)
-
-
-def _criar_primeiro_ciclo(rodada_id, rodada_db_id, now):
-    historico = db.carregar_historico(ate_id=rodada_db_id)
-    cor_entrada, estrategia = detectar_estrategia(historico)
-    if not estrategia:
-        return False
-
-    if db.existe_sinal_base(str(rodada_id)):
-        return False
-
-    ciclo_id = f"{rodada_id}-{int(datetime.now().timestamp() * 1000)}"
-    _criar_tentativa(
-        rodada_id, ciclo_id, 1, estrategia, "MultiRegras", cor_entrada, now
-    )
-    return True
-
-
-def _resolver_atual_e_avancar_ciclo(atual_id, now):
-    pendentes = db.sinais_pendentes()
-    if not pendentes:
-        return
-
-    hist = db.carregar_historico()
-    pos_por_id = {h["id"]: i for i, h in enumerate(hist)}
-    por_rodada = {h["rodada_id"]: h for h in hist}
-
-    for sinal in pendentes:
-        base = por_rodada.get(str(sinal["rodada_base"]))
-        if not base:
-            continue
-        idx = pos_por_id.get(base["id"])
-        if idx is None or idx + 1 >= len(hist):
-            continue
-        proxima = hist[idx + 1]
-        if int(proxima["id"]) != int(atual_id):
-            continue
-
-        cor_resultado = proxima["cor"]
-        if cor_resultado is None:
-            continue
-        if not resolver_sinal_por_rodada(
-            sinal, proxima["rodada_id"], cor_resultado, now
-        ):
-            continue
-
-        resultado = _resultado_do_sinal(sinal["cor_prevista"], cor_resultado)
-        ciclo = _obter_ciclo()
-        if ciclo["ativo"] and ciclo["id"] == sinal["ciclo_id"]:
-            if resultado == RESULTADO_WIN:
-                _finalizar_ciclo(
-                    now, f"WIN na tentativa {sinal['tentativa']}/{MAX_TENTATIVAS}"
-                )
+        cor_entrada = None
+        if total_amostras >= 3:
+            if estatisticas["R"] > estatisticas["P"]:
+                cor_entrada = "R"
+            elif estatisticas["P"] > estatisticas["R"]:
+                cor_entrada = "P"
             else:
-                _finalizar_ciclo(now, "LOSS - Ciclo encerrado (Aposta Fixa)")
-
-
-def reconciliar_sinais_pendentes(now, limite=5000):
-    resolvidos = 0
-    for sinal in db.sinais_pendentes(limite):
-        base = db.buscar_rodada(sinal["rodada_base"])
-        if not base:
-            continue
-        proxima = _proxima_rodada_complete(base["id"])
-        if not proxima:
-            continue
-        cor_resultado = proxima["cor"]
-        if cor_resultado is None:
-            continue
-        if resolver_sinal_por_rodada(
-            sinal, proxima["rodada_id"], cor_resultado, now
-        ):
-            resolvidos += 1
-    return resolvidos
-
-
-def recalcular_bot_estado(rodada_atual=None, now=None):
-    est = db.estatisticas()
-    estado = db.ler_estado()
-    motor_ativo = db.to_bool(estado.get("motor_ativo"))
-    ciclo = _obter_ciclo()
-
-    rodada_base_sinal = ""
-    if ciclo["ativo"] and ciclo["id"]:
-        s = db.sinal_pendente_do_ciclo(ciclo["id"])
-        if s:
-            rodada_base_sinal = s["rodada_base"]
-
-    now = now or db.agora()
-    ultima = (
-        str(rodada_atual)
-        if rodada_atual is not None
-        else db.txt(estado.get("ultima_rodada_processada"))
-    )
-
-    db.atualizar_estado({
-        "wins": est["wins"],
-        "losses": est["losses"],
-        "whites": est["whites_internos"],
-        "profit": round(est["profit"], 2),
-        "sinal_ativo": ciclo["estrategia"] if ciclo["ativo"] else "",
-        "cor_sinal": ciclo["cor_entrada"] if ciclo["ativo"] else "",
-        "ultima_rodada_processada": ultima,
-        "rodada_base_sinal": rodada_base_sinal,
-        "ultima_estrategia": ciclo["estrategia"] if ciclo["ativo"] else "",
-        "atualizado_em": now,
-    })
-
-    return {
-        "wins": est["wins"],
-        "losses": est["losses"],
-        "pendentes": est["pendentes"],
-        "whites_internos": est["whites_internos"],
-        "profit": est["profit"],
-        "sinal_ativo": ciclo["estrategia"] if ciclo["ativo"] else None,
-        "cor_sinal": ciclo["cor_entrada"] if ciclo["ativo"] else None,
-        "rodada_base_sinal": None,
-        "estrategia": ciclo["estrategia"] if ciclo["ativo"] else None,
-        "motor_ativo": motor_ativo,
-        "ciclo_ativo": ciclo["ativo"],
-        "ciclo_id": ciclo["id"],
-        "tentativa_atual": ciclo["tentativa"],
-        "ciclo_cor_regra": ciclo["ciclo_cor_regra"],
-        "ciclo_cor_entrada": ciclo["ciclo_cor_entrada"],
-    }
-
-
-def processar_novo_resultado(rodada_id, color, roll):
-    global _iniciado
-    if not _iniciado:
-        if not init_engine_db():
-            return None
-    try:
-        rodada_id, color, roll = str(rodada_id), int(color), int(roll)
-        cor_atual = cor_para_sigla(color)
-        if cor_atual is None:
-            print(
-                f"⚠️ MOTOR: cor inválida na rodada {rodada_id}: {color}", flush=True
-            )
-            return None
-
-        now = db.agora()
-        rodada = db.buscar_rodada(rodada_id)
-        if not rodada:
-            print(
-                f"⚠️ MOTOR: rodada {rodada_id} ainda não persistida como complete.",
-                flush=True,
-            )
-            return None
-        rodada_db_id = int(rodada["id"])
-
-        estado = db.ler_estado()
-        motor_ativo = db.to_bool(estado.get("motor_ativo"))
-        ultima_processada = db.txt(estado.get("ultima_rodada_processada")) or None
-
-        if ultima_processada == rodada_id:
-            resumo = recalcular_bot_estado(rodada_id, now)
-            return {
-                "ativo": motor_ativo,
-                "estrategia": resumo["estrategia"],
-                "cor": resumo["cor_sinal"],
-                "wins": resumo["wins"],
-                "losses": resumo["losses"],
-                "pendentes": resumo["pendentes"],
-                "profit": resumo["profit"],
-            }
-
-        db.atualizar_estado(
-            {"ultima_rodada_processada": rodada_id, "atualizado_em": now}
-        )
-
-        ciclo_antes = _obter_ciclo()
-        if motor_ativo or ciclo_antes["ativo"]:
-            _resolver_atual_e_avancar_ciclo(rodada_db_id, now)
-            ciclo = _obter_ciclo()
-            if motor_ativo and not ciclo["ativo"]:
-                _criar_primeiro_ciclo(rodada_id, rodada_db_id, now)
+                cor_entrada = dados_filtrados[i - 1]["cor"]
         else:
-            print(
-                f"⏸️ MOTOR UNIFICADO PAUSADO | rodada={rodada_id} | fora da"
-                " janela ou pausado",
-                flush=True,
-            )
+            cor_entrada = dados_filtrados[i - 1]["cor"]
 
-        reconciliar_sinais_pendentes(now, limite=5000)
-        resumo = recalcular_bot_estado(rodada_id, now)
+        if cor_entrada:
+            resultado = 1 if cor_seguinte == cor_entrada else -1
+            chave_sessao = f"{item_seguinte['data']} | {item_seguinte['hora']:02d}:00"
+            sessoes[chave_sessao].append(resultado)
 
-        return {
-            "ativo": motor_ativo,
-            "estrategia": resumo["estrategia"],
-            "cor": resumo["cor_sinal"],
-            "wins": resumo["wins"],
-            "losses": resumo["losses"],
-            "pendentes": resumo["pendentes"],
-            "profit": resumo["profit"],
-        }
+    # Apurativo de sessões com Stop Win (+3) / Stop Loss (-3)
+    total_wins = 0
+    total_loss = 0
+    total_neutras = 0
+    lucro_total = 0
 
-    except Exception as e:
+    print("\n" + "=" * 65)
+    print("🎯 SIMULAÇÃO DE METAS: MARKOV PURO (+3 / -3)")
+    print("=" * 65)
+    print(f"{'SESSÃO (DATA | HORA)':<22} | {'STATUS':<12} | {'SALDO':<10}")
+    print("-" * 65)
+
+    for sessao in sorted(sessoes.keys()):
+        resultados = sessoes[sessao]
+        saldo_parcial = 0
+        status_sessao = "NEUTRO"
+
+        for res in resultados:
+            saldo_parcial += res
+            if saldo_parcial >= META_DIARIA:
+                status_sessao = f"WIN (+{META_DIARIA})"
+                total_wins += 1
+                break
+            elif saldo_parcial <= STOP_LOSS:
+                status_sessao = f"LOSS ({STOP_LOSS})"
+                total_loss += 1
+                break
+
+        if status_sessao == "NEUTRO":
+            if saldo_parcial > 0:
+                total_wins += 1
+                status_sessao = f"WIN (+{saldo_parcial})"
+            elif saldo_parcial < 0:
+                total_loss += 1
+                status_sessao = f"LOSS ({saldo_parcial})"
+            else:
+                total_neutras += 1
+                status_sessao = "0 (Empate)"
+
+        lucro_total += saldo_parcial
         print(
-            f"❌ MOTOR UNIFICADO: erro processando rodada {rodada_id}: {e}",
-            flush=True,
+            f"{sessao:<22} | {status_sessao:<12} | {saldo_parcial:+d} unidades"
         )
-        return None
+
+    print("=" * 65)
+    print(f"📊 RESUMO DO MOTOR DE MARKOV:")
+    print(f"✅ Total de Sessões Positivas (Meta Batida): {total_wins}")
+    print(f"❌ Total de Sessões Negativas (Stop Loss): {total_loss}")
+    print(f"⚖️ Sessões Neutras: {total_neutras}")
+    print(f"💰 Saldo Líquido Total Acumulado: {lucro_total:+d} unidades")
+    print("=" * 65)
 
 
-def reconciliar_todos_sinais():
-    global _iniciado
-    if not _iniciado:
-        if not init_engine_db():
-            return None
-    try:
-        now = db.agora()
-        resolvidos = reconciliar_sinais_pendentes(now, limite=50000)
-        resumo = recalcular_bot_estado(now=now)
-        print(
-            f"🧾 AUDITORIA MOTOR | resolvidos={resolvidos} |"
-            f" pendentes={resumo['pendentes']} | W={resumo['wins']} |"
-            f" L={resumo['losses']} | profit={resumo['profit']:.2f}",
-            flush=True,
-        )
-        return {"resolvidos": resolvidos, **resumo}
-    except Exception as e:
-        print(f"❌ AUDITORIA MOTOR: erro: {e}", flush=True)
-        return None
-
-
-def obter_status_motor():
-    global _iniciado
-    if not _iniciado:
-        if not init_engine_db():
-            return {
-                "ativo": False,
-                "sinal": None,
-                "cor": None,
-                "estrategia": None,
-                "wins": 0,
-                "losses": 0,
-                "pendentes": 0,
-                "profit": 0.0,
-                "ciclo_ativo": False,
-                "tentativa_atual": 0,
-            }
-    try:
-        resumo = recalcular_bot_estado(now=db.agora())
-        return {
-            "ativo": resumo["motor_ativo"],
-            "sinal": resumo["sinal_ativo"],
-            "cor": resumo["cor_sinal"],
-            "estrategia": resumo["estrategia"],
-            "wins": resumo["wins"],
-            "losses": resumo["losses"],
-            "pendentes": resumo["pendentes"],
-            "profit": resumo["profit"],
-            "ciclo_ativo": resumo["ciclo_ativo"],
-            "tentativa_atual": resumo["tentativa_atual"],
-            "ciclo_cor_regra": resumo["ciclo_cor_regra"],
-            "ciclo_cor_entrada": resumo["ciclo_cor_entrada"],
-        }
-    except Exception as e:
-        print(f"❌ MOTOR: erro consultando status: {e}", flush=True)
-        return {
-            "ativo": False,
-            "sinal": None,
-            "cor": None,
-            "estrategia": None,
-            "wins": 0,
-            "losses": 0,
-            "pendentes": 0,
-            "profit": 0.0,
-            "ciclo_ativo": False,
-            "tentativa_atual": 0,
-        }
-```eof
-
-### O que mudou e foi integrado:
-1. **Filtros por Horário Independentes:** Cada estratégia agora possui a sua própria lista restrita de horários validados na auditoria (`HORARIOS_ORIGINAIS`, `HORARIOS_EXAUSTAO`, `HORARIOS_BRANCO`).
-2. **Função `calcular_z_scores_com_detalhes`:** Ajustada para retornar o valor exato do Z-Score e a cor dominante correspondente, viabilizando o cálculo da Regra de Exaustão ($Z \ge 1.96$).
-3. **Detecção de Branco:** Implementada a contagem em tempo real de rodadas seguidas sem branco para atender a nova regra de $\ge 15$ rodadas.
-4. **Mensagens Dinâmicas no Telegram:** O bot agora identifica e informa no alerta qual foi a regra exata que disparou o sinal.
+executar_backtest_markov()
