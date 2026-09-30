@@ -1,1042 +1,992 @@
-# BLAZE STRATEGY ENGINE — ESTRATÉGIA 1
-# Gatilho por ciclo pós-branco + média dos rolls
+# ================================================================
+# BLAZE — ESTRATÉGIA 2 ADAPTADA PELA ESTRATÉGIA 3
+# ================================================================
 #
-# Substitui a lógica MULTI-GATILHOS PÓS-BRANCO da versão anterior,
-# mantendo a interface operacional esperada pelo BOT:
-#   - sheets_db
-#   - sinais
-#   - estado do motor
-#   - dashboard
-#   - Telegram
+# ESTRATÉGIA BASE:
+#   Estratégia 2 = gatilho após BRANCO
 #
-# REGRA DA ESTRATÉGIA 1:
-# 1) Localiza o BRANCO.
-# 2) Acumula os rolls após esse branco.
-# 3) Quando aparece o próximo BRANCO, fecha o ciclo anterior.
-# 4) Calcula a média dos rolls do ciclo fechado.
-# 5) Média <= 7.5  -> GRANDE (8-14)
-# 6) Média >  7.5  -> PEQUENO (1-7)
-# 7) O sinal fica pendente.
-# 8) O primeiro resultado NÃO-BRANCO após o sinal resolve a entrada.
+# DECISÃO:
+#   Estratégia 3 = Random Forest usando os últimos 5 resultados
 #
-# IMPORTANTE:
-# A estratégia original trabalha com GRANDE/PEQUENO, mas o banco do BOT
-# trabalha com cores R/P. Para preservar a estrutura do motor:
-#   GRANDE  -> P (PRETO / 8-14)
-#   PEQUENO -> R (VERMELHO / 1-7)
+# REGRAS:
+#   1. BRANCO continua fazendo parte do histórico.
+#   2. BRANCO funciona como gatilho para procurar entrada.
+#   3. O modelo utiliza os últimos 5 resultados.
+#   4. Só gera sinal se a confiança >= 55%.
+#   5. Sinal pode ser somente VERMELHO ou PRETO.
+#   6. BRANCO após VERMELHO/PRETO = LOSS.
+#   7. Cada sinal é avaliado somente na próxima rodada.
+#   8. Não existe GALE.
+#   9. Não existe empate.
 #
-# Esta conversão segue exatamente o texto da Estratégia 1:
-# GRANDE (Preto / 8-14) e PEQUENO (Vermelho / 1-7).
-# =====================================================================
+# ================================================================
 
-import os
-from datetime import datetime
-import requests
-import sheets_db as db
+import pandas as pd
+import numpy as np
+import time
+import gspread
+
+from google.colab import auth
+from google.auth import default
+from IPython.display import clear_output
+
+from sklearn.ensemble import RandomForestClassifier
 
 
-# ---------------------------------------------------------------------
-# CONFIGURAÇÃO
-# ---------------------------------------------------------------------
+# ================================================================
+# CONFIGURAÇÕES
+# ================================================================
 
-APOSTA_BASE = 1.0
+NOME_DA_PLANILHA = "Blaze Bot"
+NOME_DA_ABA = "blaze_historico"
 
-RESULTADO_PENDENTE = "PENDENTE"
-RESULTADO_WIN = "WIN"
-RESULTADO_LOSS = "LOSS"
+# Confiança mínima para gerar sinal
+LIMIAR_CONFIANCA = 0.55
 
-PREFIXO_ESTRATEGIA = "PÓS-BRANCO — MÉDIA DOS ROLLS"
+# Quantidade de resultados usados pelo modelo
+JANELA_HISTORICO = 5
 
-LIMITE_MEDIA = 7.5
+# Quantidade mínima de dados para treinar
+MINIMO_TREINO = 50
 
-NOMES = {
-    "R": "VERMELHO",
-    "P": "PRETO",
-    "W": "BRANCO",
+# Intervalo de atualização da planilha
+INTERVALO_ATUALIZACAO = 5
+
+
+# ================================================================
+# MAPEAMENTO
+# ================================================================
+
+# Mantemos BRANCO dentro do histórico.
+#
+# VERMELHO = 0
+# PRETO    = 1
+# BRANCO   = 2
+#
+MAPEAMENTO_COR = {
+    "VERMELHO": 0,
+    "PRETO": 1,
+    "BRANCO": 2,
+    "V": 0,
+    "P": 1,
+    "B": 2
 }
 
-_iniciado = False
+
+# ================================================================
+# CONEXÃO COM GOOGLE SHEETS
+# ================================================================
+
+def conectar_planilha():
+
+    print("🔐 Conectando ao Google Sheets...")
+
+    auth.authenticate_user()
+
+    creds, _ = default()
+
+    gc = gspread.authorize(creds)
+
+    planilha = gc.open(NOME_DA_PLANILHA)
+
+    aba = planilha.worksheet(NOME_DA_ABA)
+
+    print("✅ Conexão estabelecida.")
+
+    return aba
 
 
-# ---------------------------------------------------------------------
-# UTILITÁRIOS
-# ---------------------------------------------------------------------
+# ================================================================
+# NORMALIZAÇÃO DAS CORES
+# ================================================================
 
-def _nome(cor):
-    return NOMES.get(cor, cor or "?")
+def normalizar_cor(valor):
 
-
-def _normalizar_cor(valor):
-    if valor in ("R", "P", "W"):
-        return valor
-
-    try:
-        v = str(valor).upper().strip()
-    except Exception:
+    if pd.isna(valor):
         return None
 
-    if "VERMELHO" in v or v in {"R", "RED", "V", "VI"}:
-        return "R"
+    texto = str(valor).upper().strip()
 
-    if "PRETO" in v or v in {"P", "BLACK", "B"}:
-        return "P"
+    # Remove possíveis espaços
+    texto = texto.replace(" ", "")
 
-    if "BRANCO" in v or v in {"W", "WHITE", "0"}:
-        return "W"
+    if texto in ["VERMELHO", "V", "RED"]:
+        return "VERMELHO"
+
+    if texto in ["PRETO", "P", "BLACK"]:
+        return "PRETO"
+
+    if texto in ["BRANCO", "B", "WHITE"]:
+        return "BRANCO"
 
     return None
 
 
-def _roll_para_cor(roll):
-    """
-    Conversão operacional do roll para a classificação da Estratégia 1.
+# ================================================================
+# PREPARAR HISTÓRICO
+# ================================================================
 
-    A Estratégia 1 considera:
-      8-14 = GRANDE / PRETO
-      1-7  = PEQUENO / VERMELHO
-      0    = BRANCO
-    """
-    try:
-        r = int(roll)
-    except Exception:
-        return None
+def preparar_historico(df):
 
-    if r == 0:
-        return "W"
+    if df.empty:
+        return df
 
-    if 1 <= r <= 7:
-        return "R"
+    # ------------------------------------------------------------
+    # Identificar coluna de cor
+    # ------------------------------------------------------------
 
-    if 8 <= r <= 14:
-        return "P"
+    if "cor" in df.columns:
 
-    return None
+        coluna_cor = "cor"
 
-
-def _extrair_roll(item):
-    """
-    Extrai o roll do registro do histórico.
-
-    O motor prioriza 'roll', que é o campo usado pela Estratégia 1
-    original. Se não existir, tenta converter a cor.
-    """
-    try:
-        valor = item.get("roll")
-    except Exception:
-        valor = None
-
-    if valor is not None and str(valor).strip() != "":
-        try:
-            return int(float(valor))
-        except Exception:
-            pass
-
-    cor = _normalizar_cor(item.get("cor"))
-    if cor == "W":
-        return 0
-
-    # Sem roll não é possível reconstruir a média original.
-    return None
-
-
-def _classificar_resultado(roll):
-    if roll is None:
-        return None
-
-    try:
-        r = int(roll)
-    except Exception:
-        return None
-
-    if r == 0:
-        return "W"
-
-    if 1 <= r <= 7:
-        return "R"
-
-    if 8 <= r <= 14:
-        return "P"
-
-    return None
-
-
-def _cor_do_historico(item):
-    """
-    Obtém a cor de forma robusta.
-
-    Quando o roll existe, ele é usado para manter a mesma classificação
-    da Estratégia 1.
-    """
-    roll = _extrair_roll(item)
-
-    cor_roll = _classificar_resultado(roll)
-    if cor_roll is not None:
-        return cor_roll
-
-    return _normalizar_cor(item.get("cor"))
-
-
-# ---------------------------------------------------------------------
-# TELEGRAM
-# ---------------------------------------------------------------------
-
-def enviar_telegram(mensagem):
-    token = os.getenv("TELEGRAM_TOKEN", "").strip()
-    chat_id = os.getenv("TELEGRAM_CHAT_ID", "").strip()
-
-    if not token or not chat_id:
-        print("⚠️ Telegram não configurado.", flush=True)
-        return False
-
-    try:
-        r = requests.post(
-            f"https://api.telegram.org/bot{token}/sendMessage",
-            data={
-                "chat_id": chat_id,
-                "text": mensagem,
-                "parse_mode": "Markdown",
-                "disable_web_page_preview": True,
-            },
-            timeout=10,
-        )
-
-        r.raise_for_status()
-        j = r.json()
-
-        if not j.get("ok"):
-            print(f"❌ Telegram recusou: {j}", flush=True)
-            return False
-
-        print("📨 Telegram enviado.", flush=True)
-        return True
-
-    except Exception as e:
-        print(f"❌ Erro Telegram: {e}", flush=True)
-        return False
-
-
-# ---------------------------------------------------------------------
-# INICIALIZAÇÃO
-# ---------------------------------------------------------------------
-
-def init_engine_db():
-    global _iniciado
-
-    _iniciado = db.init_db()
-
-    if _iniciado:
-        print(
-            "✅ Motor ESTRATÉGIA 1 — MÉDIA DOS ROLLS inicializado.",
-            flush=True,
-        )
     else:
-        print("❌ Falha inicializando motor.", flush=True)
 
-    return _iniciado
+        # Procura alguma coluna compatível
+        coluna_cor = None
+
+        for coluna in df.columns:
+
+            nome = str(coluna).lower()
+
+            if nome in ["color", "colour", "cor"]:
+
+                coluna_cor = coluna
+                break
+
+        if coluna_cor is None:
+
+            raise ValueError(
+                "Não foi encontrada uma coluna de cor na planilha."
+            )
+
+    # ------------------------------------------------------------
+    # Normalizar cor
+    # ------------------------------------------------------------
+
+    df["cor_normalizada"] = df[coluna_cor].apply(normalizar_cor)
+
+    # Remove registros sem cor válida
+    df = df[df["cor_normalizada"].notna()].copy()
+
+    # ------------------------------------------------------------
+    # Ordenação cronológica
+    # ------------------------------------------------------------
+
+    if "created_at" in df.columns:
+
+        df["created_at_dt"] = pd.to_datetime(
+            df["created_at"],
+            errors="coerce"
+        )
+
+        if df["created_at_dt"].notna().any():
+
+            df = df.sort_values(
+                "created_at_dt"
+            ).reset_index(drop=True)
+
+    elif "timestamp" in df.columns:
+
+        df["timestamp_dt"] = pd.to_datetime(
+            df["timestamp"],
+            errors="coerce"
+        )
+
+        if df["timestamp_dt"].notna().any():
+
+            df = df.sort_values(
+                "timestamp_dt"
+            ).reset_index(drop=True)
+
+    else:
+
+        df = df.reset_index(drop=True)
+
+    return df
 
 
-# ---------------------------------------------------------------------
-# 1. CONSTRUÇÃO DOS CICLOS PÓS-BRANCO
-# ---------------------------------------------------------------------
+# ================================================================
+# CONVERTER HISTÓRICO PARA NÚMEROS
+# ================================================================
 
-def _obter_ciclos(hist):
-    """
-    Reproduz a estrutura da Estratégia 1 original.
+def obter_valores_numericos(df):
 
-    Cada ciclo é formado pelos rolls NÃO-ZERO entre dois brancos.
+    valores = []
 
-    Exemplo:
+    for cor in df["cor_normalizada"]:
 
-        W | 5 | 9 | 7 | W
+        valores.append(
+            MAPEAMENTO_COR[cor]
+        )
 
-    ciclo = [5, 9, 7]
-    média = 7.00
-    sinal = GRANDE
+    return np.array(valores)
 
-    Retorna ciclos fechados e o ciclo atual ainda aberto.
-    """
 
-    ciclos_fechados = []
-    bloco_rolls = []
+# ================================================================
+# CRIAR DATASET PARA O RANDOM FOREST
+# ================================================================
 
-    branco_anterior = None
+def criar_dataset_treino(valores):
 
-    for idx, item in enumerate(hist):
-        roll = _extrair_roll(item)
+    X = []
+    y = []
 
-        if roll is None:
+    #
+    # Utilizamos os últimos 5 resultados
+    # para prever o próximo resultado.
+    #
+    # Exemplo:
+    #
+    # [V, P, B, P, V] -> próximo resultado
+    #
+
+    for i in range(
+        JANELA_HISTORICO,
+        len(valores)
+    ):
+
+        janela = valores[
+            i - JANELA_HISTORICO:i
+        ]
+
+        resultado = valores[i]
+
+        #
+        # BRANCO não é uma classe de previsão.
+        #
+        # Quando o próximo resultado é BRANCO,
+        # ele não entra como alvo de treinamento.
+        #
+        if resultado not in [0, 1]:
             continue
 
-        if roll != 0:
-            bloco_rolls.append(
-                {
-                    "roll": roll,
-                    "idx": idx,
-                    "rodada_id": item.get("rodada_id"),
-                    "id": item.get("id"),
-                }
-            )
-            continue
+        X.append(janela)
 
-        # Encontrou BRANCO.
-        if len(bloco_rolls) > 0:
-            media = (
-                sum(x["roll"] for x in bloco_rolls)
-                / len(bloco_rolls)
-            )
+        y.append(resultado)
 
-            if media <= LIMITE_MEDIA:
-                aposta_tipo = "P"
-                aposta_texto = "GRANDE (Preto / 8-14)"
-            else:
-                aposta_tipo = "R"
-                aposta_texto = "PEQUENO (Vermelho / 1-7)"
+    if len(X) == 0:
 
-            ciclos_fechados.append(
-                {
-                    "branco_idx": idx,
-                    "branco_rodada_id": item.get("rodada_id"),
-                    "rolls": [x["roll"] for x in bloco_rolls],
-                    "tamanho": len(bloco_rolls),
-                    "media": media,
-                    "aposta_tipo": aposta_tipo,
-                    "aposta_texto": aposta_texto,
-                    "primeiro_idx": bloco_rolls[0]["idx"],
-                    "ultimo_idx": bloco_rolls[-1]["idx"],
-                }
-            )
+        return (
+            np.empty((0, JANELA_HISTORICO)),
+            np.array([])
+        )
 
-        bloco_rolls = []
-        branco_anterior = idx
-
-    ciclo_aberto = {
-        "rolls": [x["roll"] for x in bloco_rolls],
-        "tamanho": len(bloco_rolls),
-        "primeiro_idx": (
-            bloco_rolls[0]["idx"] if bloco_rolls else None
-        ),
-        "ultimo_idx": (
-            bloco_rolls[-1]["idx"] if bloco_rolls else None
-        ),
-    }
-
-    return ciclos_fechados, ciclo_aberto
+    return np.array(X), np.array(y)
 
 
-def construir_sinal_media(hist):
-    """
-    Detecta se a rodada atual acabou de ser um BRANCO que fecha um ciclo.
+# ================================================================
+# TREINAR MODELO
+# ================================================================
 
-    Quando isso acontece, cria a decisão exatamente como a Estratégia 1:
+def treinar_modelo(valores):
 
-        média <= 7.5 -> GRANDE / PRETO
-        média >  7.5 -> PEQUENO / VERMELHO
+    X, y = criar_dataset_treino(valores)
 
-    O sinal aponta para o primeiro resultado NÃO-BRANCO seguinte.
-    """
+    if len(X) < MINIMO_TREINO:
 
-    if not hist:
+        return None, X, y
+
+    #
+    # É necessário ter as duas classes:
+    # VERMELHO e PRETO
+    #
+
+    classes_unicas = np.unique(y)
+
+    if len(classes_unicas) < 2:
+
+        return None, X, y
+
+    modelo = RandomForestClassifier(
+
+        n_estimators=100,
+
+        max_depth=6,
+
+        min_samples_split=20,
+
+        random_state=42
+
+    )
+
+    modelo.fit(X, y)
+
+    return modelo, X, y
+
+
+# ================================================================
+# GERAR SINAL
+# ================================================================
+
+def gerar_sinal(modelo, ultimos_resultados):
+
+    if modelo is None:
+
+        return None, 0.0, 0.0
+
+    if len(ultimos_resultados) < JANELA_HISTORICO:
+
+        return None, 0.0, 0.0
+
+    #
+    # Últimos 5 resultados
+    #
+
+    features = np.array(
+        ultimos_resultados[-JANELA_HISTORICO:]
+    ).reshape(
+        1,
+        -1
+    )
+
+    probabilidades = modelo.predict_proba(
+        features
+    )[0]
+
+    #
+    # Como o modelo pode ter as classes em ordem
+    # diferente, usamos modelo.classes_
+    #
+
+    prob_vermelho = 0.0
+    prob_preto = 0.0
+
+    for classe, prob in zip(
+        modelo.classes_,
+        probabilidades
+    ):
+
+        if classe == 0:
+
+            prob_vermelho = float(prob)
+
+        elif classe == 1:
+
+            prob_preto = float(prob)
+
+    #
+    # Escolha somente se atingir o limiar
+    #
+
+    if prob_vermelho >= LIMIAR_CONFIANCA:
+
+        return (
+            "VERMELHO",
+            prob_vermelho,
+            prob_preto
+        )
+
+    if prob_preto >= LIMIAR_CONFIANCA:
+
+        return (
+            "PRETO",
+            prob_vermelho,
+            prob_preto
+        )
+
+    return (
+        None,
+        prob_vermelho,
+        prob_preto
+    )
+
+
+# ================================================================
+# AVALIAR SINAL
+# ================================================================
+
+def avaliar_sinal(sinal, resultado):
+
+    if sinal is None:
+
         return None
 
-    ciclos_fechados, _ = _obter_ciclos(hist)
+    #
+    # IMPORTANTE:
+    #
+    # Branco NÃO é empate.
+    #
+    # Se sinal = VERMELHO e resultado = BRANCO:
+    # LOSS
+    #
+    # Se sinal = PRETO e resultado = BRANCO:
+    # LOSS
+    #
 
-    if not ciclos_fechados:
-        return None
+    if resultado == sinal:
 
-    ciclo = ciclos_fechados[-1]
+        return "WIN"
 
-    ultimo = hist[-1]
-    ultimo_roll = _extrair_roll(ultimo)
-
-    # O sinal só nasce quando a rodada atual é o BRANCO
-    # que acabou de fechar o ciclo.
-    if ultimo_roll != 0:
-        return None
-
-    # Não criar novamente o mesmo ciclo.
-    rodada_base = str(ultimo.get("rodada_id"))
-
-    return {
-        "estrategia": (
-            f"{PREFIXO_ESTRATEGIA} — "
-            f"{ciclo['aposta_texto']}"
-        ),
-        "cor_entrada": ciclo["aposta_tipo"],
-        "cor_regra": ciclo["aposta_tipo"],
-        "alvo_offset": 1,
-        "padrao": " → ".join(str(x) for x in ciclo["rolls"]),
-        "rodada_base": rodada_base,
-        "media": ciclo["media"],
-        "tamanho_ciclo": ciclo["tamanho"],
-        "rolls_ciclo": ciclo["rolls"],
-        "aposta_texto": ciclo["aposta_texto"],
-    }
+    return "LOSS"
 
 
-# ---------------------------------------------------------------------
-# ANÁLISE HISTÓRICA
-# ---------------------------------------------------------------------
+# ================================================================
+# FORMATAÇÃO
+# ================================================================
 
-def analisar_historico(hist):
-    """
-    Calcula as mesmas estatísticas básicas exibidas pela Estratégia 1:
-      - wins
-      - losses
-      - taxa
-      - saldo
-      - maior sequência de wins
-      - maior sequência de losses
-      - frequência das sequências de losses
+def nome_curto(cor):
 
-    A análise considera somente sinais já resolvidos.
-    """
+    if cor == "VERMELHO":
+        return "🔴 V"
 
-    sinais = [
-        s for s in db.sinais_todos()
-        if db.txt(s.get("estrategia")).startswith(PREFIXO_ESTRATEGIA)
-    ]
+    if cor == "PRETO":
+        return "⚫ P"
+
+    if cor == "BRANCO":
+        return "⚪ B"
+
+    return "?"
+
+
+# ================================================================
+# MONITOR PRINCIPAL
+# ================================================================
+
+def monitorar_estrategia_2_adaptada():
+
+    aba = conectar_planilha()
+
+    ultimo_tamanho_df = 0
+
+    #
+    # Histórico dos sinais já avaliados
+    #
+
+    sinais_historico = []
 
     wins = 0
     losses = 0
 
-    seq_atual_wins = 0
-    seq_atual_losses = 0
     max_seq_wins = 0
     max_seq_losses = 0
 
-    lista_seq_losses = []
+    seq_wins = 0
+    seq_losses = 0
 
-    for s in sinais:
-        resultado = db.txt(s.get("resultado"))
+    #
+    # Sinal que aguarda o próximo resultado
+    #
 
-        if resultado == RESULTADO_WIN:
-            wins += 1
+    pendente_sinal = None
 
-            if seq_atual_losses > 0:
-                lista_seq_losses.append(seq_atual_losses)
+    #
+    # Controle do último resultado processado
+    #
 
-            seq_atual_wins += 1
-            seq_atual_losses = 0
+    ultimo_registro_processado = None
 
-            max_seq_wins = max(max_seq_wins, seq_atual_wins)
+    print()
+    print("=" * 75)
+    print("🚀 ESTRATÉGIA 2 ADAPTADA PELA ESTRATÉGIA 3")
+    print("=" * 75)
+    print()
+    print("🎯 Gatilho: BRANCO")
+    print("🧠 Modelo: Random Forest")
+    print(f"📊 Janela: {JANELA_HISTORICO} resultados")
+    print(f"🎚️ Confiança mínima: {LIMIAR_CONFIANCA:.0%}")
+    print("⚪ BRANCO no histórico: SIM")
+    print("⚪ BRANCO após sinal: LOSS")
+    print()
 
-        elif resultado == RESULTADO_LOSS:
-            losses += 1
+    while True:
 
-            seq_atual_losses += 1
-            seq_atual_wins = 0
-
-            max_seq_losses = max(max_seq_losses, seq_atual_losses)
-
-    if seq_atual_losses > 0:
-        lista_seq_losses.append(seq_atual_losses)
-
-    taxa = (
-        wins / (wins + losses) * 100
-        if (wins + losses) > 0
-        else 0.0
-    )
-
-    from collections import Counter
-    contagem_losses = Counter(lista_seq_losses)
-
-    return {
-        "wins": wins,
-        "losses": losses,
-        "taxa": taxa,
-        "saldo": wins - losses,
-        "max_seq_wins": max_seq_wins,
-        "max_seq_losses": max_seq_losses,
-        "contagem_losses": contagem_losses,
-    }
-
-
-# ---------------------------------------------------------------------
-# BACKTEST DA ESTRATÉGIA 1
-# ---------------------------------------------------------------------
-
-def backtest_historico(hist):
-    """
-    Backtest descritivo da Estratégia 1.
-
-    Para cada ciclo fechado:
-      1) calcula a média dos rolls;
-      2) decide GRANDE/PRETO ou PEQUENO/VERMELHO;
-      3) procura o primeiro resultado NÃO-BRANCO após o branco;
-      4) contabiliza WIN/LOSS.
-
-    Este backtest é apenas diagnóstico. Não participa da criação
-    do sinal operacional.
-    """
-
-    if not hist:
-        return {
-            "entradas": 0,
-            "wins": 0,
-            "losses": 0,
-            "taxa": 0.0,
-            "saldo": 0,
-        }
-
-    ciclos_fechados, _ = _obter_ciclos(hist)
-
-    wins = 0
-    losses = 0
-
-    for ciclo in ciclos_fechados:
-        branco_idx = ciclo["branco_idx"]
-        prevista = ciclo["aposta_tipo"]
-
-        alvo = None
-
-        for idx in range(branco_idx + 1, len(hist)):
-            cor = _cor_do_historico(hist[idx])
-
-            if cor in ("R", "P"):
-                alvo = cor
-                break
-
-        if alvo is None:
-            continue
-
-        if alvo == prevista:
-            wins += 1
-        else:
-            losses += 1
-
-    entradas = wins + losses
-
-    taxa = (
-        wins / entradas * 100
-        if entradas
-        else 0.0
-    )
-
-    return {
-        "entradas": entradas,
-        "wins": wins,
-        "losses": losses,
-        "taxa": taxa,
-        "saldo": wins - losses,
-    }
-
-
-# ---------------------------------------------------------------------
-# CRIAÇÃO DO SINAL
-# ---------------------------------------------------------------------
-
-def _criar_sinal(g, now):
-    base = str(g["rodada_base"])
-    estrategia = g["estrategia"]
-
-    # Não cria duas vezes o mesmo gatilho na mesma rodada-base.
-    if any(
-        str(s.get("rodada_base")) == base
-        and db.txt(s.get("estrategia")) == estrategia
-        for s in db.sinais_todos()
-    ):
-        return False
-
-    cid = (
-        f"MEDIA-{base}-"
-        f"{int(datetime.now().timestamp() * 1000)}"
-    )
-
-    db.inserir_sinal(
-        {
-            "rodada_base": base,
-            "estrategia": estrategia,
-            "cor_prevista": g["cor_entrada"],
-            "resultado": RESULTADO_PENDENTE,
-            "tentativa": 1,
-            "ciclo_id": cid,
-            "cor_regra": g.get("cor_regra"),
-            "cor_entrada": g["cor_entrada"],
-            "valor_aposta": APOSTA_BASE,
-
-            # Mantém a interface do banco.
-            # A resolução real da Estratégia 1 procura o primeiro
-            # resultado não-branco após o branco.
-            "alvo_offset": 1,
-        }
-    )
-
-    rolls_texto = ", ".join(
-        str(x) for x in g["rolls_ciclo"]
-    )
-
-    print(
-        "\n"
-        "============================================================\n"
-        "🎯 NOVO SINAL — ESTRATÉGIA 1 / MÉDIA PÓS-BRANCO\n"
-        "============================================================\n"
-        f"⚪ Branco base       : {base}\n"
-        f"📦 Ciclo             : {rolls_texto}\n"
-        f"📏 Tamanho do ciclo  : {g['tamanho_ciclo']}\n"
-        f"📊 Média             : {g['media']:.2f}\n"
-        f"🎯 Regra             : média {'≤' if g['media'] <= LIMITE_MEDIA else '>'} {LIMITE_MEDIA}\n"
-        f"👉 Entrada           : {g['aposta_texto']}\n"
-        "⏭️ Alvo              : primeiro resultado NÃO-BRANCO\n"
-        "============================================================",
-        flush=True,
-    )
-
-    enviar_telegram(
-        "🚨 *NOVO SINAL — ESTRATÉGIA 1* 🚨\n\n"
-        f"⚪ Branco base: *{base}*\n"
-        f"📦 Ciclo: *{rolls_texto}*\n"
-        f"📏 Tamanho: *{g['tamanho_ciclo']}*\n"
-        f"📊 Média: *{g['media']:.2f}*\n"
-        f"🎯 Regra: *{'GRANDE' if g['cor_entrada'] == 'P' else 'PEQUENO'}*\n"
-        f"🎯 Entrada: *{_nome(g['cor_entrada'])}*\n"
-        "⏭️ Alvo: *PRIMEIRO RESULTADO NÃO-BRANCO*\n"
-        "💵 Valor: R$ 1,00"
-    )
-
-    return True
-
-
-# ---------------------------------------------------------------------
-# RESOLUÇÃO DOS SINAIS
-# ---------------------------------------------------------------------
-
-def _resolver_pendentes(atual_id, now):
-    """
-    Resolve sinais pendentes da Estratégia 1.
-
-    Diferentemente da Estratégia 2, a Estratégia 1 original não trata
-    um branco imediatamente posterior como o resultado da entrada.
-
-    O sinal permanece pendente até aparecer o primeiro resultado
-    NÃO-BRANCO após o branco que gerou o sinal.
-
-    Isso reproduz a lógica original:
-
-        if pendente_sinal is not None and r != 0:
-            resolve WIN/LOSS
-    """
-
-    hist = db.carregar_historico()
-
-    if not hist:
-        return 0
-
-    pos = {
-        h.get("id"): i
-        for i, h in enumerate(hist)
-    }
-
-    pendentes = db.sinais_pendentes()
-
-    estado = db.ler_estado()
-    inicio = db.txt(estado.get("inicio_sessao"))
-
-    count = 0
-
-    for s in pendentes:
         try:
-            estrategia = db.txt(s.get("estrategia"))
 
-            # Não mexer nos sinais de outras estratégias.
-            if not estrategia.startswith(PREFIXO_ESTRATEGIA):
+            # ====================================================
+            # LER PLANILHA
+            # ====================================================
+
+            dados = aba.get_all_records()
+
+            df = pd.DataFrame(dados)
+
+            if df.empty:
+
+                time.sleep(
+                    INTERVALO_ATUALIZACAO
+                )
+
                 continue
 
-            if (
-                inicio
-                and s.get("criado_em")
-                and s["criado_em"] < inicio
-            ):
+            # ====================================================
+            # PREPARAR DADOS
+            # ====================================================
+
+            df = preparar_historico(df)
+
+            if df.empty:
+
+                time.sleep(
+                    INTERVALO_ATUALIZACAO
+                )
+
                 continue
 
-            base_id = None
+            valores = obter_valores_numericos(df)
 
-            # Localiza a rodada-base pelo rodada_id.
-            base_rodada_id = str(s.get("rodada_base"))
+            tamanho_atual = len(df)
 
-            base_idx = None
+            #
+            # Se não houve rodada nova,
+            # apenas atualizamos o painel.
+            #
 
-            for i, h in enumerate(hist):
-                if str(h.get("rodada_id")) == base_rodada_id:
-                    base_idx = i
-                    break
-
-            if base_idx is None:
-                continue
-
-            # Procura o primeiro resultado não-branco depois
-            # da rodada-base.
-            alvo_idx = None
-
-            for i in range(base_idx + 1, len(hist)):
-                cor = _cor_do_historico(hist[i])
-
-                if cor in ("R", "P"):
-                    alvo_idx = i
-                    break
-
-            if alvo_idx is None:
-                continue
-
-            alvo = hist[alvo_idx]
-
-            real = _cor_do_historico(alvo)
-            prevista = _normalizar_cor(
-                s.get("cor_prevista")
+            houve_novidade = (
+                tamanho_atual >
+                ultimo_tamanho_df
             )
 
-            if real not in ("R", "P"):
-                continue
+            if houve_novidade:
 
-            if prevista not in ("R", "P"):
-                continue
+                # =================================================
+                # PROCESSAR SOMENTE NOVOS RESULTADOS
+                # =================================================
 
-            resultado = (
-                RESULTADO_WIN
-                if real == prevista
-                else RESULTADO_LOSS
+                if ultimo_tamanho_df == 0:
+
+                    inicio_processamento = 0
+
+                else:
+
+                    inicio_processamento = ultimo_tamanho_df
+
+                novos_indices = range(
+                    inicio_processamento,
+                    tamanho_atual
+                )
+
+                #
+                # Treinar modelo com histórico disponível
+                #
+
+                modelo, X, y = treinar_modelo(
+                    valores
+                )
+
+                for indice in novos_indices:
+
+                    cor_atual = (
+                        df.iloc[indice]
+                        ["cor_normalizada"]
+                    )
+
+                    # =============================================
+                    # PRIMEIRO:
+                    # RESOLVER SINAL PENDENTE
+                    # =============================================
+
+                    if pendente_sinal is not None:
+
+                        resultado = avaliar_sinal(
+                            pendente_sinal["sinal"],
+                            cor_atual
+                        )
+
+                        if resultado is not None:
+
+                            #
+                            # Registrar
+                            #
+
+                            registro = {
+
+                                "sinal":
+                                    pendente_sinal[
+                                        "sinal"
+                                    ],
+
+                                "confianca":
+                                    pendente_sinal[
+                                        "confianca"
+                                    ],
+
+                                "resultado":
+                                    cor_atual,
+
+                                "status":
+                                    resultado
+                            }
+
+                            sinais_historico.append(
+                                registro
+                            )
+
+                            # -------------------------------------
+                            # WIN
+                            # -------------------------------------
+
+                            if resultado == "WIN":
+
+                                wins += 1
+
+                                seq_wins += 1
+                                seq_losses = 0
+
+                                if seq_wins > max_seq_wins:
+
+                                    max_seq_wins = seq_wins
+
+                            # -------------------------------------
+                            # LOSS
+                            # -------------------------------------
+
+                            else:
+
+                                losses += 1
+
+                                seq_losses += 1
+                                seq_wins = 0
+
+                                if seq_losses > max_seq_losses:
+
+                                    max_seq_losses = seq_losses
+
+                            #
+                            # Sinal foi resolvido
+                            #
+
+                            pendente_sinal = None
+
+                    # =============================================
+                    # SEGUNDO:
+                    # DETECTAR BRANCO
+                    # =============================================
+
+                    #
+                    # IMPORTANTE:
+                    #
+                    # O Branco é o GATILHO.
+                    #
+                    # Mas ele continua dentro do histórico.
+                    #
+
+                    if cor_atual == "BRANCO":
+
+                        #
+                        # Só procurar uma nova entrada
+                        # se não existe sinal pendente.
+                        #
+
+                        if pendente_sinal is None:
+
+                            #
+                            # Precisamos ter 5 resultados
+                            # anteriores ao Branco.
+                            #
+
+                            if indice >= JANELA_HISTORICO:
+
+                                historico_ate_agora = (
+                                    valores[:indice]
+                                )
+
+                                #
+                                # Treinar novamente utilizando
+                                # tudo que existia antes do gatilho.
+                                #
+                                # Isso evita usar o próprio Branco
+                                # como resultado futuro.
+                                #
+
+                                modelo_gatilho, Xg, yg = (
+                                    treinar_modelo(
+                                        historico_ate_agora
+                                    )
+                                )
+
+                                if modelo_gatilho is not None:
+
+                                    ultimos_5 = (
+                                        historico_ate_agora[
+                                            -JANELA_HISTORICO:
+                                        ]
+                                    )
+
+                                    sinal, prob_v, prob_p = (
+                                        gerar_sinal(
+                                            modelo_gatilho,
+                                            ultimos_5
+                                        )
+                                    )
+
+                                    if sinal is not None:
+
+                                        if sinal == "VERMELHO":
+
+                                            confianca = prob_v
+
+                                        else:
+
+                                            confianca = prob_p
+
+                                        pendente_sinal = {
+
+                                            "sinal":
+                                                sinal,
+
+                                            "confianca":
+                                                confianca,
+
+                                            "prob_vermelho":
+                                                prob_v,
+
+                                            "prob_preto":
+                                                prob_p,
+
+                                            "gatilho_indice":
+                                                indice
+                                        }
+
+                    # =================================================
+                    # FIM DO PROCESSAMENTO
+                    # =================================================
+
+                #
+                # Atualizar tamanho processado
+                #
+
+                ultimo_tamanho_df = tamanho_atual
+
+            # ====================================================
+            # PAINEL
+            # ====================================================
+
+            clear_output(
+                wait=True
             )
 
-            ok = db.resolver_sinal(
-                s["id"],
-                {
-                    "rodada_resultado": str(
-                        alvo.get("rodada_id")
-                    ),
-                    "cor_resultado": real,
-                    "resultado": resultado,
-                    "resolvido_em": now,
-                },
+            total = wins + losses
+
+            if total > 0:
+
+                assertividade = (
+                    wins /
+                    total *
+                    100
+                )
+
+            else:
+
+                assertividade = 0.0
+
+            saldo = wins - losses
+
+            print("=" * 75)
+            print(
+                "🎯 BLAZE — ESTRATÉGIA 2 + RANDOM FOREST"
             )
+            print("=" * 75)
 
-            if not ok:
-                continue
+            print()
 
-            count += 1
-
-            emoji = (
-                "✅"
-                if resultado == RESULTADO_WIN
-                else "❌"
+            print(
+                f"📊 REGISTROS NA BASE: "
+                f"{tamanho_atual}"
             )
 
             print(
-                f"{emoji} RESULTADO | "
-                f"estratégia={estrategia} | "
-                f"entrada={_nome(prevista)} | "
-                f"real={_nome(real)} | "
-                f"rodada={alvo.get('rodada_id')} | "
-                f"{resultado}",
-                flush=True,
+                f"🎯 ENTRADAS AVALIADAS: "
+                f"{total}"
             )
 
-            enviar_telegram(
-                f"{emoji} *RESULTADO — {resultado}*\n\n"
-                f"🧠 Estratégia: *{estrategia}*\n"
-                f"🎯 Entrada: *{_nome(prevista)}*\n"
-                f"🎲 Resultado: *{_nome(real)}*\n"
-                f"🔢 Rodada: *{alvo.get('rodada_id')}*"
+            print()
+
+            print(
+                f"🟢 WINS: "
+                f"{wins}"
+            )
+
+            print(
+                f"🔴 LOSSES: "
+                f"{losses}"
+            )
+
+            print(
+                f"📈 ASSERTIVIDADE: "
+                f"{assertividade:.2f}%"
+            )
+
+            print(
+                f"💰 SALDO: "
+                f"{saldo:+d}"
+            )
+
+            print()
+
+            print(
+                f"🔥 MAIOR SEQUÊNCIA WIN: "
+                f"{max_seq_wins}"
+            )
+
+            print(
+                f"❄️ MAIOR SEQUÊNCIA LOSS: "
+                f"{max_seq_losses}"
+            )
+
+            print()
+            print("-" * 75)
+
+            # ====================================================
+            # ÚLTIMO SINAL RESOLVIDO
+            # ====================================================
+
+            if len(sinais_historico) > 0:
+
+                ultimo = sinais_historico[-1]
+
+                print(
+                    "📌 ÚLTIMO SINAL RESOLVIDO"
+                )
+
+                print(
+                    f"   Sinal: "
+                    f"{ultimo['sinal']}"
+                )
+
+                print(
+                    f"   Confiança: "
+                    f"{ultimo['confianca']:.2%}"
+                )
+
+                print(
+                    f"   Resultado: "
+                    f"{ultimo['resultado']}"
+                )
+
+                if ultimo["status"] == "WIN":
+
+                    print(
+                        "   Status: ✅ WIN"
+                    )
+
+                else:
+
+                    print(
+                        "   Status: ❌ LOSS"
+                    )
+
+                print()
+
+            # ====================================================
+            # SINAL PENDENTE
+            # ====================================================
+
+            if pendente_sinal is not None:
+
+                print(
+                    "🚨 ENTRADA ATIVA"
+                )
+
+                print(
+                    f"   🎯 Apostar em: "
+                    f"{pendente_sinal['sinal']}"
+                )
+
+                print(
+                    f"   🧠 Confiança: "
+                    f"{pendente_sinal['confianca']:.2%}"
+                )
+
+                print(
+                    f"   🔴 VERMELHO: "
+                    f"{pendente_sinal['prob_vermelho']:.2%}"
+                )
+
+                print(
+                    f"   ⚫ PRETO: "
+                    f"{pendente_sinal['prob_preto']:.2%}"
+                )
+
+                print(
+                    "   ⏳ Aguardando próxima rodada..."
+                )
+
+            else:
+
+                print(
+                    "⏳ NENHUMA ENTRADA ATIVA"
+                )
+
+                print(
+                    "   Aguardando BRANCO para "
+                    "ativar o gatilho."
+                )
+
+            print()
+            print("-" * 75)
+
+            # ====================================================
+            # ÚLTIMOS RESULTADOS
+            # ====================================================
+
+            ultimos_exibicao = (
+                df["cor_normalizada"]
+                .tail(15)
+                .tolist()
+            )
+
+            print(
+                "📜 ÚLTIMOS 15 RESULTADOS:"
+            )
+
+            print(
+                " ".join(
+                    nome_curto(cor)
+                    for cor in ultimos_exibicao
+                )
+            )
+
+            print()
+            print("=" * 75)
+
+            if modelo is None:
+
+                print(
+                    "⚠️ Modelo ainda sem dados suficientes "
+                    "para treinamento."
+                )
+
+            else:
+
+                print(
+                    f"🧠 Modelo treinado com "
+                    f"{len(X)} exemplos."
+                )
+
+            print(
+                f"🔄 Atualização a cada "
+                f"{INTERVALO_ATUALIZACAO}s"
+            )
+
+            print("=" * 75)
+
+            time.sleep(
+                INTERVALO_ATUALIZACAO
             )
 
         except Exception as e:
+
+            print()
+            print("=" * 75)
+            print("⚠️ ERRO NO MONITOR")
+            print("=" * 75)
             print(
-                f"❌ Erro resolvendo sinal {s.get('id')}: {e}",
-                flush=True,
+                f"{type(e).__name__}: {e}"
+            )
+            print()
+            print(
+                "🔄 Tentando novamente em "
+                f"{INTERVALO_ATUALIZACAO}s..."
+            )
+            print("=" * 75)
+
+            time.sleep(
+                INTERVALO_ATUALIZACAO
             )
 
-    if count:
-        print(
-            f"📊 Sinais da ESTRATÉGIA 1 resolvidos: {count}",
-            flush=True,
-        )
 
-    return count
+# ================================================================
+# INICIAR
+# ================================================================
 
-
-# ---------------------------------------------------------------------
-# ESTADO / DASHBOARD
-# ---------------------------------------------------------------------
-
-def _estado(now):
-    est = db.estatisticas()
-    estado = db.ler_estado()
-
-    pend = [
-        s
-        for s in db.sinais_pendentes()
-        if db.txt(
-            s.get("estrategia")
-        ).startswith(PREFIXO_ESTRATEGIA)
-    ]
-
-    ultimo = pend[-1] if pend else None
-
-    db.atualizar_estado(
-        {
-            "wins": est["wins"],
-            "losses": est["losses"],
-            "whites": est["whites_internos"],
-            "profit": round(est["profit"], 2),
-            "sinal_ativo": (
-                ultimo["estrategia"]
-                if ultimo
-                else ""
-            ),
-            "cor_sinal": (
-                ultimo["cor_prevista"]
-                if ultimo
-                else ""
-            ),
-            "ultima_estrategia": (
-                ultimo["estrategia"]
-                if ultimo
-                else db.txt(
-                    estado.get("ultima_estrategia")
-                )
-            ),
-            "atualizado_em": now,
-        }
-    )
-
-    return est
-
-
-# ---------------------------------------------------------------------
-# ENTRADA PRINCIPAL DO COLLECTOR
-# ---------------------------------------------------------------------
-
-def processar_novo_resultado(rodada_id, color, roll):
-    """
-    Chamado pelo coletor a cada nova rodada completa.
-
-    Ordem:
-      1) Resolve sinal pendente, se apareceu resultado não-branco.
-      2) Carrega histórico até a rodada atual.
-      3) Verifica se a rodada atual é BRANCO.
-      4) Se o branco fechou um ciclo, calcula a média.
-      5) Cria o sinal GRANDE/PRETO ou PEQUENO/VERMELHO.
-      6) Atualiza o estado do BOT.
-    """
-
-    global _iniciado
-
-    if not _iniciado and not init_engine_db():
-        return None
-
-    try:
-        rid = str(rodada_id)
-
-        rodada = db.buscar_rodada(rid)
-
-        if not rodada:
-            return None
-
-        now = db.agora()
-        estado = db.ler_estado()
-
-        motor = db.to_bool(
-            estado.get("motor_ativo")
-        )
-
-        ultimo = db.txt(
-            estado.get("ultima_rodada_processada")
-        )
-
-        # Evita processar a mesma rodada duas vezes.
-        # Ainda tenta resolver sinal pendente.
-        if ultimo == rid:
-            if motor:
-                _resolver_pendentes(
-                    rodada["id"],
-                    now,
-                )
-
-            return None
-
-        if motor:
-            # Primeiro resolve sinais anteriores.
-            _resolver_pendentes(
-                rodada["id"],
-                now,
-            )
-
-            hist = db.carregar_historico(
-                ate_id=rodada["id"]
-            )
-
-            # Backtest somente diagnóstico.
-            if len(hist) >= 20:
-                bt = backtest_historico(hist)
-
-                print(
-                    f"📊 BACKTEST ESTRATÉGIA 1 | "
-                    f"Entradas={bt['entradas']} | "
-                    f"Wins={bt['wins']} | "
-                    f"Losses={bt['losses']} | "
-                    f"Taxa={bt['taxa']:.2f}% | "
-                    f"Saldo={bt['saldo']:+d}",
-                    flush=True,
-                )
-
-            g = construir_sinal_media(hist)
-
-            if g:
-                _criar_sinal(
-                    g,
-                    now,
-                )
-            else:
-                # Diagnóstico do ciclo atual.
-                ultimo_roll = _extrair_roll(hist[-1]) if hist else None
-
-                if ultimo_roll == 0:
-                    _, ciclo = _obter_ciclos(hist)
-
-                    if ciclo["tamanho"] > 0:
-                        print(
-                            "🔎 ESTRATÉGIA 1 | "
-                            "BRANCO detectado, mas sem ciclo "
-                            "fechado com rolls anteriores.",
-                            flush=True,
-                        )
-                    else:
-                        print(
-                            "🔎 ESTRATÉGIA 1 | "
-                            "BRANCO detectado, ciclo vazio.",
-                            flush=True,
-                        )
-
-                else:
-                    _, ciclo = _obter_ciclos(hist)
-
-                    if ciclo["tamanho"] > 0:
-                        media_atual = (
-                            sum(ciclo["rolls"])
-                            / ciclo["tamanho"]
-                        )
-
-                        print(
-                            "🔎 ESTRATÉGIA 1 | "
-                            f"ciclo atual={ciclo['tamanho']} "
-                            f"roll(s) | "
-                            f"média parcial={media_atual:.2f} | "
-                            "aguardando BRANCO para fechar.",
-                            flush=True,
-                        )
-
-        # Só marca como processada depois do motor.
-        db.atualizar_estado(
-            {
-                "ultima_rodada_processada": rid,
-                "atualizado_em": now,
-            }
-        )
-
-        est = _estado(now)
-        estado_final = db.ler_estado()
-
-        return {
-            "ativo": motor,
-            "estrategia": (
-                db.txt(
-                    estado_final.get(
-                        "ultima_estrategia"
-                    )
-                )
-                or None
-            ),
-            "cor": (
-                db.txt(
-                    estado_final.get(
-                        "cor_sinal"
-                    )
-                )
-                or None
-            ),
-            "wins": est["wins"],
-            "losses": est["losses"],
-            "profit": est["profit"],
-        }
-
-    except Exception as e:
-        print(
-            f"❌ Erro no motor: {e}",
-            flush=True,
-        )
-        return None
-
-
-# ---------------------------------------------------------------------
-# COMPATIBILIDADE COM O DASHBOARD
-# ---------------------------------------------------------------------
-
-def reconciliar_todos_sinais():
-    """
-    Mantém a API antiga do dashboard.
-
-    Não cria sinais retroativos.
-    Apenas atualiza o estado.
-    """
-
-    if not _iniciado and not init_engine_db():
-        return None
-
-    est = _estado(db.agora())
-
-    return {
-        "resolvidos": 0,
-        **est,
-    }
-
-
-def obter_status_motor():
-    if not _iniciado and not init_engine_db():
-        return {
-            "ativo": False,
-            "sinal": None,
-            "cor": None,
-            "estrategia": None,
-            "wins": 0,
-            "losses": 0,
-            "pendentes": 0,
-            "profit": 0.0,
-        }
-
-    est = _estado(db.agora())
-    estado = db.ler_estado()
-
-    pend = [
-        s
-        for s in db.sinais_pendentes()
-        if db.txt(
-            s.get("estrategia")
-        ).startswith(PREFIXO_ESTRATEGIA)
-    ]
-
-    s = pend[-1] if pend else None
-
-    return {
-        "ativo": db.to_bool(
-            estado.get("motor_ativo")
-        ),
-        "sinal": bool(s),
-        "cor": (
-            s["cor_prevista"]
-            if s
-            else None
-        ),
-        "estrategia": (
-            s["estrategia"]
-            if s
-            else None
-        ),
-        "wins": est["wins"],
-        "losses": est["losses"],
-        "pendentes": len(pend),
-        "profit": est["profit"],
-        "ciclo_ativo": bool(s),
-        "tentativa_atual": (
-            int(s["tentativa"] or 1)
-            if s
-            else 0
-        ),
-    }
+monitorar_estrategia_2_adaptada()
