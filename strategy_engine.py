@@ -1,27 +1,21 @@
 # =====================================================================
-# BLAZE STRATEGY ENGINE — MULTI-GATILHOS PÓS-BRANCO
-# Estratégia baseada exatamente no script de referência enviado pelo usuário.
+# BLAZE STRATEGY ENGINE — MACHINE LEARNING (RANDOM FOREST)
 #
 # REGRA:
-# 1) Localiza o último BRANCO.
-# 2) Espera exatamente 3 resultados após esse BRANCO.
-# 3) Forma o padrão de 3 cores (R/P/W).
-# 4) Procura TODAS as ocorrências desse padrão na base histórica.
-# 5) Só cria gatilho se o padrão tiver pelo menos 3 ocorrências.
-# 6) Prediz R ou P pela maior frequência histórica do próximo resultado.
-# 7) Empate R/P = sem sinal.
-# 8) O sinal aponta exclusivamente para a PRÓXIMA rodada (+1).
-# 9) BRANCO no alvo = LOSS técnico, como no script de referência.
-#
-# Importante:
-# - O mapeamento é recalculado a cada rodada usando o histórico disponível.
-# - Este motor NÃO usa ELITE, QUEBRA_ALT ou as regras antigas de pós-branco.
-# - A coluna "estrategia_sinais" continua sendo usada pelo dashboard.
+# 1) Extrai o histórico do banco de dados (sheets_db).
+# 2) Mapeia as cores: Vermelho (R) = 0, Preto (P) = 1, Branco (W) = 2.
+# 3) Monta a matriz de atributos (Features) com base nas últimas 5 jogadas.
+# 4) Treina o classificador RandomForestClassifier dinamicamente.
+# 5) Analisa a probabilidade preditiva para a PRÓXIMA rodada (+1).
+# 6) Se a probabilidade de R ou P for >= 55% (LIMIAR_CONFIANCA), gera sinal.
+# 7) Notifica via Telegram e envia ao banco de dados para resolução.
 # =====================================================================
 
 import os
 from datetime import datetime
 import requests
+import numpy as np
+from sklearn.ensemble import RandomForestClassifier
 import sheets_db as db
 
 APOSTA_BASE = 1.0
@@ -29,14 +23,28 @@ RESULTADO_PENDENTE = "PENDENTE"
 RESULTADO_WIN = "WIN"
 RESULTADO_LOSS = "LOSS"
 
-PREFIXO_ESTRATEGIA = "PÓS-BRANCO — MULTI-GATILHOS"
-TAMANHO_JANELA = 3
-MIN_OCORRENCIAS = 3
+PREFIXO_ESTRATEGIA = "MACHINE LEARNING — RANDOM FOREST"
+
+# Configurações do modelo
+JANELA_HISTORICO = 5      # Quantidade de jogadas passadas como Atributos (Features)
+LIMIAR_CONFIANCA = 0.55   # Confiança mínima (55%) para disparar o sinal
+MIN_REGISTROS_TREINO = 30 # Mínimo de histórico para treinar o modelo
 
 NOMES = {
     "R": "VERMELHO",
     "P": "PRETO",
     "W": "BRANCO",
+}
+
+MAPEAMENTO_NUMERICO = {
+    "R": 0,
+    "P": 1,
+    "W": 2,
+}
+
+NUMERICO_PARA_COR = {
+    0: "R",
+    1: "P",
 }
 
 _iniciado = False
@@ -59,11 +67,11 @@ def _normalizar_cor(valor):
     except Exception:
         return None
 
-    if "VERMELHO" in v or v in {"R", "RED", "V", "VI"}:
+    if "VERMELHO" in v or v in {"R", "RED", "V", "VI", "0"}:
         return "R"
-    if "PRETO" in v or v in {"P", "BLACK", "B"}:
+    if "PRETO" in v or v in {"P", "BLACK", "B", "1"}:
         return "P"
-    if "BRANCO" in v or v in {"W", "WHITE"}:
+    if "BRANCO" in v or v in {"W", "WHITE", "2"}:
         return "W"
 
     return None
@@ -110,7 +118,7 @@ def init_engine_db():
 
     if _iniciado:
         print(
-            "✅ Motor MULTI-GATILHOS PÓS-BRANCO inicializado.",
+            "✅ Motor MACHINE LEARNING (Random Forest) inicializado.",
             flush=True,
         )
     else:
@@ -120,214 +128,82 @@ def init_engine_db():
 
 
 # ---------------------------------------------------------------------
-# 1. MAPEAMENTO DOS PADRÕES PÓS-BRANCO
+# 1. INTELIGÊNCIA ARTIFICIAL / MACHINE LEARNING
 # ---------------------------------------------------------------------
 
-def construir_gatilhos_dinamicos(hist):
+def treinar_e_prever(hist):
     """
-    Reproduz a lógica do script de referência:
-
-    Para cada BRANCO que tenha pelo menos 3 resultados depois dele:
-        seq = próximas 3 cores
-        próxima = cor seguinte à sequência
-
-    Depois:
-        - mantém padrões com total >= 3;
-        - escolhe R se R > P;
-        - escolhe P se P > R;
-        - empate = nenhum gatilho.
-
-    O W é contado no histórico, mas nunca é uma cor de entrada.
+    Treina o modelo de Random Forest com o histórico disponível e realiza
+    a predição para a próxima rodada com base nas últimas 5 jogadas.
     """
-    estatisticas = {}
-
-    for idx, item in enumerate(hist):
-        if item["cor"] != "W":
-            continue
-
-        # Precisamos de 3 cores para montar a sequência
-        # e mais 1 resultado para ser o alvo histórico.
-        if idx + TAMANHO_JANELA + 1 >= len(hist):
-            continue
-
-        seq = tuple(
-            hist[idx + deslocamento]["cor"]
-            for deslocamento in range(1, TAMANHO_JANELA + 1)
-        )
-
-        proxima = hist[idx + TAMANHO_JANELA + 1]["cor"]
-
-        if seq not in estatisticas:
-            estatisticas[seq] = {
-                "R": 0,
-                "P": 0,
-                "W": 0,
-                "total": 0,
-            }
-
-        estatisticas[seq][proxima] += 1
-        estatisticas[seq]["total"] += 1
-
-    gatilhos = {}
-
-    for seq, dados in estatisticas.items():
-        if dados["total"] < MIN_OCORRENCIAS:
-            continue
-
-        r_qtd = dados["R"]
-        p_qtd = dados["P"]
-
-        if r_qtd > p_qtd:
-            gatilhos[seq] = {
-                "cor": "R",
-                "acertos": r_qtd,
-                "total": dados["total"],
-                "R": r_qtd,
-                "P": p_qtd,
-                "W": dados["W"],
-            }
-
-        elif p_qtd > r_qtd:
-            gatilhos[seq] = {
-                "cor": "P",
-                "acertos": p_qtd,
-                "total": dados["total"],
-                "R": r_qtd,
-                "P": p_qtd,
-                "W": dados["W"],
-            }
-
-    return gatilhos, estatisticas
-
-
-def detectar_sinal_pos_branco(hist):
-    """
-    Verifica se o histórico atual está exatamente 3 rodadas depois
-    do último BRANCO.
-
-    Exemplo:
-        W -> R -> P -> R
-                    ^ aqui nasce o sinal para a PRÓXIMA rodada
-    """
-    if len(hist) < 4:
+    if len(hist) < MIN_REGISTROS_TREINO + JANELA_HISTORICO:
         return None
 
-    # Localiza o último branco.
-    indices_brancos = [
-        i for i, item in enumerate(hist)
-        if item["cor"] == "W"
-    ]
+    # Normaliza e converte para numérico
+    valores_numericos = []
+    for item in hist:
+        cor_norm = _normalizar_cor(item.get("cor"))
+        if cor_norm in MAPEAMENTO_NUMERICO:
+            valores_numericos.append(MAPEAMENTO_NUMERICO[cor_norm])
 
-    if not indices_brancos:
+    if len(valores_numericos) < MIN_REGISTROS_TREINO + JANELA_HISTORICO:
         return None
 
-    ultimo_idx_branco = indices_brancos[-1]
-    distancia_fim = len(hist) - 1 - ultimo_idx_branco
+    X = []
+    y = []
 
-    # O script de referência só gera sinal quando há exatamente
-    # três resultados depois do último branco.
-    if distancia_fim != TAMANHO_JANELA:
+    # Construção dos conjuntos X (Atributos) e y (Alvos)
+    for i in range(JANELA_HISTORICO, len(valores_numericos) - 1):
+        cor_seguinte = valores_numericos[i + 1]
+
+        # Foco do modelo em apostas binárias (0 = Vermelho, 1 = Preto)
+        if cor_seguinte in [0, 1]:
+            features = valores_numericos[i - JANELA_HISTORICO + 1 : i + 1]
+            X.append(features)
+            y.append(cor_seguinte)
+
+    if len(X) < MIN_REGISTROS_TREINO:
         return None
 
-    seq = tuple(
-        hist[ultimo_idx_branco + deslocamento]["cor"]
-        for deslocamento in range(1, TAMANHO_JANELA + 1)
+    X = np.array(X)
+    y = np.array(y)
+
+    # Treinamento do Modelo Random Forest
+    modelo = RandomForestClassifier(
+        n_estimators=100,
+        max_depth=6,
+        min_samples_split=20,
+        random_state=42
     )
+    modelo.fit(X, y)
 
-    gatilhos, _ = construir_gatilhos_dinamicos(hist)
+    # Atributos atuais (últimas JANELA_HISTORICO jogadas)
+    features_atuais = np.array([valores_numericos[-JANELA_HISTORICO:]])
 
-    regra = gatilhos.get(seq)
-    if not regra:
-        return None
+    # Predição das probabilidades [P(Vermelho), P(Preto)]
+    probabilidades = modelo.predict_proba(features_atuais)[0]
+    prob_vermelho = probabilidades[0]
+    prob_preto = probabilidades[1]
+
+    # Avaliação do limiar de confiança
+    if prob_vermelho >= LIMIAR_CONFIANCA:
+        cor_prevista = "R"
+        confianca = prob_vermelho
+    elif prob_preto >= LIMIAR_CONFIANCA:
+        cor_prevista = "P"
+        confianca = prob_preto
+    else:
+        return None # Sem sinal (modelo indeciso)
 
     return {
-        "estrategia": (
-            f"{PREFIXO_ESTRATEGIA} — "
-            f"[{' → '.join(seq)}] → {_nome(regra['cor'])}"
-        ),
-        "cor_entrada": regra["cor"],
-        "cor_regra": regra["cor"],
+        "estrategia": f"{PREFIXO_ESTRATEGIA} — Confiança: {confianca * 100:.1f}%",
+        "cor_entrada": cor_prevista,
+        "cor_regra": cor_prevista,
         "alvo_offset": 1,
-        "padrao": "".join(seq),
+        "confianca": confianca,
+        "prob_vermelho": prob_vermelho,
+        "prob_preto": prob_preto,
         "rodada_base": hist[-1]["rodada_id"],
-        "acertos_hist": regra["acertos"],
-        "total_hist": regra["total"],
-        "R": regra["R"],
-        "P": regra["P"],
-        "W": regra["W"],
-    }
-
-
-# ---------------------------------------------------------------------
-# BACKTEST INFORMATIVO
-# ---------------------------------------------------------------------
-
-def backtest_historico(hist):
-    """
-    Reproduz o backtest do script de referência.
-
-    Atenção: assim como o script de referência, o mapeamento é construído
-    com a base completa antes do loop. Portanto este backtest é descritivo
-    e não é um backtest walk-forward sem vazamento temporal.
-    """
-    if not hist:
-        return {
-            "entradas": 0,
-            "wins": 0,
-            "losses": 0,
-            "taxa": 0.0,
-            "saldo": 0,
-        }
-
-    indices_brancos = [
-        i for i, item in enumerate(hist)
-        if item["cor"] == "W"
-    ]
-
-    gatilhos, _ = construir_gatilhos_dinamicos(hist)
-
-    saldo = 0
-    entradas = 0
-    wins = 0
-    losses = 0
-
-    for idx in indices_brancos:
-        if idx + 4 >= len(hist):
-            continue
-
-        seq = (
-            hist[idx + 1]["cor"],
-            hist[idx + 2]["cor"],
-            hist[idx + 3]["cor"],
-        )
-
-        resultado_real = hist[idx + 4]["cor"]
-
-        regra = gatilhos.get(seq)
-        if not regra:
-            continue
-
-        # Igual ao script de referência:
-        # W não entra no denominador como vitória/derrota física,
-        # porque o backtest ignora W nessa etapa.
-        if resultado_real != "W":
-            entradas += 1
-
-            if resultado_real == regra["cor"]:
-                saldo += 1
-                wins += 1
-            else:
-                saldo -= 1
-                losses += 1
-
-    taxa = (wins / entradas * 100) if entradas else 0.0
-
-    return {
-        "entradas": entradas,
-        "wins": wins,
-        "losses": losses,
-        "taxa": taxa,
-        "saldo": saldo,
     }
 
 
@@ -339,16 +215,16 @@ def _criar_sinal(g, now):
     base = str(g["rodada_base"])
     estrategia = g["estrategia"]
 
-    # Não cria duas vezes o mesmo gatilho na mesma rodada-base.
+    # Evita duplicidade na mesma rodada base
     if any(
         s["rodada_base"] == base
-        and s["estrategia"] == estrategia
+        and s["estrategia"].startswith(PREFIXO_ESTRATEGIA)
         for s in db.sinais_todos()
     ):
         return False
 
     cid = (
-        f"POS3-{base}-"
+        f"RFML-{base}-"
         f"{int(datetime.now().timestamp() * 1000)}"
     )
 
@@ -370,25 +246,24 @@ def _criar_sinal(g, now):
     print(
         "\n"
         "============================================================\n"
-        "🎯 NOVO SINAL — MULTI-GATILHOS PÓS-BRANCO\n"
+        "🤖 NOVO SINAL — MACHINE LEARNING (RANDOM FOREST)\n"
         "============================================================\n"
-        f"📐 Padrão pós-branco : {g['padrao']}\n"
-        f"📊 Histórico         : {g['acertos_hist']}/{g['total_hist']}\n"
-        f"   R={g['R']} | P={g['P']} | W={g['W']}\n"
-        f"👉 Entrada           : {_nome(g['cor_entrada'])}\n"
-        f"🎲 Rodada base       : {base}\n"
-        f"⏭️ Alvo              : próxima rodada (+1)\n"
+        f"📊 Confiança Modelo : {g['confianca'] * 100:.1f}%\n"
+        f"🔴 Prob. Vermelho   : {g['prob_vermelho'] * 100:.1f}%\n"
+        f"⚫ Prob. Preto      : {g['prob_preto'] * 100:.1f}%\n"
+        f"👉 Entrada          : {_nome(g['cor_entrada'])}\n"
+        f"🎲 Rodada base      : {base}\n"
+        f"⏭️ Alvo             : próxima rodada (+1)\n"
         "============================================================",
         flush=True,
     )
 
     enviar_telegram(
-        "🚨 *NOVO SINAL — MULTI-GATILHOS PÓS-BRANCO* 🚨\n\n"
-        f"📐 Padrão: *{g['padrao']}*\n"
-        f"📊 Histórico: *{g['acertos_hist']}/{g['total_hist']}*\n"
-        f"🔴 R: {g['R']} | ⚫ P: {g['P']} | ⚪ W: {g['W']}\n"
+        "🤖 *NOVO SINAL — RANDOM FOREST (ML)* 🤖\n\n"
         f"🎯 Entrada: *{_nome(g['cor_entrada'])}*\n"
-        f"🎲 Rodada base: *{base}*\n"
+        f"📊 Confiança: *{g['confianca'] * 100:.1f}%*\n"
+        f"🔴 Vermelho: {g['prob_vermelho'] * 100:.1f}% | ⚫ Preto: {g['prob_preto'] * 100:.1f}%\n"
+        f"🎲 Rodada Base: *{base}*\n"
         "⏭️ Alvo: *PRÓXIMA RODADA*\n"
         "💵 Valor: R$ 1,00"
     )
@@ -401,16 +276,6 @@ def _criar_sinal(g, now):
 # ---------------------------------------------------------------------
 
 def _resolver_pendentes(atual_id, now):
-    """
-    Resolve apenas sinais criados por este novo motor.
-
-    O alvo é:
-        índice da rodada-base + alvo_offset
-
-    Para esta estratégia, alvo_offset = 1.
-
-    Branco no alvo é LOSS, porque somente a cor prevista R/P gera WIN.
-    """
     hist = db.carregar_historico()
 
     pos = {h["id"]: i for i, h in enumerate(hist)}
@@ -423,14 +288,12 @@ def _resolver_pendentes(atual_id, now):
     inicio = db.txt(estado.get("inicio_sessao"))
 
     count = 0
-
     pendentes = db.sinais_pendentes()
 
     for s in pendentes:
         try:
             estrategia = db.txt(s.get("estrategia"))
 
-            # Não mexer nos sinais das estratégias antigas.
             if not estrategia.startswith(PREFIXO_ESTRATEGIA):
                 continue
 
@@ -456,15 +319,9 @@ def _resolver_pendentes(atual_id, now):
             real = _normalizar_cor(alvo.get("cor"))
             prevista = _normalizar_cor(s.get("cor_prevista"))
 
-            if real not in ("R", "P", "W"):
+            if real not in ("R", "P", "W") or prevista not in ("R", "P"):
                 continue
 
-            if prevista not in ("R", "P"):
-                continue
-
-            # Regra operacional do script:
-            # somente a cor prevista = WIN.
-            # W ou a cor oposta = LOSS.
             resultado = (
                 RESULTADO_WIN
                 if real == prevista
@@ -485,12 +342,10 @@ def _resolver_pendentes(atual_id, now):
                 continue
 
             count += 1
-
             emoji = "✅" if resultado == RESULTADO_WIN else "❌"
 
             print(
-                f"{emoji} RESULTADO | "
-                f"estratégia={estrategia} | "
+                f"{emoji} RESULTADO ML | "
                 f"entrada={_nome(prevista)} | "
                 f"real={_nome(real)} | "
                 f"rodada={alvo['rodada_id']} | "
@@ -500,7 +355,7 @@ def _resolver_pendentes(atual_id, now):
 
             enviar_telegram(
                 f"{emoji} *RESULTADO — {resultado}*\n\n"
-                f"🧠 Estratégia: *{estrategia}*\n"
+                f"🤖 Estratégia: *{estrategia}*\n"
                 f"🎯 Entrada: *{_nome(prevista)}*\n"
                 f"🎲 Resultado: *{_nome(real)}*\n"
                 f"🔢 Rodada: *{alvo['rodada_id']}*"
@@ -511,12 +366,6 @@ def _resolver_pendentes(atual_id, now):
                 f"❌ Erro resolvendo sinal {s.get('id')}: {e}",
                 flush=True,
             )
-
-    if count:
-        print(
-            f"📊 Sinais MULTI-GATILHOS resolvidos: {count}",
-            flush=True,
-        )
 
     return count
 
@@ -566,16 +415,6 @@ def _estado(now):
 # ---------------------------------------------------------------------
 
 def processar_novo_resultado(rodada_id, color, roll):
-    """
-    Chamado pelo coletor a cada nova rodada completa.
-
-    Ordem:
-    1) resolve sinal anterior;
-    2) carrega histórico até a rodada atual;
-    3) recalcula TODOS os padrões pós-branco;
-    4) verifica se a rodada atual é exatamente a 3ª após o último branco;
-    5) se o padrão tiver gatilho, cria sinal para a próxima rodada.
-    """
     global _iniciado
 
     if not _iniciado and not init_engine_db():
@@ -599,8 +438,6 @@ def processar_novo_resultado(rodada_id, color, roll):
             estado.get("ultima_rodada_processada")
         )
 
-        # Evita processar a mesma rodada duas vezes.
-        # Ainda tenta resolver um sinal pendente.
         if ultimo == rid:
             if motor:
                 _resolver_pendentes(
@@ -610,60 +447,31 @@ def processar_novo_resultado(rodada_id, color, roll):
             return None
 
         if motor:
-            # Primeiro resolve o alvo de sinais anteriores.
+            # 1) Resolver pendentes das rodadas passadas
             _resolver_pendentes(
                 rodada["id"],
                 now,
             )
 
+            # 2) Carregar histórico até a rodada atual
             hist = db.carregar_historico(
                 ate_id=rodada["id"]
             )
 
-            # O backtest é mantido apenas como diagnóstico.
-            # Não interfere na geração do sinal.
-            if len(hist) >= 20:
-                bt = backtest_historico(hist)
+            # 3) Executar Machine Learning / Treinamento / Predição
+            predicao = treinar_e_prever(hist)
 
-                print(
-                    f"📊 BACKTEST DIAGNÓSTICO | "
-                    f"Entradas={bt['entradas']} | "
-                    f"Wins={bt['wins']} | "
-                    f"Losses={bt['losses']} | "
-                    f"Taxa={bt['taxa']:.2f}% | "
-                    f"Saldo={bt['saldo']:+d}",
-                    flush=True,
-                )
-
-            g = detectar_sinal_pos_branco(hist)
-
-            if g:
+            if predicao:
                 _criar_sinal(
-                    g,
+                    predicao,
                     now,
                 )
             else:
-                # Mensagem somente quando a rodada não gerou gatilho.
-                indices_brancos = [
-                    i for i, h in enumerate(hist)
-                    if h["cor"] == "W"
-                ]
+                print(
+                    "🔎 MACHINE LEARNING | Sem sinal com confiança >= 55%.",
+                    flush=True,
+                )
 
-                if indices_brancos:
-                    ultimo_w = indices_brancos[-1]
-                    distancia = (
-                        len(hist) - 1 - ultimo_w
-                    )
-
-                    if distancia <= TAMANHO_JANELA:
-                        print(
-                            f"🔎 PÓS-BRANCO | "
-                            f"distância={distancia}/3 | "
-                            f"nenhum gatilho aplicável.",
-                            flush=True,
-                        )
-
-        # Só marca como processada depois do motor.
         db.atualizar_estado(
             {
                 "ultima_rodada_processada": rid,
@@ -678,17 +486,13 @@ def processar_novo_resultado(rodada_id, color, roll):
             "ativo": motor,
             "estrategia": (
                 db.txt(
-                    estado_final.get(
-                        "ultima_estrategia"
-                    )
+                    estado_final.get("ultima_estrategia")
                 )
                 or None
             ),
             "cor": (
                 db.txt(
-                    estado_final.get(
-                        "cor_sinal"
-                    )
+                    estado_final.get("cor_sinal")
                 )
                 or None
             ),
@@ -699,17 +503,13 @@ def processar_novo_resultado(rodada_id, color, roll):
 
     except Exception as e:
         print(
-            f"❌ Erro no motor: {e}",
+            f"❌ Erro no motor de ML: {e}",
             flush=True,
         )
         return None
 
 
 def reconciliar_todos_sinais():
-    """
-    Mantém a API antiga do dashboard.
-    Não cria sinais retroativos; apenas atualiza o estado.
-    """
     if not _iniciado and not init_engine_db():
         return None
 
