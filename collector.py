@@ -1,5 +1,5 @@
 # ================================================================
-# BLAZE DOUBLE — COLLECTOR V3.0 — QUEBRA_ALT + GOOGLE PLANILHAS
+# BLAZE DOUBLE — COLLECTOR V3.2 (CORRIGIDO) — GOOGLE PLANILHAS
 # ================================================================
 # Coleta resultados do Double da Blaze via Socket.IO e
 # persiste em Google Planilhas (sheets_db.py).
@@ -26,7 +26,7 @@ from strategy_engine import processar_novo_resultado
 # ================================================================
 
 BLAZE_URL = "https://api-gaming.blaze.bet.br"
-SOCKET_PATH = "/replication/"
+SOCKET_PATH = "replication/socket.io"  # 👈 CORRIGIDO: Sufixo /socket.io adicionado
 ROOM = "double_room_1"
 EVENT_NAME = "data"
 TICK_NAME = "double.tick"
@@ -190,7 +190,7 @@ def persistir_status():
 
 
 # ================================================================
-# SOCKET.IO — MESMO PROTOCOLO DO V2.1
+# SOCKET.IO — EVENTOS
 # ================================================================
 
 def on_connect():
@@ -216,7 +216,7 @@ def on_connect():
             }
         }
 
-        print("📡 ENVIANDO SUBSCRIBE ORIGINAL V2.1")
+        print("📡 ENVIANDO SUBSCRIBE DA SALA")
         print(f"   evento  = cmd")
         print(f"   payload = {payload}")
 
@@ -376,11 +376,19 @@ def iniciar_socket():
     print("Transporte: websocket")
     print("=" * 70)
 
+    # Headers para simular conexão de navegador real
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Origin": "https://blaze.com",
+        "Referer": "https://blaze.com/",
+    }
+
     try:
         sio.connect(
             BLAZE_URL,
             socketio_path=SOCKET_PATH,
             transports=["websocket"],
+            headers=headers,  # 👈 CORRIGIDO: Cabeçalhos adicionados
             wait_timeout=20,
         )
 
@@ -400,11 +408,9 @@ def iniciar_socket():
 # MAIN
 # ================================================================
 
-
 def iniciar_coletor_em_thread():
     """
     Compatibilidade com o app.py do Render.
-
     Inicia o collector em uma thread daemon para que o Gunicorn
     consiga subir o Flask normalmente enquanto o Socket.IO roda
     em segundo plano.
@@ -424,7 +430,7 @@ def main():
 
     print("")
     print("=" * 70)
-    print("BLAZE DOUBLE — RENDER V3.1 — GOOGLE PLANILHAS + RETRY")
+    print("BLAZE DOUBLE — RENDER V3.2 — GOOGLE PLANILHAS + RETRY")
     print("=" * 70)
     print("Collector ao vivo + ELITE + POS_BRANCO + QUEBRA_ALT + Telegram")
     print("=" * 70)
