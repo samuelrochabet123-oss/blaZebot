@@ -1,14 +1,5 @@
 # =====================================================================
 # BLAZE STRATEGY ENGINE — MACHINE LEARNING (RANDOM FOREST)
-#
-# REGRA:
-# 1) Extrai o histórico do banco de dados (sheets_db).
-# 2) Mapeia as cores: Vermelho (R) = 0, Preto (P) = 1, Branco (W) = 2.
-# 3) Monta a matriz de atributos (Features) com base nas últimas 5 jogadas.
-# 4) Treina o classificador RandomForestClassifier dinamicamente.
-# 5) Analisa a probabilidade preditiva para a PRÓXIMA rodada (+1).
-# 6) Se a probabilidade de R ou P for >= 55% (LIMIAR_CONFIANCA), gera sinal.
-# 7) Notifica via Telegram e envia ao banco de dados para resolução.
 # =====================================================================
 
 import os
@@ -25,10 +16,9 @@ RESULTADO_LOSS = "LOSS"
 
 PREFIXO_ESTRATEGIA = "MACHINE LEARNING — RANDOM FOREST"
 
-# Configurações do modelo
-JANELA_HISTORICO = 5      # Quantidade de jogadas passadas como Atributos (Features)
-LIMIAR_CONFIANCA = 0.55   # Confiança mínima (55%) para disparar o sinal
-MIN_REGISTROS_TREINO = 30 # Mínimo de histórico para treinar o modelo
+JANELA_HISTORICO = 5
+LIMIAR_CONFIANCA = 0.55
+MIN_REGISTROS_TREINO = 30
 
 NOMES = {
     "R": "VERMELHO",
@@ -40,11 +30,6 @@ MAPEAMENTO_NUMERICO = {
     "R": 0,
     "P": 1,
     "W": 2,
-}
-
-NUMERICO_PARA_COR = {
-    0: "R",
-    1: "P",
 }
 
 _iniciado = False
@@ -113,7 +98,6 @@ def enviar_telegram(mensagem):
 
 def init_engine_db():
     global _iniciado
-
     _iniciado = db.init_db()
 
     if _iniciado:
@@ -132,14 +116,9 @@ def init_engine_db():
 # ---------------------------------------------------------------------
 
 def treinar_e_prever(hist):
-    """
-    Treina o modelo de Random Forest com o histórico disponível e realiza
-    a predição para a próxima rodada com base nas últimas 5 jogadas.
-    """
     if len(hist) < MIN_REGISTROS_TREINO + JANELA_HISTORICO:
         return None
 
-    # Normaliza e converte para numérico
     valores_numericos = []
     for item in hist:
         cor_norm = _normalizar_cor(item.get("cor"))
@@ -152,11 +131,8 @@ def treinar_e_prever(hist):
     X = []
     y = []
 
-    # Construção dos conjuntos X (Atributos) e y (Alvos)
     for i in range(JANELA_HISTORICO, len(valores_numericos) - 1):
         cor_seguinte = valores_numericos[i + 1]
-
-        # Foco do modelo em apostas binárias (0 = Vermelho, 1 = Preto)
         if cor_seguinte in [0, 1]:
             features = valores_numericos[i - JANELA_HISTORICO + 1 : i + 1]
             X.append(features)
@@ -168,7 +144,6 @@ def treinar_e_prever(hist):
     X = np.array(X)
     y = np.array(y)
 
-    # Treinamento do Modelo Random Forest
     modelo = RandomForestClassifier(
         n_estimators=100,
         max_depth=6,
@@ -177,15 +152,17 @@ def treinar_e_prever(hist):
     )
     modelo.fit(X, y)
 
-    # Atributos atuais (últimas JANELA_HISTORICO jogadas)
     features_atuais = np.array([valores_numericos[-JANELA_HISTORICO:]])
 
-    # Predição das probabilidades [P(Vermelho), P(Preto)]
     probabilidades = modelo.predict_proba(features_atuais)[0]
+    
+    # Trata retornos onde o modelo só aprendeu uma classe na amostra
+    if len(probabilidades) < 2:
+        return None
+
     prob_vermelho = probabilidades[0]
     prob_preto = probabilidades[1]
 
-    # Avaliação do limiar de confiança
     if prob_vermelho >= LIMIAR_CONFIANCA:
         cor_prevista = "R"
         confianca = prob_vermelho
@@ -193,7 +170,7 @@ def treinar_e_prever(hist):
         cor_prevista = "P"
         confianca = prob_preto
     else:
-        return None # Sem sinal (modelo indeciso)
+        return None
 
     return {
         "estrategia": f"{PREFIXO_ESTRATEGIA} — Confiança: {confianca * 100:.1f}%",
@@ -215,7 +192,6 @@ def _criar_sinal(g, now):
     base = str(g["rodada_base"])
     estrategia = g["estrategia"]
 
-    # Evita duplicidade na mesma rodada base
     if any(
         s["rodada_base"] == base
         and s["estrategia"].startswith(PREFIXO_ESTRATEGIA)
@@ -223,10 +199,7 @@ def _criar_sinal(g, now):
     ):
         return False
 
-    cid = (
-        f"RFML-{base}-"
-        f"{int(datetime.now().timestamp() * 1000)}"
-    )
+    cid = f"RFML-{base}-{int(datetime.now().timestamp() * 1000)}"
 
     db.inserir_sinal(
         {
@@ -253,7 +226,7 @@ def _criar_sinal(g, now):
         f"⚫ Prob. Preto      : {g['prob_preto'] * 100:.1f}%\n"
         f"👉 Entrada          : {_nome(g['cor_entrada'])}\n"
         f"🎲 Rodada base      : {base}\n"
-        f"⏭️ Alvo             : próxima rodada (+1)\n"
+        f"⏭️ Alvo              : próxima rodada (+1)\n"
         "============================================================",
         flush=True,
     )
@@ -279,10 +252,7 @@ def _resolver_pendentes(atual_id, now):
     hist = db.carregar_historico()
 
     pos = {h["id"]: i for i, h in enumerate(hist)}
-    por_rodada = {
-        str(h["rodada_id"]): h
-        for h in hist
-    }
+    por_rodada = {str(h["rodada_id"]): h for h in hist}
 
     estado = db.ler_estado()
     inicio = db.txt(estado.get("inicio_sessao"))
@@ -322,11 +292,7 @@ def _resolver_pendentes(atual_id, now):
             if real not in ("R", "P", "W") or prevista not in ("R", "P"):
                 continue
 
-            resultado = (
-                RESULTADO_WIN
-                if real == prevista
-                else RESULTADO_LOSS
-            )
+            resultado = RESULTADO_WIN if real == prevista else RESULTADO_LOSS
 
             ok = db.resolver_sinal(
                 s["id"],
@@ -338,40 +304,22 @@ def _resolver_pendentes(atual_id, now):
                 },
             )
 
-            if not ok:
-                continue
-
-            count += 1
-            emoji = "✅" if resultado == RESULTADO_WIN else "❌"
-
-            print(
-                f"{emoji} RESULTADO ML | "
-                f"entrada={_nome(prevista)} | "
-                f"real={_nome(real)} | "
-                f"rodada={alvo['rodada_id']} | "
-                f"{resultado}",
-                flush=True,
-            )
-
-            enviar_telegram(
-                f"{emoji} *RESULTADO — {resultado}*\n\n"
-                f"🤖 Estratégia: *{estrategia}*\n"
-                f"🎯 Entrada: *{_nome(prevista)}*\n"
-                f"🎲 Resultado: *{_nome(real)}*\n"
-                f"🔢 Rodada: *{alvo['rodada_id']}*"
-            )
+            if ok:
+                count += 1
+                emoji = "✅" if resultado == RESULTADO_WIN else "❌"
+                print(
+                    f"{emoji} RESULTADO ML | entrada={_nome(prevista)} | real={_nome(real)} | {resultado}",
+                    flush=True,
+                )
 
         except Exception as e:
-            print(
-                f"❌ Erro resolvendo sinal {s.get('id')}: {e}",
-                flush=True,
-            )
+            print(f"❌ Erro resolvendo sinal {s.get('id')}: {e}", flush=True)
 
     return count
 
 
 # ---------------------------------------------------------------------
-# ESTADO / DASHBOARD
+# ESTADO E PONTO DE ENTRADA DO COLETOR
 # ---------------------------------------------------------------------
 
 def _estado(now):
@@ -388,21 +336,9 @@ def _estado(now):
         {
             "wins": est["wins"],
             "losses": est["losses"],
-            "whites": est["whites_internos"],
             "profit": round(est["profit"], 2),
-            "sinal_ativo": (
-                ultimo["estrategia"]
-                if ultimo else ""
-            ),
-            "cor_sinal": (
-                ultimo["cor_prevista"]
-                if ultimo else ""
-            ),
-            "ultima_estrategia": (
-                ultimo["estrategia"]
-                if ultimo
-                else db.txt(estado.get("ultima_estrategia"))
-            ),
+            "sinal_ativo": ultimo["estrategia"] if ultimo else "",
+            "cor_sinal": ultimo["cor_prevista"] if ultimo else "",
             "atualizado_em": now,
         }
     )
@@ -410,11 +346,10 @@ def _estado(now):
     return est
 
 
-# ---------------------------------------------------------------------
-# ENTRADA PRINCIPAL DO COLLECTOR
-# ---------------------------------------------------------------------
-
 def processar_novo_resultado(rodada_id, color, roll):
+    """
+    Chamado pelo coletor a cada nova rodada recebida da API.
+    """
     global _iniciado
 
     if not _iniciado and not init_engine_db():
@@ -430,47 +365,22 @@ def processar_novo_resultado(rodada_id, color, roll):
         now = db.agora()
         estado = db.ler_estado()
 
-        motor = db.to_bool(
-            estado.get("motor_ativo")
-        )
-
-        ultimo = db.txt(
-            estado.get("ultima_rodada_processada")
-        )
+        motor = db.to_bool(estado.get("motor_ativo"))
+        ultimo = db.txt(estado.get("ultima_rodada_processada"))
 
         if ultimo == rid:
             if motor:
-                _resolver_pendentes(
-                    rodada["id"],
-                    now,
-                )
+                _resolver_pendentes(rodada["id"], now)
             return None
 
         if motor:
-            # 1) Resolver pendentes das rodadas passadas
-            _resolver_pendentes(
-                rodada["id"],
-                now,
-            )
+            _resolver_pendentes(rodada["id"], now)
 
-            # 2) Carregar histórico até a rodada atual
-            hist = db.carregar_historico(
-                ate_id=rodada["id"]
-            )
+            hist = db.carregar_historico(ate_id=rodada["id"])
 
-            # 3) Executar Machine Learning / Treinamento / Predição
-            predicao = treinar_e_prever(hist)
-
-            if predicao:
-                _criar_sinal(
-                    predicao,
-                    now,
-                )
-            else:
-                print(
-                    "🔎 MACHINE LEARNING | Sem sinal com confiança >= 55%.",
-                    flush=True,
-                )
+            g = treinar_e_prever(hist)
+            if g:
+                _criar_sinal(g, now)
 
         db.atualizar_estado(
             {
@@ -480,90 +390,8 @@ def processar_novo_resultado(rodada_id, color, roll):
         )
 
         est = _estado(now)
-        estado_final = db.ler_estado()
-
-        return {
-            "ativo": motor,
-            "estrategia": (
-                db.txt(
-                    estado_final.get("ultima_estrategia")
-                )
-                or None
-            ),
-            "cor": (
-                db.txt(
-                    estado_final.get("cor_sinal")
-                )
-                or None
-            ),
-            "wins": est["wins"],
-            "losses": est["losses"],
-            "profit": est["profit"],
-        }
+        return {"ativo": motor, "wins": est["wins"], "losses": est["losses"], "profit": est["profit"]}
 
     except Exception as e:
-        print(
-            f"❌ Erro no motor de ML: {e}",
-            flush=True,
-        )
+        print(f"❌ Erro no motor ML: {e}", flush=True)
         return None
-
-
-def reconciliar_todos_sinais():
-    if not _iniciado and not init_engine_db():
-        return None
-
-    est = _estado(db.agora())
-
-    return {
-        "resolvidos": 0,
-        **est,
-    }
-
-
-def obter_status_motor():
-    if not _iniciado and not init_engine_db():
-        return {
-            "ativo": False,
-            "sinal": None,
-            "cor": None,
-            "estrategia": None,
-            "wins": 0,
-            "losses": 0,
-            "pendentes": 0,
-            "profit": 0.0,
-        }
-
-    est = _estado(db.agora())
-    estado = db.ler_estado()
-
-    pend = [
-        s for s in db.sinais_pendentes()
-        if db.txt(s.get("estrategia")).startswith(PREFIXO_ESTRATEGIA)
-    ]
-
-    s = pend[-1] if pend else None
-
-    return {
-        "ativo": db.to_bool(
-            estado.get("motor_ativo")
-        ),
-        "sinal": bool(s),
-        "cor": (
-            s["cor_prevista"]
-            if s else None
-        ),
-        "estrategia": (
-            s["estrategia"]
-            if s else None
-        ),
-        "wins": est["wins"],
-        "losses": est["losses"],
-        "pendentes": len(pend),
-        "profit": est["profit"],
-        "ciclo_ativo": bool(s),
-        "tentativa_atual": (
-            int(s["tentativa"] or 1)
-            if s else 0
-        ),
-    }
